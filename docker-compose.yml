@@ -1,0 +1,48 @@
+services:
+
+  web_hauptseite:
+    image: ${DOCKERHUB_USERNAME}/web_hauptseite:latest
+    restart: unless-stopped
+    networks:
+      - brewing_net
+
+  web_assistent:
+    image: ${DOCKERHUB_USERNAME}/web_assistent:latest
+    restart: unless-stopped
+    networks:
+      - brewing_net
+
+  web_rapt:
+    image: ${DOCKERHUB_USERNAME}/web_rapt:latest
+    restart: unless-stopped
+    networks:
+      - brewing_net
+
+  api_proxy:
+    image: ${DOCKERHUB_USERNAME}/brew_proxy:latest
+    restart: unless-stopped
+    env_file: .env
+    networks:
+      - brewing_net
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    networks:
+      - brewing_net
+
+  watchtower:
+    image: containrrr/watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 30 --cleanup
+    networks:
+      - brewing_net
+
+networks:
+  brewing_net:
+    driver: bridge
