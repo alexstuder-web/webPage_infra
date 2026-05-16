@@ -1,0 +1,22 @@
+name: Validate docker-compose
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate docker-compose.yml syntax
+        run: docker compose config --quiet
+        env:
+          DOCKERHUB_USERNAME: placeholder
+          CLOUDFLARE_TUNNEL_TOKEN: placeholder
+          RAPT_EMAIL: placeholder
+          RAPT_PASSWORD: placeholder
+          OPENAI_API_KEY: placeholder
