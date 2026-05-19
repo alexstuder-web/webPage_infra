@@ -1,13 +1,14 @@
+# Produktiv-Stack für das gesamte Brewing-Ökosystem.
+# brew_assistent + sein Supabase-Stack werden via `include:` aus dem App-Repo geholt
+# (so können sie auch standalone ohne webPage_infra deployed werden).
+
+include:
+  - path: ../brew_assistent-new/docker-compose.yml
+
 services:
 
   web_hauptseite:
     image: ${DOCKERHUB_USERNAME}/web_hauptseite:latest
-    restart: unless-stopped
-    networks:
-      - brewing_net
-
-  web_assistent:
-    image: ${DOCKERHUB_USERNAME}/web_assistent:latest
     restart: unless-stopped
     networks:
       - brewing_net
@@ -22,8 +23,11 @@ services:
     image: ${DOCKERHUB_USERNAME}/brew_proxy:latest
     restart: unless-stopped
     env_file: .env
+    environment:
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
     networks:
       - brewing_net
+      - assistent_net
 
   cloudflared:
     image: cloudflare/cloudflared:latest

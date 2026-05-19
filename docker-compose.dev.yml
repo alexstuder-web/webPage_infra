@@ -1,0 +1,44 @@
+# Lokales Test-Setup — pullt Images von Docker Hub, exposed Ports auf localhost.
+# Kein cloudflared (kein Tunnel lokal), kein watchtower (manueller Container-Restart in Dev).
+# Start: docker compose -f docker-compose.dev.yml up
+# Stop:  Ctrl+C  (oder: docker compose -f docker-compose.dev.yml down)
+#
+# brew_assistent + Supabase kommen via `include:` aus dem App-Repo
+# (Port-Mapping 8081 + 54321/54322/54323 ist dort definiert).
+
+include:
+  - path: ../brew_assistent-new/docker-compose.yml
+
+services:
+
+  web_hauptseite:
+    image: ${DOCKERHUB_USERNAME}/web_hauptseite:latest
+    pull_policy: always
+    ports:
+      - "8090:80"   # 8080 lokal oft durch andere Tools belegt
+    networks:
+      - brewing_net
+
+  web_rapt:
+    image: ${DOCKERHUB_USERNAME}/web_rapt:latest
+    pull_policy: always
+    ports:
+      - "8082:80"
+    networks:
+      - brewing_net
+
+  api_proxy:
+    image: ${DOCKERHUB_USERNAME}/brew_proxy:latest
+    pull_policy: always
+    ports:
+      - "8083:3000"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
+    networks:
+      - brewing_net
+      - assistent_net   # für DB-Zugriff (supabase-db)
+
+networks:
+  brewing_net:
+    driver: bridge
