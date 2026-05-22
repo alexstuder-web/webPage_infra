@@ -1,1 +1,8 @@
+# Secrets - niemals committen
 .env
+
+# Verschlüsselte Variante darf committed werden
+!.env.gpg
+
+# DB-Dumps mit echten Daten — nie committen
+backups/
