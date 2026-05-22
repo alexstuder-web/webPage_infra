@@ -12,11 +12,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate docker-compose.yml syntax
-        run: docker compose config --quiet
+      - name: Validate production compose (--profile vps)
+        run: docker compose -f docker-compose.yml --profile vps config --quiet
         env:
           DOCKERHUB_USERNAME: placeholder
           CLOUDFLARE_TUNNEL_TOKEN: placeholder
-          RAPT_EMAIL: placeholder
-          RAPT_PASSWORD: placeholder
-          OPENAI_API_KEY: placeholder
+          POSTGRES_PASSWORD: placeholder
+          JWT_SECRET: placeholder
+          SECRET_KEY_BASE: placeholder
+          ANON_KEY: placeholder
+          SERVICE_ROLE_KEY: placeholder
+          DASHBOARD_PASSWORD: placeholder
+          PG_META_CRYPTO_KEY: placeholder
+          SUPABASE_PUBLIC_URL: http://placeholder
+          SITE_URL: http://placeholder
+          ADDITIONAL_REDIRECT_URLS: ""
+
+      - name: Validate dev override
+        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml config --quiet
+        env:
+          DOCKERHUB_USERNAME: placeholder
+          POSTGRES_PASSWORD: placeholder
+          JWT_SECRET: placeholder
+          SECRET_KEY_BASE: placeholder
+          ANON_KEY: placeholder
+          SERVICE_ROLE_KEY: placeholder
+          DASHBOARD_PASSWORD: placeholder
+          PG_META_CRYPTO_KEY: placeholder
+          SUPABASE_PUBLIC_URL: http://placeholder
+          SITE_URL: http://placeholder
+          ADDITIONAL_REDIRECT_URLS: ""
+
+      - name: Bash syntax check (alle scripts)
+        run: bash -n scripts/bootstrap.sh scripts/decrypt-env.sh scripts/encrypt-env.sh

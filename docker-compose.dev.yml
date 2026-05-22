@@ -1,38 +1,38 @@
-# Lokales Test-Setup — pullt Images von Docker Hub, exposed Ports auf localhost.
-# Kein cloudflared (kein Tunnel lokal), kein watchtower (manueller Container-Restart in Dev).
-# Start: docker compose -f docker-compose.dev.yml up
-# Stop:  Ctrl+C  (oder: docker compose -f docker-compose.dev.yml down)
+# Dev-Override für docker-compose.yml — exposed Ports auf localhost,
+# damit man direkt im Browser drauf zugreifen kann.
 #
-# Beide App-Stacks via `include:` aus den App-Repos:
-#   - brew_assistent + Supabase (Ports 8081 + 54321/54322/54323)
-#   - web_rapt (Port 8082)
-
-include:
-  - path: ../brew_assistent-new/docker-compose.yml
-  - path: ../RAPT_Brewing_Dashboard-new/docker-compose.yml
+# Start:  docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+# Stop:   docker compose -f docker-compose.yml -f docker-compose.dev.yml down
+#
+# cloudflared + watchtower laufen NICHT (haben profile=vps in der base.yml,
+# das hier nicht aktiviert wird).
 
 services:
 
   web_hauptseite:
-    image: ${DOCKERHUB_USERNAME}/web_hauptseite:latest
-    pull_policy: always
     ports:
-      - "8090:80"   # 8080 lokal oft durch andere Tools belegt
-    networks:
-      - brewing_net
+      - "8090:80"   # 8080 lokal oft belegt
+
+  web_assistent:
+    ports:
+      - "8081:80"
+
+  web_rapt:
+    ports:
+      - "8082:80"
 
   api_proxy:
-    image: ${DOCKERHUB_USERNAME}/brew_proxy:latest
-    pull_policy: always
     ports:
       - "8083:3000"
-    env_file: .env
-    environment:
-      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
-    networks:
-      - brewing_net
-      - assistent_net   # für DB-Zugriff (supabase-db)
 
-networks:
-  brewing_net:
-    driver: bridge
+  supabase-kong:
+    ports:
+      - "54321:8000"
+
+  supabase-db:
+    ports:
+      - "54322:5432"
+
+  supabase-studio:
+    ports:
+      - "54323:3000"

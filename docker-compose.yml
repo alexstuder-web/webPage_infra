@@ -1,50 +1,313 @@
-# Produktiv-Stack für das gesamte Brewing-Ökosystem.
-# Beide App-Stacks werden via `include:` aus ihren App-Repos geholt
-# (so können sie auch standalone ohne webPage_infra deployt werden):
-#   - brew_assistent-new/docker-compose.yml  (assistent_net + Supabase)
-#   - RAPT_Brewing_Dashboard-new/docker-compose.yml  (rapt_net + web_rapt)
-# cloudflared hängt am rapt_net dran, um den RAPT-Container per Tunnel zu erreichen.
+# Production-Stack für das gesamte Brewing-Ökosystem.
+# Single source of truth — alle Services als Image aus Docker Hub.
+# Volume-Mounts: ./supabase/* (kong config + db init scripts).
+#
+# Bootstrap auf frischem Ubuntu-VPS:
+#   curl -fsSL https://raw.githubusercontent.com/alexstuder-web/webPage_infra/main/scripts/bootstrap.sh -o bootstrap.sh && chmod +x bootstrap.sh && ./bootstrap.sh
+#
+# Lokales Dev: docker-compose.dev.yml (Ports exposed, kein Tunnel/Watchtower).
 
-include:
-  - path: ../brew_assistent-new/docker-compose.yml
-  - path: ../RAPT_Brewing_Dashboard-new/docker-compose.yml
+name: brewing
 
 services:
 
+  # ==========================================================================
+  # FRONTENDS  (Nginx mit Flutter-Web-Build bzw. statischem HTML)
+  # ==========================================================================
+
   web_hauptseite:
+    container_name: web-hauptseite
     image: ${DOCKERHUB_USERNAME}/web_hauptseite:latest
+    pull_policy: always
     restart: unless-stopped
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
     networks:
       - brewing_net
 
+  web_assistent:
+    container_name: web-assistent
+    image: ${DOCKERHUB_USERNAME}/web_assistent:latest
+    pull_policy: always
+    restart: unless-stopped
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    networks:
+      - brewing_net
+
+  web_rapt:
+    container_name: web-rapt
+    image: ${DOCKERHUB_USERNAME}/web_rapt:latest
+    pull_policy: always
+    restart: unless-stopped
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    networks:
+      - brewing_net
+
+  # ==========================================================================
+  # API LAYER
+  # ==========================================================================
+
   api_proxy:
+    container_name: api-proxy
     image: ${DOCKERHUB_USERNAME}/brew_proxy:latest
+    pull_policy: always
     restart: unless-stopped
     env_file: .env
     environment:
       DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
     networks:
       - brewing_net
-      - assistent_net
+
+  # ==========================================================================
+  # SUPABASE STACK  (Versionen gepinnt — kein Watchtower-Label)
+  # Postgres + Auth + REST + Realtime + Storage + Meta + Studio + Kong
+  # ==========================================================================
+
+  supabase-db:
+    container_name: supabase-db
+    image: supabase/postgres:15.8.1.060
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    environment:
+      POSTGRES_HOST: /var/run/postgresql
+      POSTGRES_DB: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGPORT: 5432
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXP: 3600
+    volumes:
+      - supabase-db-data:/var/lib/postgresql/data
+      # Einzeldatei-Mounts mit zz- Prefix, damit sie alphabetisch NACH der
+      # supabase/postgres-eigenen migrate.sh laufen.
+      - ./supabase/db_init/zz-set-role-passwords.sh:/docker-entrypoint-initdb.d/zz-set-role-passwords.sh:ro
+      - ./supabase/db_init/zz-create-realtime-internal-schema.sql:/docker-entrypoint-initdb.d/zz-create-realtime-internal-schema.sql:ro
+    networks:
+      - brewing_net
+
+  supabase-auth:
+    container_name: supabase-auth
+    image: supabase/gotrue:v2.176.1
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      API_EXTERNAL_URL: ${SUPABASE_PUBLIC_URL}
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
+      GOTRUE_SITE_URL: ${SITE_URL}
+      GOTRUE_URI_ALLOW_LIST: ${ADDITIONAL_REDIRECT_URLS}
+      GOTRUE_DISABLE_SIGNUP: "false"
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: 3600
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_MAILER_AUTOCONFIRM: "true"
+    networks:
+      - brewing_net
+
+  supabase-rest:
+    container_name: supabase-rest
+    image: postgrest/postgrest:v12.2.10
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
+      PGRST_DB_SCHEMAS: public,storage,graphql_public,aibrewgenius,rapt
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+      PGRST_APP_SETTINGS_JWT_SECRET: ${JWT_SECRET}
+      PGRST_APP_SETTINGS_JWT_EXP: 3600
+    command: postgrest
+    networks:
+      - brewing_net
+
+  supabase-realtime:
+    container_name: supabase-realtime
+    image: supabase/realtime:v2.34.43
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      PORT: 4000
+      DB_HOST: supabase-db
+      DB_PORT: 5432
+      DB_USER: supabase_admin
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: postgres
+      DB_AFTER_CONNECT_QUERY: 'SET search_path TO _realtime'
+      DB_ENC_KEY: supabaserealtime
+      API_JWT_SECRET: ${JWT_SECRET}
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
+      ERL_AFLAGS: -proto_dist inet_tcp
+      DNS_NODES: "''"
+      RLIMIT_NOFILE: "10000"
+      APP_NAME: realtime
+      SEED_SELF_HOST: "true"
+      RUN_JANITOR: "true"
+    networks:
+      - brewing_net
+
+  supabase-storage:
+    container_name: supabase-storage
+    image: supabase/storage-api:v1.13.3
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+      supabase-rest:
+        condition: service_started
+    restart: unless-stopped
+    volumes:
+      - supabase-storage-data:/var/lib/storage
+    environment:
+      ANON_KEY: ${ANON_KEY}
+      SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      POSTGREST_URL: http://supabase-rest:3000
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
+      FILE_SIZE_LIMIT: 52428800
+      STORAGE_BACKEND: file
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      TENANT_ID: stub
+      REGION: stub
+      GLOBAL_S3_BUCKET: stub
+      ENABLE_IMAGE_TRANSFORMATION: "false"
+    networks:
+      - brewing_net
+
+  supabase-meta:
+    container_name: supabase-meta
+    image: supabase/postgres-meta:v0.96.3
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      PG_META_PORT: 8080
+      PG_META_DB_HOST: supabase-db
+      PG_META_DB_PORT: 5432
+      PG_META_DB_NAME: postgres
+      PG_META_DB_USER: supabase_admin
+      PG_META_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      CRYPTO_KEY: ${PG_META_CRYPTO_KEY}
+    networks:
+      - brewing_net
+
+  supabase-studio:
+    container_name: supabase-studio
+    image: supabase/studio:2026.04.27-sha-5f60601
+    depends_on:
+      supabase-meta:
+        condition: service_started
+    restart: unless-stopped
+    environment:
+      # IPv4 binding — sonst kriegt Healthcheck ECONNREFUSED auf 127.0.0.1.
+      HOSTNAME: "0.0.0.0"
+      STUDIO_PG_META_URL: http://supabase-meta:8080
+      POSTGRES_HOST: supabase-db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PG_META_CRYPTO_KEY: ${PG_META_CRYPTO_KEY}
+      DEFAULT_ORGANIZATION_NAME: ${DEFAULT_ORGANIZATION_NAME:-Brewing}
+      DEFAULT_PROJECT_NAME: ${DEFAULT_PROJECT_NAME:-aibrewgenius}
+      SUPABASE_URL: http://supabase-kong:8000
+      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL}
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-supabase}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
+      # Pflicht-Vars seit Next.js-16-Studio-Builds.
+      EDGE_FUNCTIONS_MANAGEMENT_FOLDER: /tmp/edge-functions
+      SNIPPETS_MANAGEMENT_FOLDER: /tmp/snippets
+    networks:
+      - brewing_net
+
+  supabase-kong:
+    container_name: supabase-kong
+    image: kong:2.8.1
+    depends_on:
+      supabase-auth:
+        condition: service_started
+      supabase-rest:
+        condition: service_started
+      supabase-realtime:
+        condition: service_started
+      supabase-storage:
+        condition: service_started
+      supabase-meta:
+        condition: service_started
+    restart: unless-stopped
+    volumes:
+      - ./supabase/kong.yml:/var/lib/kong/kong.yml:ro
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /var/lib/kong/kong.yml
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth
+      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
+      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-supabase}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
+    networks:
+      - brewing_net
+
+  # ==========================================================================
+  # INFRASTRUCTURE  (Tunnel + Auto-Update)
+  # ==========================================================================
+
+  # cloudflared + watchtower laufen NUR auf dem VPS, nicht lokal in Dev.
+  # → `profiles: [vps]` heißt: nur aktiv mit `docker compose --profile vps up -d`.
+  # Bootstrap-Script + README setzen das automatisch.
 
   cloudflared:
+    container_name: cloudflared
     image: cloudflare/cloudflared:latest
+    profiles: [vps]
     restart: unless-stopped
     command: tunnel --no-autoupdate run
     environment:
-      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
     networks:
       - brewing_net
-      - rapt_net
 
   watchtower:
+    container_name: watchtower
     image: containrrr/watchtower
+    profiles: [vps]
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    command: --interval 30 --cleanup
+    # --label-enable: nur Container mit Watchtower-Label updaten
+    # (App-Container; Supabase-Stack bleibt auf gepinnten Versionen).
+    command: --interval 300 --cleanup --label-enable
     networks:
       - brewing_net
+
+volumes:
+  supabase-db-data:
+  supabase-storage-data:
 
 networks:
   brewing_net:
