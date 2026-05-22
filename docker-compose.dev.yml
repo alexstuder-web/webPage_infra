@@ -3,11 +3,13 @@
 # Start: docker compose -f docker-compose.dev.yml up
 # Stop:  Ctrl+C  (oder: docker compose -f docker-compose.dev.yml down)
 #
-# brew_assistent + Supabase kommen via `include:` aus dem App-Repo
-# (Port-Mapping 8081 + 54321/54322/54323 ist dort definiert).
+# Beide App-Stacks via `include:` aus den App-Repos:
+#   - brew_assistent + Supabase (Ports 8081 + 54321/54322/54323)
+#   - web_rapt (Port 8082)
 
 include:
   - path: ../brew_assistent-new/docker-compose.yml
+  - path: ../RAPT_Brewing_Dashboard-new/docker-compose.yml
 
 services:
 
@@ -16,14 +18,6 @@ services:
     pull_policy: always
     ports:
       - "8090:80"   # 8080 lokal oft durch andere Tools belegt
-    networks:
-      - brewing_net
-
-  web_rapt:
-    image: ${DOCKERHUB_USERNAME}/web_rapt:latest
-    pull_policy: always
-    ports:
-      - "8082:80"
     networks:
       - brewing_net
 

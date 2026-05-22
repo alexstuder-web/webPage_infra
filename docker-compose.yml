@@ -1,20 +1,18 @@
 # Produktiv-Stack für das gesamte Brewing-Ökosystem.
-# brew_assistent + sein Supabase-Stack werden via `include:` aus dem App-Repo geholt
-# (so können sie auch standalone ohne webPage_infra deployed werden).
+# Beide App-Stacks werden via `include:` aus ihren App-Repos geholt
+# (so können sie auch standalone ohne webPage_infra deployt werden):
+#   - brew_assistent-new/docker-compose.yml  (assistent_net + Supabase)
+#   - RAPT_Brewing_Dashboard-new/docker-compose.yml  (rapt_net + web_rapt)
+# cloudflared hängt am rapt_net dran, um den RAPT-Container per Tunnel zu erreichen.
 
 include:
   - path: ../brew_assistent-new/docker-compose.yml
+  - path: ../RAPT_Brewing_Dashboard-new/docker-compose.yml
 
 services:
 
   web_hauptseite:
     image: ${DOCKERHUB_USERNAME}/web_hauptseite:latest
-    restart: unless-stopped
-    networks:
-      - brewing_net
-
-  web_rapt:
-    image: ${DOCKERHUB_USERNAME}/web_rapt:latest
     restart: unless-stopped
     networks:
       - brewing_net
@@ -37,6 +35,7 @@ services:
       - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
     networks:
       - brewing_net
+      - rapt_net
 
   watchtower:
     image: containrrr/watchtower
