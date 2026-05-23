@@ -77,6 +77,58 @@ Dev-Override aktiviert Localhost-Ports (`:8081` web_assistent, `:8082` web_rapt,
 `:54323` studio). `cloudflared` + `watchtower` laufen lokal **nicht** (sind
 hinter `profiles: [vps]`).
 
+## Cloudflare Tunnel + DNS  (idempotent via API)
+
+Routing-Map liegt deklarativ in [`scripts/cloudflare-routes.json`](scripts/cloudflare-routes.json):
+
+| Hostname | Container:Port | Notiz |
+|---|---|---|
+| `alexstuder.cloud` | `web-hauptseite:80` | Landing |
+| `aibrewgenius.alexstuder.cloud` | `web-assistent:80` | AiBrewGenius UI |
+| `rapt.alexstuder.cloud` | `web-rapt:80` | Fermentation Dashboard |
+| `api.alexstuder.cloud` | `api-proxy:3000` | OpenAI/RAPT/Brewfather Proxy |
+| `supabase.alexstuder.cloud` | `supabase-kong:8000` | Auth/REST/Realtime/Storage API |
+| `studio.alexstuder.cloud` | `supabase-studio:3000` | Admin UI — Cloudflare Access davor! |
+
+`./scripts/cloudflare-reconcile.sh` ist **idempotent**: bei jedem Lauf wird
+die Tunnel-Ingress-Config gegen die JSON gediffed, fehlende DNS-CNAMEs
+angelegt, abweichende auf den Tunnel umgebogen. Wird vom `bootstrap.sh`
+automatisch am Ende aufgerufen und kann jederzeit manuell laufen — z.B.
+nach Editieren der `routes.json`.
+
+### API-Token erstellen  (einmalig)
+
+1. https://dash.cloudflare.com → Profile → **API Tokens** → *Create Token* → *Custom token*
+2. Name: `webPage_infra-bootstrap`
+3. Permissions:
+
+   | Type | Resource | Permission |
+   |---|---|---|
+   | Account | Cloudflare Tunnel | Edit |
+   | Zone | DNS | Edit |
+   | Zone | Zone | Read |
+
+4. **Account Resources** → All accounts (oder selektiv)
+5. **Zone Resources** → Specific zone → `alexstuder.cloud`
+6. Create → Token **einmalig** kopieren
+
+Plus drei IDs (alle im Dashboard sichtbar, keine Secrets):
+
+- **Account ID** — Dashboard-Hauptseite, rechte Sidebar
+- **Zone ID** — `alexstuder.cloud` öffnen, rechte Sidebar
+- **Tunnel ID** — Zero Trust → Networks → Tunnels → dein Tunnel → UUID in der URL
+
+Diese 4 Werte in `.env`:
+
+```env
+CLOUDFLARE_API_TOKEN=<token>
+CLOUDFLARE_ACCOUNT_ID=<id>
+CLOUDFLARE_ZONE_ID=<id>
+CLOUDFLARE_TUNNEL_ID=<id>
+```
+
+Dann `./scripts/encrypt-env.sh && git add .env.gpg && git commit && git push`.
+
 ## Wartung auf dem VPS
 
 ```bash
@@ -98,6 +150,9 @@ docker compose --profile vps up -d
 # Stack stoppen / starten
 docker compose --profile vps down
 docker compose --profile vps up -d
+
+# Cloudflare Hostnames + DNS abgleichen (nach Edit von scripts/cloudflare-routes.json)
+./scripts/cloudflare-reconcile.sh
 ```
 
 ## Architektur

@@ -176,6 +176,19 @@ docker compose --profile vps up -d
 EOSU
 ok "Stack läuft"
 
+# ---------------------------------------------------------------- Cloudflare reconcile
+log "Cloudflare Tunnel + DNS reconcilen"
+if sudo -u "$APP_USER" -H bash -c "cd '$APP_DIR' && grep -q '^CLOUDFLARE_API_TOKEN=.\\+' .env"; then
+  sudo -u "$APP_USER" -H bash <<EOSU
+set -euo pipefail
+cd "$APP_DIR"
+./scripts/cloudflare-reconcile.sh
+EOSU
+else
+  echo "  CLOUDFLARE_API_TOKEN nicht gesetzt — übersprungen."
+  echo "  Hostnames manuell im Dashboard pflegen oder Token nachtragen + ./scripts/cloudflare-reconcile.sh"
+fi
+
 # ---------------------------------------------------------------- Done
 log "✓ Bootstrap abgeschlossen"
 cat <<EOF
@@ -190,5 +203,8 @@ cat <<EOF
 
   Auto-Updates der App-Container (web_*, api_proxy) übernimmt Watchtower
   alle 5 Minuten. Supabase-Stack bleibt auf gepinnten Versionen.
+
+  Cloudflare-Hostnames/DNS: scripts/cloudflare-routes.json editieren →
+  ./scripts/cloudflare-reconcile.sh (idempotent).
 
 EOF

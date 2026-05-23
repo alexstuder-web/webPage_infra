@@ -1,0 +1,12 @@
+{
+  "_comment": "Deklarative Routing-Map: Hostname → Container:Port. Bootstrap/Reconcile liest das hier, vergleicht mit Cloudflare-Tunnel-Config + DNS, und gleicht ab. Änderungen einfach hier eintragen, dann ./scripts/cloudflare-reconcile.sh. Reihenfolge bleibt erhalten; catch-all wird automatisch am Ende angehängt.",
+
+  "routes": [
+    { "hostname": "alexstuder.cloud",              "service": "http://web-hauptseite:80" },
+    { "hostname": "aibrewgenius.alexstuder.cloud", "service": "http://web-assistent:80" },
+    { "hostname": "rapt.alexstuder.cloud",         "service": "http://web-rapt:80" },
+    { "hostname": "api.alexstuder.cloud",          "service": "http://api-proxy:3000" },
+    { "hostname": "supabase.alexstuder.cloud",     "service": "http://supabase-kong:8000" },
+    { "hostname": "studio.alexstuder.cloud",       "service": "http://supabase-studio:3000" }
+  ]
+}
