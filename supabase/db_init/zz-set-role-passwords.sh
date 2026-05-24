@@ -15,6 +15,15 @@ set -euo pipefail
 [[ -n "${POSTGRES_PASSWORD:-}" ]]    || { echo "FATAL: POSTGRES_PASSWORD is unset or empty"    >&2; exit 1; }
 [[ -n "${PROXY_SYNC_PASSWORD:-}" ]]  || { echo "FATAL: PROXY_SYNC_PASSWORD is unset or empty"  >&2; exit 1; }
 
+# Single-quote guard: a literal ' in either password would break the interpolated SQL string
+# (heredoc label is intentionally unquoted — see comment below).
+[[ "${POSTGRES_PASSWORD}"   != *"'"* ]] || { echo "FATAL: POSTGRES_PASSWORD darf kein einfaches Anführungszeichen enthalten"   >&2; exit 1; }
+[[ "${PROXY_SYNC_PASSWORD}" != *"'"* ]] || { echo "FATAL: PROXY_SYNC_PASSWORD darf kein einfaches Anführungszeichen enthalten" >&2; exit 1; }
+
+# INTENTIONAL: the heredoc label EOSQL is deliberately UNQUOTED so that the shell expands
+# ${POSTGRES_PASSWORD} and ${PROXY_SYNC_PASSWORD} into the SQL text before it is handed to
+# psql.  The \$\$ delimiters in the DO block are escaped to prevent premature shell
+# expansion of the dollar-signs.  Do NOT quote EOSQL — that would suppress the expansion.
 psql -v ON_ERROR_STOP=1 --username "supabase_admin" --dbname "postgres" <<-EOSQL
   ALTER ROLE authenticator              WITH PASSWORD '${POSTGRES_PASSWORD}';
   ALTER ROLE supabase_auth_admin        WITH PASSWORD '${POSTGRES_PASSWORD}';
@@ -23,16 +32,50 @@ psql -v ON_ERROR_STOP=1 --username "supabase_admin" --dbname "postgres" <<-EOSQL
   ALTER ROLE pgbouncer                  WITH PASSWORD '${POSTGRES_PASSWORD}';
   ALTER ROLE postgres                   WITH PASSWORD '${POSTGRES_PASSWORD}';
   -- proxy_sync: minimale Lese-Rolle für api_proxy (Phase 1 dba-coder Migration 004).
-  -- Rolle wird durch 004_proxy_role.sql angelegt; hier nur Passwort setzen.
-  -- Dediziertes Passwort PROXY_SYNC_PASSWORD (nicht POSTGRES_PASSWORD) —
-  -- least-privilege: ein kompromittierter proxy_sync-Key öffnet nicht den
-  -- Master-Account. PROXY_SYNC_PASSWORD muss in .env gesetzt sein.
-  -- DO-Block schützt gegen Fehler falls die Rolle noch nicht existiert
-  -- (z.B. auf altem VPS ohne Migration 004).
+  --
+  -- Zweck dieses Blocks: Rolle idempotent anlegen und Passwort setzen.
+  --   - Frische DB (kein 004_proxy_role.sql gelaufen): CREATE ROLE mit den exakten
+  --     Attributen aus der Migration, damit api_proxy sich beim ersten Boot verbinden kann.
+  --   - Bestehende DB (Rolle existiert bereits, z.B. nach Restore oder nach 004): ALTER ROLE
+  --     setzt Login + Passwort sicher neu (idempotent).
+  --
+  -- Grants kommen NICHT hier: zum db-init-Zeitpunkt existieren die Schemata
+  -- aibrewgenius/rapt noch nicht (sie entstehen erst beim restore.sh-Lauf).
+  -- Die Tabellen-Grants für proxy_sync werden über den wiederhergestellten
+  -- rapt-Dump eingespielt — die Rolle existiert dann bereits und die GRANTs greifen.
+  -- Das quell-seitige Pendant ist brew_assistent-new/db_scripts/migrations/004_proxy_role.sql.
+  --
+  -- Rollen-Attribute exakt spiegelnd aus 004_proxy_role.sql (Section 1):
+  --   LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS INHERIT
+  --
+  -- Dediziertes Passwort PROXY_SYNC_PASSWORD (NICHT POSTGRES_PASSWORD) —
+  -- least-privilege: ein geleakter proxy_sync-Key öffnet nicht den Master-Account.
   DO \$\$
   BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'proxy_sync') THEN
-      ALTER ROLE proxy_sync WITH PASSWORD '${PROXY_SYNC_PASSWORD}';
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'proxy_sync') THEN
+      CREATE ROLE proxy_sync
+        WITH LOGIN
+             NOSUPERUSER
+             NOCREATEROLE
+             NOCREATEDB
+             NOREPLICATION
+             NOBYPASSRLS
+             INHERIT
+             PASSWORD '${PROXY_SYNC_PASSWORD}';
+      RAISE NOTICE 'proxy_sync: Rolle neu angelegt (frische DB — 004_proxy_role.sql noch nicht gelaufen).';
+    ELSE
+      -- Re-assert full attribute set (mirrors CREATE above and Migration 004) so this
+      -- script is self-contained and does not rely on 004_proxy_role.sql having run.
+      ALTER ROLE proxy_sync
+        WITH LOGIN
+             NOSUPERUSER
+             NOCREATEROLE
+             NOCREATEDB
+             NOREPLICATION
+             NOBYPASSRLS
+             INHERIT
+             PASSWORD '${PROXY_SYNC_PASSWORD}';
+      RAISE NOTICE 'proxy_sync: Rolle existiert bereits — Attribute + Passwort neu gesetzt (idempotent).';
     END IF;
   END
   \$\$;
