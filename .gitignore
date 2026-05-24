@@ -6,3 +6,6 @@
 
 # DB-Dumps mit echten Daten — nie committen
 backups/
+
+# requirement-analyst Specs — transiente Build-Inputs, nie committen
+specs/
