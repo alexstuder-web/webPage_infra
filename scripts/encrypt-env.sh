@@ -21,7 +21,11 @@ fi
 GPG_ARGS=(--batch --yes --symmetric --cipher-algo AES256 --output .env.gpg)
 
 if [[ -n "${GPG_PASSPHRASE:-}" ]]; then
-  gpg --passphrase "$GPG_PASSPHRASE" --pinentry-mode loopback "${GPG_ARGS[@]}" .env
+  # Passphrase NIE auf der Kommandozeile (--passphrase wäre in ps sichtbar).
+  # Stattdessen über fd 3 via --passphrase-fd reinschieben — konsistent mit
+  # backup.sh/restore.sh. Interaktiver Fallback unten, wenn $GPG_PASSPHRASE leer.
+  gpg --pinentry-mode loopback --passphrase-fd 3 "${GPG_ARGS[@]}" .env \
+    3< <(printf '%s' "$GPG_PASSPHRASE")
 else
   gpg "${GPG_ARGS[@]}" .env
 fi

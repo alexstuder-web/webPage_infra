@@ -137,6 +137,123 @@ CLOUDFLARE_TUNNEL_ID=<id>
 
 Dann `./scripts/encrypt-env.sh && git add .env.gpg && git commit && git push`.
 
+## Backup & Restore
+
+**Variante A — pro App getrennte Dumps.** Beide Apps teilen sich eine Postgres-DB
+und das `auth`-Schema (Logins). Pro Backup-Lauf entstehen **drei** verschlüsselte
+Dumps in eigene Ordner (lokal + R2-Bucket `backup`):
+
+| Ordner | pg_dump | Inhalt |
+|---|---|---|
+| `_supabase_core/` | `--exclude-schema=aibrewgenius --exclude-schema=rapt` | `auth` + `storage` + `public` + `_realtime` + Rest |
+| `brew_assistent/` | `-n aibrewgenius` | Schema `aibrewgenius` |
+| `rapt_dashboard/` | `-n rapt` | Schema `rapt` |
+
+```bash
+# Manuelles Backup (drei verschlüsselte Dumps → lokal + R2). Als 'alex', kein sudo.
+./scripts/backup.sh
+
+# Pre-Migration-Backup mit Label (alle drei, rotation-exempt)
+./scripts/backup.sh --label pre-migration     # → ..._pre-migration.fc.gpg
+
+# Nur lokal, kein Off-site-Upload
+./scripts/backup.sh --no-upload
+
+# Andere Retention (Standard N=7 neueste pro Ordner, lokal + R2)
+BACKUP_KEEP=14 ./scripts/backup.sh
+
+# Restore ALLER Schemas in zwingender Reihenfolge (core → apps), jüngste aus R2
+./scripts/restore.sh all
+
+# Restore eines einzelnen Ziels (jüngste aus dem passenden R2-Ordner)
+./scripts/restore.sh core
+./scripts/restore.sh rapt_dashboard
+./scripts/restore.sh brew_assistent latest
+
+# Restore aus konkreter lokaler Datei (ein Ziel)
+./scripts/restore.sh rapt_dashboard backups/rapt_dashboard/rapt_20260523_030000.fc.gpg
+
+# Cron-Log der nightly Backups
+tail -f /var/log/brewing-backup.log
+```
+
+Echter, nicht-reproduzierbarer State liegt nur im zentralen Supabase-Postgres
+(Schemas `auth`, `aibrewgenius`, `rapt`, `storage`, `_realtime`, `public`). Alles
+andere ist stateless (Git + Docker-Hub-Images). Konzept-Details:
+[`BACKUP_RESTORE.md`](BACKUP_RESTORE.md).
+
+```
+scripts/backup.sh   (drei getrennte Pipelines, kein Klartext-Dump auf Platte)
+  docker exec supabase-db pg_dump -Fc -U supabase_admin -d postgres <schema-args>
+     ▼  gpg --symmetric AES256  (gleiche Passphrase wie .env.gpg)
+  backups/_supabase_core/core_<TS>.fc.gpg          ─► R2 backup/_supabase_core/
+  backups/brew_assistent/aibrewgenius_<TS>.fc.gpg  ─► R2 backup/brew_assistent/
+  backups/rapt_dashboard/rapt_<TS>.fc.gpg          ─► R2 backup/rapt_dashboard/
+     └─► Retention PRO ORDNER: neueste N=7 behalten (lokal + R2), BACKUP_KEEP
+
+scripts/restore.sh all
+  je Ziel:  (R2 holen) → entschlüsseln → pg_restore --clean --if-exists --no-owner
+  Reihenfolge: core ZUERST, dann brew_assistent, dann rapt_dashboard
+```
+
+- **Trigger:** nightly um 03:00 via `cron` (`/etc/cron.d/brewing-backup`), von
+  `bootstrap.sh` eingerichtet. Läuft direkt **als `alex` (kein sudo/root)**: alex
+  ist in der `docker`-Gruppe (`docker exec` ohne sudo) und owner von Repo +
+  Passphrase-Datei `/etc/brewing/gpg.pass` (mode 600, owner alex) → liest sie ohne
+  Prompt. `cron`s minimaler PATH wird in `backup.sh`/`cron.d` auf einen sane Wert
+  gesetzt, damit `docker`/`gpg`/`rclone` auflösen.
+- **Verschlüsselung:** symmetrisch AES-256, **gleiche Passphrase wie `.env.gpg`**.
+  R2 sieht nie Klartext — nur die fertigen `.fc.gpg` gehen raus.
+- **Konsistenz (bewusste Entscheidung):** die drei Dumps laufen **back-to-back
+  ohne geteilten Snapshot** (kein `pg_export_snapshot`). Das lässt ein winziges
+  Inkonsistenz-Fenster zwischen den Dumps offen — ein während des Laufs neu
+  angelegter `auth.users`-Eintrag könnte im `core`-Dump fehlen, aber von einem
+  später gedumpten App-Eintrag referenziert werden. Beim nightly-Lauf um 03:00
+  gibt es praktisch keine Schreiblast, und `--no-owner`/nicht-fatale Fehler beim
+  Restore fangen den Rand-Fall ab. Bewusst keine Snapshot-Koordination, um die
+  bash-Komplexität (offene psql-Session über drei Dumps) zu vermeiden.
+- **R2-Credentials:** `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET=backup`
+  und entweder `R2_ENDPOINT` oder `R2_ACCOUNT_ID` in `.env` (siehe `.env.example`).
+  Token: Cloudflare Dashboard → R2 → *Manage R2 API Tokens* (Object Read & Write,
+  auf den Bucket gescopt). rclone-Creds werden via `RCLONE_CONFIG_R2_*`-Env-Vars
+  übergeben (nie in der Kommandozeile/`ps`). Danach `./scripts/encrypt-env.sh` +
+  commit `.env.gpg`.
+- **Retention:** count-based, **neueste N=7 pro Ordner** (`BACKUP_KEEP`, default 7),
+  **lokal UND R2**. `backup.sh` löscht in jedem `backups/<ordner>/` und nach dem
+  Upload auch im R2-Ordner alles außer den neuesten N (per `rclone lsf`/`rclone
+  delete`). Gelabelte Dumps (`--label`) bleiben unangetastet und zählen nicht mit.
+  Keine R2-Lifecycle-Rule mehr nötig.
+
+### Restore — der fragile Teil
+
+Das `supabase/postgres`-Image legt `auth`, `storage`, `_realtime`, Extensions und
+Roles beim ersten Start **selbst** an. `pg_restore --clean --if-exists` droppt
+diese Image-Objekte vor dem Neuanlegen und löst so die Kollisionen. App-Migrationen
+sind im jeweiligen Dump enthalten — kein separater Schritt nötig.
+
+**Reihenfolge ist zwingend:** `core` zuerst (legt `auth.users` an), dann die
+App-Schemas — `aibrewgenius` und `rapt` referenzieren beide `auth.users`.
+`restore.sh all` erzwingt diese Reihenfolge automatisch.
+
+Restore läuft **nie** automatisch und **nie** ohne explizites Ziel-Argument
+(`core`/`brew_assistent`/`rapt_dashboard`/`all`) plus interaktive Bestätigung
+(`restore` tippen) bzw. `--yes`.
+
+**Bekannte, nicht-fatale Restore-Fehler** (erwartbar, kein echter Fehlschlag):
+
+- `publication "supabase_realtime" already exists` / `... does not exist`
+- Fehler/Warnungen rund um `extensions`-Schema, `pgsodium`, `vault`
+- `role "..." already exists` (vom Image vorab angelegt) — wegen `--no-owner` unkritisch
+- `must be owner of extension ...` für vom Image verwaltete Extensions
+
+`restore.sh` ruft `pg_restore` daher **ohne** `--exit-on-error` auf und bewertet
+den Erfolg über die Tabellen-Counts am Ende + den App-Smoke-Check (Login + je eine
+Query auf `aibrewgenius.*` und `rapt.*`), nicht über den Exit-Code.
+
+**Disaster-Recovery-Gesamtbild:** neuer VPS → `bootstrap.sh` (frischer Stack,
+Image-Init legt Roles/Schemas an) → `restore.sh all` (core → apps, aus R2-Bucket
+`backup`) → `cloudflare-reconcile.sh`.
+
 ## Wartung auf dem VPS
 
 ```bash
