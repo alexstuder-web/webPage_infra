@@ -138,10 +138,16 @@ beim VPS, der die jeweiligen Container betreibt.
    | Account | Cloudflare Tunnel | **Edit** | Tunnel anlegen (`POST cfd_tunnel`), Token holen, Ingress schreiben |
    | Zone | DNS | Edit | CNAMEs anlegen/ändern/löschen |
    | Zone | Zone | Read | Zone-Auflösung |
+   | Account | Access: Apps and Policies | **Edit** | Access-App + Allow-Policy für `portainer.alexstuder.cloud` automatisch anlegen (Hub-VPS) |
 
    **Hinweis:** `Cloudflare Tunnel: Edit` deckt sowohl das **Anlegen** neuer Tunnel
    (`POST /accounts/.../cfd_tunnel`) als auch das Schreiben der Ingress-Config
    (`PUT .../configurations`) ab — kein separater Scope nötig.
+   `Access: Apps and Policies: Edit` wird **nur auf dem Hub-VPS** aktiv genutzt
+   (`PORTAINER_ROLE=hub`); auf allen anderen VPS erzeugt er keinen API-Call.
+   **Einmalige Voraussetzung:** Cloudflare Zero Trust muss auf dem Account aktiviert
+   sein (Team-Domain konfiguriert — einmalig im Zero-Trust-Dashboard). Ohne diese
+   Voraussetzung schlägt der Access-Schritt mit einem deutlichen Warn-Block fehl.
 
 4. **Account Resources** → All accounts (oder selektiv)
 5. **Zone Resources** → Specific zone → `alexstuder.cloud`

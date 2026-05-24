@@ -154,7 +154,15 @@ Spoke-VPS uebergehen diese Routen — kein konkurriender Ingress, kein CNAME-Kon
 1. Hub-VPS bootstrappen (`PORTAINER_ROLE=hub`) → `portainer`-Container laeuft.
 2. Portainer-Admin-Passwort im ersten UI-Login setzen (**Credential-Schritt**).
 3. AEEC-Key aus Portainer-UI holen → `PORTAINER_EDGE_KEY=` in `.env` → `encrypt-env.sh` → commit (**Credential-Schritt**).
-4. Cloudflare Access Policy fuer `portainer.alexstuder.cloud` anlegen (**Credential-Schritt**).
+4. Cloudflare Access-App + Allow-Policy fuer `portainer.alexstuder.cloud` wird vom
+   Reconcile **automatisch per API angelegt** (kein manueller Schritt im Dashboard).
+   Einmalige Voraussetzungen (bestehen bleiben, sind keine laufenden Credential-Schritte):
+   (a) API-Token hat Scope `Access: Apps and Policies: Edit` (im Token-Setup beim ersten
+       Deployment einmalig eintragen — siehe `README.md → Cloudflare API-Token`).
+   (b) Cloudflare Zero Trust ist auf dem Account aktiviert (Team-Domain konfiguriert —
+       einmalig im Zero-Trust-Dashboard). Ohne diese Basis existiert keine Access-Schicht.
+   Der Reconcile loggt laut, falls einer der Punkte fehlt, und beendet sich mit Exit 1.
+   E-Mail-Adresse: `PORTAINER_ACCESS_EMAIL` in `.env` (Default: `alex@alexstuder.ch`).
 5. Ab dann joinen Agents auf weiteren VPS automatisch beim Bootstrap.
 
 ### Konfiguration (`.env`)
@@ -166,6 +174,7 @@ Spoke-VPS uebergehen diese Routen — kein konkurriender Ingress, kein CNAME-Kon
 | `PORTAINER_EDGE_URL` | Edge-Endpoint fuer Agents | `https://edge.alexstuder.cloud` |
 | `PORTAINER_EDGE_KEY` | wiederverwendbarer AEEC-Key (nach Hub-Setup) | (leer = Fehler bei agent-Start) |
 | `PORTAINER_EDGE_ID` | optionale feste Agent-UUID | (leer = auto) |
+| `PORTAINER_ACCESS_EMAIL` | E-Mail fuer Cloudflare Access Allow-Policy (`portainer.`) | `alex@alexstuder.ch` |
 
 ---
 

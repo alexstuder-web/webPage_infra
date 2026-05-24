@@ -674,7 +674,7 @@ docker compose --profile vps --profile portainer-hub pull portainer 2>/dev/null 
 docker compose --profile vps --profile portainer-hub up -d portainer cloudflared
 EOSU
   ok "Portainer Hub gestartet"
-  printf '\n  \033[1;33m⚠ CREDENTIAL-SCHRITT (Portainer Hub, einmalig):\033[0m\n'
+  printf '\n  \033[1;33m⚠ CREDENTIAL-SCHRITTE (Portainer Hub, einmalig):\033[0m\n'
   printf '  1. Portainer-Admin-Passwort im ersten UI-Login setzen:\n'
   printf '     https://portainer.alexstuder.cloud\n'
   printf '  2. Wiederverwendbaren Edge-Key (AEEC) erzeugen:\n'
@@ -683,8 +683,12 @@ EOSU
   printf '  3. Key in .env eintragen: PORTAINER_EDGE_KEY=<key>\n'
   printf '     Dann .env.gpg neu verschluesseln: ./scripts/encrypt-env.sh\n'
   printf '     (Passphrase aus Bitwarden: ALEXSTUDER_WEBPAGE_GPG_PASSWORD)\n'
-  printf '  4. Cloudflare Access Policy fuer portainer.alexstuder.cloud anlegen\n'
-  printf '     (Dashboard: Zero Trust → Access → Applications → portainer.alexstuder.cloud).\n'
+  printf '\n  \033[1;32m  ✓ Cloudflare Access-Policy wird automatisch angelegt:\033[0m\n'
+  printf '     Der nachfolgende Reconcile (cf_reconcile_if_token) erstellt eine\n'
+  printf '     self-hosted Access-App fuer portainer.alexstuder.cloud und eine\n'
+  printf '     Allow-Policy fuer PORTAINER_ACCESS_EMAIL (Default: alex@alexstuder.ch).\n'
+  printf '     Voraussetzung: Token-Scope "Access: Apps and Policies: Edit" +\n'
+  printf '     Zero Trust Team-Domain im Cloudflare-Account aktiviert.\n'
   printf '  Hinweis: portainer.+edge. Hostnames werden vom Reconcile NUR auf diesem\n'
   printf '  Hub-VPS beansprucht (PORTAINER_ROLE=hub Gate in cloudflare-routes.json).\n\n'
 }

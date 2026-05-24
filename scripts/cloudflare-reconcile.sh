@@ -441,4 +441,214 @@ else
   ok "$DELETED orphan CNAME(s) gelöscht"
 fi
 
+
+# ============================================================================
+# Step 4: Cloudflare Access — portainer.alexstuder.cloud (nur Hub-VPS)
+#
+# Legt eine self-hosted Access-Application für portainer.alexstuder.cloud an
+# und sichert sie mit einer Allow-Policy (E-Mail via PORTAINER_ACCESS_EMAIL,
+# Default: alex@alexstuder.ch).
+#
+# Warum NUR Hub-VPS: edge.alexstuder.cloud muss öffentlich bleiben (Edge-Agents
+# pollen ausgehend über diesen Endpoint). Wenn IS_PORTAINER_HUB=0, wird dieser
+# Block vollständig übersprungen.
+#
+# Idempotenz:
+#   App:    GET /accounts/{id}/access/apps → nach domain==portainer.alexstuder.cloud
+#           filtern → falls vorhanden: ID übernehmen, sonst POST anlegen.
+#   Policy: GET /accounts/{id}/access/apps/{app_id}/policies → nach name=="Allow
+#           Portainer Admin" filtern → falls vorhanden: übernehmen (kein Re-POST),
+#           sonst POST anlegen.
+#
+# Policy-Weg: inline unter /accounts/{id}/access/apps/{app_id}/policies.
+#   Warum nicht reusable (/accounts/{id}/access/policies + link)?
+#   Reusable-Policies brauchen einen zweistufigen Workflow (POST Policy, dann PUT
+#   link auf die App). Für eine einzelne App, die nur eine Policy braucht, ist der
+#   inline-Weg direkter, hat weniger API-Aufrufe und ist im CF-Dashboard auch als
+#   "App policy" sichtbar — keine Nachteile.
+#
+# Fehlerverhalten:
+#   - Wenn der Token keinen Access:Edit-Scope hat (403) oder Zero Trust nicht
+#     aktiviert ist: LAUTER Warn-Block + Exit 1 am Ende des Reconcile.
+#     KEIN stilles Weiterlaufen — eine ungeschützte Management-UI ist gefährlich.
+#     Aber: Tunnel + DNS wurden bereits geschrieben → harter Abbruch würde den
+#     Operator über den Fehler täuschen. Stattdessen: Reconcile läuft durch,
+#     meldet am Ende alle Fehler zusammen, und gibt Exit 1.
+# ============================================================================
+
+# Flag: wurde die Access-Einrichtung übersprungen oder hat sie versagt?
+# 0 = OK / nicht Hub  1 = fehlgeschlagen
+_ACCESS_SETUP_FAILED=0
+
+if (( IS_PORTAINER_HUB == 1 )); then
+  log "Cloudflare Access — portainer.alexstuder.cloud absichern (Hub-VPS)"
+
+  # PORTAINER_ACCESS_EMAIL aus .env lesen; Default: alex@alexstuder.ch
+  _portainer_access_email="$(_cf_get PORTAINER_ACCESS_EMAIL)"
+  _portainer_access_email="${_portainer_access_email:-alex@alexstuder.ch}"
+  ok "Access-Policy E-Mail: ${_portainer_access_email}"
+
+  _portainer_domain="portainer.alexstuder.cloud"
+  _access_app_id=""
+
+  # ---- 4a: Access-App suchen oder anlegen ----
+  # cf_call() ruft err() bei HTTP-Fehler und verlässt die Subshell mit Exit 1.
+  # err() schreibt nach stderr — ohne 2>&1 bleibt das für den Operator sichtbar.
+  # Wir fangen nur den Exit-Code via 'if !', der API-Fehlertext erscheint direkt
+  # auf dem Terminal, bevor unser Warn-Block kommt.
+  # WICHTIG: kein 'local _access_apps_raw; _access_apps_raw=$(...)' in einem Schritt
+  # (export VAR=$(cmd)-Äquivalent). Zweizeilig: erst zuweisen, dann prüfen.
+  _access_apps_raw=""
+  if ! _access_apps_raw="$(cf_call GET "/accounts/${CLOUDFLARE_ACCOUNT_ID}/access/apps")"; then
+    printf '\n\033[1;31m' >&2
+    printf '╔══════════════════════════════════════════════════════════════════════════╗\n' >&2
+    printf '║  SICHERHEITS-WARNUNG: Cloudflare Access konnte NICHT eingerichtet werden ║\n' >&2
+    printf '╠══════════════════════════════════════════════════════════════════════════╣\n' >&2
+    printf '║  portainer.alexstuder.cloud ist UNGESCHUETZT OEFFENTLICH ERREICHBAR.    ║\n' >&2
+    printf '╠══════════════════════════════════════════════════════════════════════════╣\n' >&2
+    printf '║  Ursache: GET /access/apps fehlgeschlagen.                              ║\n' >&2
+    printf '║  Haeufigstes Problem: API-Token hat NICHT den Scope                     ║\n' >&2
+    printf '║    "Access: Apps and Policies: Edit"                                    ║\n' >&2
+    printf '║  Oder: Cloudflare Zero Trust ist auf diesem Account noch nicht          ║\n' >&2
+    printf '║  aktiviert (Team-Domain fehlt).                                         ║\n' >&2
+    printf '╠══════════════════════════════════════════════════════════════════════════╣\n' >&2
+    printf '║  Sofort-Massnahmen:                                                     ║\n' >&2
+    printf '║  1. Cloudflare Dashboard → Zero Trust → Settings → sicherstellen dass   ║\n' >&2
+    printf '║     eine Team-Domain konfiguriert ist.                                  ║\n' >&2
+    printf '║  2. API-Token (CLOUDFLARE_API_TOKEN in .env) mit folgendem Scope        ║\n' >&2
+    printf '║     neu erstellen oder erweitern:                                       ║\n' >&2
+    printf '║       Account › Access: Apps and Policies › Edit                        ║\n' >&2
+    printf '║  3. ./scripts/cloudflare-reconcile.sh erneut ausfuehren.               ║\n' >&2
+    printf '║  Portainer jetzt NICHT oeffentlich nutzen bis Access aktiv ist!         ║\n' >&2
+    printf '╚══════════════════════════════════════════════════════════════════════════╝\n' >&2
+    printf '\033[0m\n' >&2
+    _ACCESS_SETUP_FAILED=1
+  else
+    # Exakter Domain-Match (Groß-/Kleinschreibung egal: domain kommt lowercase aus der API)
+    _access_app_id="$(printf '%s' "$_access_apps_raw" \
+      | jq -r --arg d "$_portainer_domain" \
+          '.result[] | select(.domain == $d) | .id' \
+      | head -1)"
+
+    if [[ -n "$_access_app_id" && "$_access_app_id" != "null" ]]; then
+      ok "Access-App '${_portainer_domain}' existiert bereits (ID: ${_access_app_id})"
+    else
+      log "Access-App '${_portainer_domain}' nicht gefunden — lege an"
+      _app_body="$(jq -nc \
+        --arg name "Portainer" \
+        --arg domain "$_portainer_domain" \
+        '{
+          type:             "self_hosted",
+          name:             $name,
+          domain:           $domain,
+          session_duration: "24h"
+        }')"
+
+      _app_create_raw=""
+      if ! _app_create_raw="$(cf_call POST "/accounts/${CLOUDFLARE_ACCOUNT_ID}/access/apps" "$_app_body")"; then
+        printf '\n\033[1;31m' >&2
+        printf '╔══════════════════════════════════════════════════════════════════════════╗\n' >&2
+        printf '║  SICHERHEITS-WARNUNG: Access-App anlegen fehlgeschlagen                 ║\n' >&2
+        printf '╠══════════════════════════════════════════════════════════════════════════╣\n' >&2
+        printf '║  portainer.alexstuder.cloud ist UNGESCHUETZT OEFFENTLICH ERREICHBAR.    ║\n' >&2
+        printf '╠══════════════════════════════════════════════════════════════════════════╣\n' >&2
+        printf '║  Fehler-Details: POST /access/apps fehlgeschlagen (siehe oben).         ║\n' >&2
+        printf '║  Scope pruefen: Account › Access: Apps and Policies › Edit              ║\n' >&2
+        printf '║  Zero Trust Team-Domain konfiguriert? (CF Dashboard → Zero Trust)       ║\n' >&2
+        printf '║  Danach: ./scripts/cloudflare-reconcile.sh erneut ausfuehren.           ║\n' >&2
+        printf '╚══════════════════════════════════════════════════════════════════════════╝\n' >&2
+        printf '\033[0m\n' >&2
+        _ACCESS_SETUP_FAILED=1
+      else
+        _access_app_id="$(printf '%s' "$_app_create_raw" | jq -r '.result.id')"
+        [[ -n "$_access_app_id" && "$_access_app_id" != "null" ]] \
+          || { printf '\033[1;31m✖ Access-App-Create lieferte keine ID\033[0m\n' >&2; _ACCESS_SETUP_FAILED=1; }
+        if (( _ACCESS_SETUP_FAILED == 0 )); then
+          ok "Access-App '${_portainer_domain}' angelegt (ID: ${_access_app_id})"
+        fi
+      fi
+    fi
+
+    # ---- 4b: Policy sicherstellen (nur wenn App-ID bekannt + kein Fehler) ----
+    if (( _ACCESS_SETUP_FAILED == 0 )) && [[ -n "$_access_app_id" ]]; then
+      _policy_name="Allow Portainer Admin"
+      _policies_raw=""
+      if ! _policies_raw="$(cf_call GET "/accounts/${CLOUDFLARE_ACCOUNT_ID}/access/apps/${_access_app_id}/policies")"; then
+        printf '\n\033[1;31m' >&2
+        printf '╔══════════════════════════════════════════════════════════════════════════╗\n' >&2
+        printf '║  SICHERHEITS-WARNUNG: Access-Policies konnten nicht abgerufen werden    ║\n' >&2
+        printf '╠══════════════════════════════════════════════════════════════════════════╣\n' >&2
+        printf '║  portainer.alexstuder.cloud koennte UNGESCHUETZT sein.                  ║\n' >&2
+        printf '║  Fehler: GET /access/apps/{id}/policies fehlgeschlagen.                 ║\n' >&2
+        printf '║  Danach: ./scripts/cloudflare-reconcile.sh erneut ausfuehren.           ║\n' >&2
+        printf '╚══════════════════════════════════════════════════════════════════════════╝\n' >&2
+        printf '\033[0m\n' >&2
+        _ACCESS_SETUP_FAILED=1
+      else
+        # Suche nach existierender Policy mit demselben Namen (idempotent: nicht duplizieren)
+        _existing_policy_id="$(printf '%s' "$_policies_raw" \
+          | jq -r --arg n "$_policy_name" \
+              '.result[] | select(.name == $n) | .id' \
+          | head -1)"
+
+        if [[ -n "$_existing_policy_id" && "$_existing_policy_id" != "null" ]]; then
+          ok "Access-Policy '${_policy_name}' existiert bereits (ID: ${_existing_policy_id})"
+        else
+          log "Access-Policy '${_policy_name}' anlegen (Allow: ${_portainer_access_email})"
+          # decision=allow, include=[{email: {email: "<addr>"}}]
+          # OTP (One-Time-PIN) ist der Default-IdP wenn kein externer IdP konfiguriert ist —
+          # kein explizites idp-Feld nötig, Cloudflare nutzt automatisch OTP.
+          _policy_body="$(jq -nc \
+            --arg name  "$_policy_name" \
+            --arg email "$_portainer_access_email" \
+            '{
+              name:     $name,
+              decision: "allow",
+              include:  [{ email: { email: $email } }]
+            }')"
+
+          _policy_create_raw=""
+          if ! _policy_create_raw="$(cf_call POST "/accounts/${CLOUDFLARE_ACCOUNT_ID}/access/apps/${_access_app_id}/policies" "$_policy_body")"; then
+            printf '\n\033[1;31m' >&2
+            printf '╔══════════════════════════════════════════════════════════════════════════╗\n' >&2
+            printf '║  SICHERHEITS-WARNUNG: Access-Policy anlegen fehlgeschlagen               ║\n' >&2
+            printf '╠══════════════════════════════════════════════════════════════════════════╣\n' >&2
+            printf '║  portainer.alexstuder.cloud hat KEINE Allow-Policy.                     ║\n' >&2
+            printf '║  Die Access-App existiert, aber ohne Policy blockiert CF jeden Zugang.  ║\n' >&2
+            printf '║  Fehler: POST /access/apps/{id}/policies fehlgeschlagen (siehe oben).   ║\n' >&2
+            printf '║  Danach: ./scripts/cloudflare-reconcile.sh erneut ausfuehren.           ║\n' >&2
+            printf '╚══════════════════════════════════════════════════════════════════════════╝\n' >&2
+            printf '\033[0m\n' >&2
+            _ACCESS_SETUP_FAILED=1
+          else
+            _new_policy_id="$(printf '%s' "$_policy_create_raw" | jq -r '.result.id')"
+            if [[ -z "$_new_policy_id" || "$_new_policy_id" == "null" ]]; then
+              printf '\n\033[1;31m  ✖ Access-Policy POST lieferte keine ID — Schutz unklar, UI evtl. ungeschuetzt.\033[0m\n' >&2
+              _ACCESS_SETUP_FAILED=1
+            else
+              ok "Access-Policy '${_policy_name}' angelegt (ID: ${_new_policy_id}, E-Mail: ${_portainer_access_email})"
+            fi
+          fi
+        fi
+      fi
+    fi
+  fi
+fi
+
+# ============================================================================
+# Abschluss
+# ============================================================================
+if (( _ACCESS_SETUP_FAILED == 1 )); then
+  printf '\n\033[1;31m' >&2
+  printf '╔══════════════════════════════════════════════════════════════════════════╗\n' >&2
+  printf '║  RECONCILE ABGESCHLOSSEN — ABER: Access-Einrichtung fehlgeschlagen!     ║\n' >&2
+  printf '║  Tunnel + DNS wurden gesetzt; Portainer-Access-Schutz FEHLT.            ║\n' >&2
+  printf '║  Sofort handeln — portainer.alexstuder.cloud ist ungeschuetzt!          ║\n' >&2
+  printf '║  Schritte: Token-Scope (Access: Apps and Policies: Edit) pruefen,       ║\n' >&2
+  printf '║  Zero Trust Team-Domain sicherstellen, Reconcile erneut ausfuehren.     ║\n' >&2
+  printf '╚══════════════════════════════════════════════════════════════════════════╝\n' >&2
+  printf '\033[0m\n' >&2
+  exit 1
+fi
+
 log "✓ Cloudflare reconcile abgeschlossen"
