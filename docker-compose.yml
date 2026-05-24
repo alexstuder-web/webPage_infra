@@ -38,7 +38,7 @@
 # Single-VPS: kein Tunnel-Hop — DATABASE_URL zeigt direkt auf supabase-db:5432 (default).
 # ==========================================================================
 
-name: brewing
+name: alexstuder
 
 services:
 
