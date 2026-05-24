@@ -2,6 +2,10 @@
 # ============================================================================
 # Brewing-Stack Postgres-Backup — Variante A (pro App getrennt, off-site)
 #
+# Marker-gesteuert: welche Jobs laufen, leitet backup.sh aus den installierten
+# stateful Units unter $STATEFUL_UNITS_DIR (/etc/brewing/stateful-units.d/) ab.
+# Auf einem stateless-only VPS (kein Marker) → sauberer No-op, Exit 0.
+#
 # Drei getrennte pg_dump -Fc als supabase_admin, jeder einzeln direkt durch GPG
 # gestreamt (kein Klartext-Dump landet je auf Platte):
 #
@@ -11,6 +15,7 @@
 #     ▼
 #   backups/<folder>/<name>_<TS>[_<label>].fc.gpg   ──►  Upload R2 backup/<folder>/
 #
+#   Unit 'supabase' — drei Jobs:
 #   1. _supabase_core  → pg_dump --exclude-schema=aibrewgenius --exclude-schema=rapt
 #                        (auth + storage + public + _realtime + Rest)
 #   2. brew_assistent  → pg_dump -n aibrewgenius
@@ -60,6 +65,9 @@ DB_CONTAINER="${DB_CONTAINER:-supabase-db}"
 PASS_FILE="${GPG_PASS_FILE:-/etc/brewing/gpg.pass}"
 # Retention: neueste N pro Ordner behalten (lokal + R2). Gelabelte Dumps exempt.
 BACKUP_KEEP="${BACKUP_KEEP:-7}"
+# Marker-Registry: leere Touch-Dateien je installierter stateful Unit.
+# Konfigurierbar via Env für isoliertes Testen (z.B. STATEFUL_UNITS_DIR=/tmp/test-units).
+STATEFUL_UNITS_DIR="${STATEFUL_UNITS_DIR:-/etc/brewing/stateful-units.d}"
 
 # ---------------------------------------------------------------- Helpers
 log()  { echo -e "\n\033[1;34m▶ $*\033[0m"; }
@@ -70,11 +78,14 @@ usage() {
   cat >&2 <<EOF
 Usage: $0 [--label <name>] [--no-upload]
 
-  --label <name>   Hängt _<name> an alle drei Dateinamen an (z.B. pre-migration).
+  --label <name>   Hängt _<name> an alle Dateinamen an (z.B. pre-migration).
                    Gelabelte Dumps sind rotation-exempt (bleiben liegen).
   --no-upload      Nur lokal sichern, kein R2-Upload.
 
-Erzeugt je Lauf drei verschlüsselte Dumps:
+Welche Jobs laufen, wird aus den Markern in \$STATEFUL_UNITS_DIR
+(${STATEFUL_UNITS_DIR}) abgeleitet. Kein Marker → No-op, Exit 0.
+
+Unit 'supabase' erzeugt drei Dumps:
   backups/_supabase_core/core_<TS>.fc.gpg
   backups/brew_assistent/aibrewgenius_<TS>.fc.gpg
   backups/rapt_dashboard/rapt_<TS>.fc.gpg
@@ -103,12 +114,70 @@ fi
 [[ "$BACKUP_KEEP" =~ ^[0-9]+$ && "$BACKUP_KEEP" -ge 1 ]] \
   || err "BACKUP_KEEP muss eine Ganzzahl >= 1 sein (gefunden: '$BACKUP_KEEP')"
 
+# ---------------------------------------------------------------- Marker-Discovery + Unit→Jobs-Registry
+# Liest installierten stateful Units aus $STATEFUL_UNITS_DIR.
+# Leeres Markerset → No-op, Exit 0 (BEVOR irgendein docker inspect läuft).
+# Erweiterbarkeit: neue Unit X → (a) Marker /etc/brewing/stateful-units.d/X beim
+# Install setzen + (b) neuer Zweig in unit_jobs() hinzufügen. Kein Kern-Flow-Umbau.
+
+# unit_jobs <unit>: gibt "folder stem" Paare aus (je eine Zeile).
+unit_jobs() {
+  case "$1" in
+    supabase)
+      printf '%s\n' \
+        "_supabase_core core" \
+        "brew_assistent aibrewgenius" \
+        "rapt_dashboard rapt"
+      ;;
+    # Erweiterungspunkt: weitere Units hier als neuer case-Zweig eintragen.
+    *)
+      err "unit_jobs: unbekannte Unit '$1'"
+      ;;
+  esac
+}
+
+# Effektive Job-Liste aus vorhandenen Markern aufbauen.
+declare -a FOLDERS=()
+declare -a STEMS=()
+
+if [[ -d "$STATEFUL_UNITS_DIR" ]]; then
+  shopt -s nullglob
+  for _marker in "$STATEFUL_UNITS_DIR"/*; do
+    _unit="$(basename "$_marker")"
+    # I3: Unbekannte Unit mit Warnung überspringen statt hart abbrechen —
+    # eine Fremddatei (z.B. .gitkeep) darf nicht den ganzen Backup-Lauf killen.
+    # Subshell-Check: unit_jobs ruft intern err() → exit 1; den Exit in einer
+    # Subshell fangen, damit er nicht den Haupt-Prozess beendet.
+    if ! ( unit_jobs "$_unit" >/dev/null 2>&1 ); then
+      log "WARNUNG: unbekannte Unit '$_unit' in ${STATEFUL_UNITS_DIR} — übersprungen"
+      continue
+    fi
+    while IFS=' ' read -r _folder _stem; do
+      FOLDERS+=("$_folder")
+      STEMS+=("$_stem")
+    done < <(unit_jobs "$_unit")
+  done
+  shopt -u nullglob
+fi
+
+if (( ${#FOLDERS[@]} == 0 )); then
+  log "Keine stateful Unit installiert (${STATEFUL_UNITS_DIR} leer oder fehlt) — nichts zu sichern."
+  ok "No-op — stateless-only VPS. Backup-Cron läuft, tut aber nichts."
+  exit 0
+fi
+
 # ---------------------------------------------------------------- Pre-flight
+# Nur wenn tatsächlich Jobs vorhanden: Tools + Container prüfen.
 command -v docker >/dev/null 2>&1 || err "docker fehlt"
 command -v gpg    >/dev/null 2>&1 || err "gpg fehlt"
 [[ -f "$ENV_FILE" ]] || err "Keine .env — erst ./scripts/decrypt-env.sh"
-docker inspect "$DB_CONTAINER" >/dev/null 2>&1 \
-  || err "Container '$DB_CONTAINER' läuft nicht — Stack starten (docker compose ... up -d)"
+
+# supabase-db-Check: nur wenn supabase-Jobs aktiv (Marker gesetzt).
+# Fehlt der Container obwohl Marker da → echter Fehlerfall, Hard-Fail korrekt.
+if [[ -d "$STATEFUL_UNITS_DIR" ]] && [[ -f "${STATEFUL_UNITS_DIR}/supabase" ]]; then
+  docker inspect "$DB_CONTAINER" >/dev/null 2>&1 \
+    || err "Container '$DB_CONTAINER' läuft nicht — Stack starten (docker compose ... up -d)"
+fi
 
 mkdir -p "$BACKUP_DIR"
 
@@ -140,15 +209,11 @@ else
 fi
 [[ -s "$PASS_TMP" ]] || err "Passphrase ist leer"
 
-# ---------------------------------------------------------------- Dump-Definitionen
-# Drei parallele Arrays (bash-3-sicher wäre assoz., aber wir sind eh bash 4+):
-#   FOLDERS  Unterordner unter backups/ und R2 backup/
-#   STEMS    Dateinamen-Präfix (vor _<TS>)
-# pg_dump-Argumente je Schritt liefert dump_args().
-FOLDERS=(_supabase_core brew_assistent rapt_dashboard)
-STEMS=(core aibrewgenius rapt)
-
-# Liefert die pg_dump-Schema-Argumente für einen Ordner (als Wort-Liste via echo).
+# ---------------------------------------------------------------- pg_dump-Argumente je Ordner
+# dump_args() wird von dump_one() aufgerufen und gibt die pg_dump-Schema-Argumente
+# für einen folder-Wert zurück (als Wort-Liste via echo).
+# Die FOLDERS/STEMS-Arrays werden marker-gesteuert oben befüllt; dump_args() ist
+# die Job-Definition (was gedumpt wird) und bleibt davon getrennt.
 dump_args() {
   case "$1" in
     _supabase_core) echo "--exclude-schema=aibrewgenius --exclude-schema=rapt" ;;
@@ -331,4 +396,4 @@ else
   echo "  --no-upload gesetzt — Off-site-Upload + R2-Rotation übersprungen."
 fi
 
-log "✓ Backup abgeschlossen (3 Dumps: ${STEMS[*]})"
+log "✓ Backup abgeschlossen (${#STEMS[@]} Dumps: ${STEMS[*]})"
