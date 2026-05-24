@@ -1,12 +1,16 @@
 {
   "_comment": "Deklarative Routing-Map: Hostname → Container:Port. Bootstrap/Reconcile liest das hier, vergleicht mit Cloudflare-Tunnel-Config + DNS, und gleicht ab. Änderungen einfach hier eintragen, dann ./scripts/cloudflare-reconcile.sh. Reihenfolge bleibt erhalten; catch-all wird automatisch am Ende angehängt.",
 
+  "_comment_tcp": "db-tcp.alexstuder.cloud ist ein TCP-Ingress (service: tcp://...). cloudflare-reconcile.sh schreibt die gesamte Ingress-Config via PUT /cfd_tunnel/.../configurations — das deckt HTTP UND TCP-Einträge ab. Der Reconcile braucht dafür KEINE Erweiterung: er baut den ingress-Array aus routes[] und pusht ihn komplett. ACHTUNG: Der client-seitige 'cloudflared access tcp'-Zugriff auf diesen Hostname benötigt eine Cloudflare Access Application + Service-Token (Credential-Schritt; siehe docker-compose.tunnel-tcp.yml). Solange die Access Application nicht angelegt ist, lehnt Cloudflare den TCP-Tunnel-Zugriff ab. Der DNS-CNAME für db-tcp.alexstuder.cloud wird vom Reconcile wie alle anderen Hostnames angelegt.",
+
   "routes": [
     { "hostname": "alexstuder.cloud",              "service": "http://web-hauptseite:80" },
     { "hostname": "aibrewgenius.alexstuder.cloud", "service": "http://web-assistent:80" },
     { "hostname": "rapt.alexstuder.cloud",         "service": "http://web-rapt:80" },
     { "hostname": "api.alexstuder.cloud",          "service": "http://api-proxy:3000" },
     { "hostname": "supabase.alexstuder.cloud",     "service": "http://supabase-kong:8000" },
-    { "hostname": "studio.alexstuder.cloud",       "service": "http://supabase-studio:3000" }
+    { "hostname": "studio.alexstuder.cloud",       "service": "http://supabase-studio:3000" },
+    { "hostname": "db-tcp.alexstuder.cloud",       "service": "tcp://supabase-db:5432",
+      "_comment": "TCP-Ingress für Postgres cross-VPS. Kein HTTP — cloudflared tunnelt roh-TCP. Nur aktiv wenn Supabase-Block auf diesem VPS läuft. DNS-CNAME wird vom Reconcile wie HTTP-Hostnames angelegt." }
   ]
 }

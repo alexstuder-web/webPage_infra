@@ -6,6 +6,37 @@
 #   curl -fsSL https://raw.githubusercontent.com/alexstuder-web/webPage_infra/main/scripts/bootstrap.sh -o bootstrap.sh && chmod +x bootstrap.sh && ./bootstrap.sh
 #
 # Lokales Dev: docker-compose.dev.yml (Ports exposed, kein Tunnel/Watchtower).
+#
+# ==========================================================================
+# EINHEITEN-MAPPING — Phase 1 Multi-VPS (Phase 2 Bootstrap-Menü nutzt dies)
+# ==========================================================================
+# Jede Einheit ist über Service-Namen gezielt startbar.
+# Per-Einheit-Profile (profiles: [assistent|rapt|proxy|supabase]) wurden
+# NICHT eingeführt — Freigabe fehlt (§8 PHASE1_COMPOSE_TUNNEL_CICD.md).
+# Stattdessen: explizite Service-Gruppen per Kommando.
+#
+# Einheit            Befehl                                    Zieht mit
+# ─────────────────────────────────────────────────────────────────────────
+# brew_assistent     docker compose up -d web_assistent        (zustandslos)
+# rapt_dashboard     docker compose up -d web_rapt             (zustandslos)
+# proxy              docker compose up -d api_proxy            kein depends_on
+#                                                               Supabase muss
+#                                                               erreichbar sein
+# Supabase/DB        docker compose up -d supabase-kong        depends_on zieht
+#                                                               alle Supabase-
+#                                                               Services + DB
+# cloudflared+wt     docker compose --profile vps up -d        cloudflared +
+#                                                               watchtower
+# Alle (VPS)         docker compose --profile vps up -d
+#
+# Cross-VPS-DB via Cloudflare Tunnel (TCP):
+#   DB-VPS (tunnel-ingress): docker compose -f docker-compose.yml \
+#                              -f docker-compose.tunnel-tcp.yml up -d cloudflared-db-tcp
+#   Proxy-VPS (access-tcp):  docker compose -f docker-compose.yml \
+#                              -f docker-compose.tunnel-tcp.yml up -d cloudflared-access-tcp
+# Loopback-Port für den access-tcp-Client: 15432 (frei von Dev-Ports 54321-54323/8081-8083/8090)
+# Single-VPS: kein Tunnel-Hop — DATABASE_URL zeigt direkt auf supabase-db:5432 (default).
+# ==========================================================================
 
 name: brewing
 
@@ -56,7 +87,18 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
+      # DATABASE_URL: Lokal/Single-VPS → proxy_sync auf supabase-db:5432 (direkter Service-Name).
+      # Cross-VPS (Proxy auf anderem VPS als DB): auf host.docker.internal des cloudflared access tcp:
+      #   DATABASE_URL=postgres://proxy_sync:${PROXY_SYNC_PASSWORD}@host.docker.internal:15432/postgres?sslmode=disable
+      # sslmode=disable ist korrekt: supabase/postgres hat SSL=off; TLS übernimmt der Cloudflare-Tunnel.
+      # WICHTIG: Beide Vars müssen in .env gesetzt sein — PROXY_SYNC_PASSWORD (dediziertes Passwort
+      # für proxy_sync, nicht POSTGRES_PASSWORD) und bei Cross-VPS DATABASE_URL explizit überschreiben.
+      # Wert aus .env überschreibt diesen Default, falls DATABASE_URL dort gesetzt ist.
+      DATABASE_URL: ${DATABASE_URL:-postgres://proxy_sync:${PROXY_SYNC_PASSWORD}@supabase-db:5432/postgres?sslmode=disable}
+      # SUPABASE_INTERNAL_URL: Kong-Endpunkt für Proxy→Supabase-Verbindung im selben Docker-Netz.
+      # server.js bevorzugt SUPABASE_INTERNAL_URL vor SUPABASE_PUBLIC_URL (Z. 22-26).
+      # Cross-VPS: über Cloudflare HTTP-Tunnel via supabase.alexstuder.cloud (dann aus .env setzen).
+      SUPABASE_INTERNAL_URL: ${SUPABASE_INTERNAL_URL:-http://supabase-kong:8000}
     labels:
       com.centurylinklabs.watchtower.enable: "true"
     networks:
@@ -85,6 +127,11 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD}
       JWT_SECRET: ${JWT_SECRET}
       JWT_EXP: 3600
+      # PROXY_SYNC_PASSWORD muss explizit durchgereicht werden, damit
+      # docker-entrypoint-initdb.d/zz-set-role-passwords.sh es sieht.
+      # supabase-db hat kein env_file — nur explizit gelistete Vars landen
+      # im Container-Environment.
+      PROXY_SYNC_PASSWORD: ${PROXY_SYNC_PASSWORD}
     volumes:
       - supabase-db-data:/var/lib/postgresql/data
       # Einzeldatei-Mounts mit zz- Prefix, damit sie alphabetisch NACH der

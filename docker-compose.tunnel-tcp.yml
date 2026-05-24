@@ -1,0 +1,79 @@
+# Tunnel-TCP-Override — Postgres cross-VPS über Cloudflare Tunnel.
+#
+# Dieses Override ist NICHT im Default-Pfad aktiv.
+# Single-VPS: nicht einbinden — DATABASE_URL zeigt direkt auf supabase-db:5432.
+#
+# ZWEI Einsatz-Szenarien (je nach VPS-Rolle):
+#
+# ─── Szenario A: DB-VPS (enthält supabase-db) ────────────────────────────────
+# Der cloudflared-Daemon auf dem DB-VPS muss mit einem TCP-Ingress konfiguriert
+# sein, der db-tcp.alexstuder.cloud auf tcp://supabase-db:5432 mappt.
+# Das erledigt cloudflare-reconcile.sh über die Tunnel-Config-API sobald der
+# TCP-Eintrag in cloudflare-routes.json steht (dort bereits eingetragen).
+# cloudflared läuft auf dem DB-VPS über das Standard-`profiles: [vps]` in
+# docker-compose.yml — kein Extra-Dienst nötig.
+#
+# ─── Szenario B: Proxy-VPS (enthält api_proxy, kein supabase-db) ─────────────
+# cloudflared-access-tcp bindet den Remote-DB-Hostname lokal auf Port 15432
+# des Hosts (network_mode: host).
+# api_proxy erreicht den Host-Loopback über host.docker.internal:15432 —
+# auf Linux ist das NICHT automatisch aufgelöst; deshalb fügt diese Datei
+# api_proxy eine extra_hosts-Stanza hinzu:
+#   host.docker.internal → host-gateway
+# DATABASE_URL muss entsprechend auf host.docker.internal:15432 zeigen (s.u.).
+#
+# Start auf dem Proxy-VPS:
+#   docker compose -f docker-compose.yml -f docker-compose.tunnel-tcp.yml \
+#     --profile vps up -d cloudflared-access-tcp api_proxy
+#
+# .env auf dem Proxy-VPS muss enthalten:
+#   DATABASE_URL=postgres://proxy_sync:${PROXY_SYNC_PASSWORD}@host.docker.internal:15432/postgres?sslmode=disable
+#   CF_ACCESS_CLIENT_ID=<Service-Token-ID aus Cloudflare Access Application>
+#   CF_ACCESS_CLIENT_SECRET=<Service-Token-Secret>
+#
+# Voraussetzung Credential-Schritt (User):
+#   Im Cloudflare-Dashboard eine Access Application für db-tcp.alexstuder.cloud
+#   anlegen (Typ: Self-hosted, TCP, Port 15432) und einen Service-Token erstellen.
+#   Die Token-ID + Secret in .env eintragen, dann .env.gpg re-encrypten.
+#
+# Port 15432: frei von Dev-Ports (54321-54323, 8081-8083, 8090).
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # cloudflared-access-tcp — Client-Seite (Proxy-VPS)
+  # Bindet db-tcp.alexstuder.cloud:5432 lokal auf 127.0.0.1:15432 des Hosts.
+  # api_proxy verbindet sich via DATABASE_URL gegen host.docker.internal:15432.
+  # network_mode: host ist nötig, weil `cloudflared access tcp` einen lokalen
+  # Listener auf dem Host-Interface öffnet. Da dieser Service host-Netz nutzt,
+  # gehört er keinem benannten Docker-Netz an.
+  # ---------------------------------------------------------------------------
+  cloudflared-access-tcp:
+    container_name: cloudflared-access-tcp
+    image: cloudflare/cloudflared:2026.5.0
+    profiles: [vps]
+    restart: unless-stopped
+    # network_mode: host → kein named network nötig/möglich.
+    network_mode: host
+    environment:
+      # Service-Token für Cloudflare Access (schützt den TCP-Tunnel-Endpunkt).
+      # NIEMALS in argv — nur über Env-Vars (nicht ps-sichtbar).
+      CF_ACCESS_CLIENT_ID: ${CF_ACCESS_CLIENT_ID}
+      CF_ACCESS_CLIENT_SECRET: ${CF_ACCESS_CLIENT_SECRET}
+    command: >
+      access tcp
+      --hostname ${DB_TCP_HOSTNAME:-db-tcp.alexstuder.cloud}
+      --url localhost:${DB_TCP_LOCAL_PORT:-15432}
+
+  # ---------------------------------------------------------------------------
+  # api_proxy — Override für Cross-VPS-Szenario B
+  # Fügt host.docker.internal → host-gateway hinzu, damit api_proxy (bridge-Netz)
+  # den Host-Loopback auf Linux erreichen kann, wo der cloudflared-access-tcp-
+  # Listener auf 127.0.0.1:15432 lauscht.
+  # Ohne extra_hosts wäre host.docker.internal auf Linux nicht aufgelöst und
+  # DATABASE_URL postgres://...@host.docker.internal:15432/... würde fehlschlagen.
+  # ---------------------------------------------------------------------------
+  api_proxy:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
