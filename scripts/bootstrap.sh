@@ -321,6 +321,143 @@ EOF
 } # end run_base_bootstrap
 
 # ================================================================
+# CLOUDFLARE TUNNEL-ENSURE HELPER
+# (VOR dem Container-Start aufrufen — Reihenfolge: ensure → up → reconcile)
+#
+# Was hier passiert:
+#   1. Guard: nur ausführen wenn CLOUDFLARE_API_TOKEN in .env gesetzt.
+#   2. Tunnel-Ensure via cloudflare-reconcile.sh --ensure-tunnel-only:
+#      Sucht "brewing-<sanitisierter-hostname>" → ID holen oder Tunnel neu anlegen.
+#      Schreibt CLOUDFLARE_TUNNEL_ID in die lokale .env.
+#   3. Connector-Token holen (GET .../token) → in lokale .env als
+#      CLOUDFLARE_TUNNEL_TOKEN schreiben (Variante a, §5.4):
+#        • Token kommt nie in argv oder Log.
+#        • CLOUDFLARE_TUNNEL_TOKEN in .env ist lokal-only (gitignored).
+#        • Nie in .env.gpg — Bootstrap schreibt ihn pro VPS frisch.
+#   4. Idempotenz: bei existierendem Tunnel wird der Token erneut abgeholt
+#      (GET .../token liefert immer den selben verwendbaren Token, A-2).
+#      docker compose up -d recreated cloudflared nur wenn TUNNEL_TOKEN
+#      in .env sich geändert hat (Variante a: compose liest ${CLOUDFLARE_TUNNEL_TOKEN}).
+#
+# Token-Sicherheit:
+#   • Kein set -x um das Token-Schreiben.
+#   • Token wird nie via log/ok/echo ausgegeben.
+#   • Token läuft über eine tmp-Datei (mode 600) → in CLEANUP_FILES registriert.
+#   • mv .env atomisch (kein Fenster mit halbem .env auf Platte).
+# ================================================================
+cf_ensure_tunnel_if_token() {
+  if sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+grep -q '^CLOUDFLARE_API_TOKEN=.\+' "$APP_DIR/.env"
+EOSU
+  then
+    log "Cloudflare Tunnel-Ensure (pro-VPS, idempotent)"
+
+    # ---- Schritt A: Tunnel-Ensure + Tunnel-ID in .env schreiben ----
+    # cloudflare-reconcile.sh --ensure-tunnel-only (I-2): das Script leitet intern
+    # stdout nach stderr um (exec 3>&1 1>&2) und schreibt nur 'TUNNEL_ID=<id>'
+    # gezielt nach fd3 (= ursprünglicher stdout = dieser $()-Kanal). Damit landen
+    # Diagnose-Ausgaben (log/ok, ANSI) auf stderr, und $() fängt sauber nur die
+    # eine Maschinen-Zeile ab.
+    local ensure_out
+    ensure_out="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+set -euo pipefail
+cd "$APP_DIR"
+./scripts/cloudflare-reconcile.sh --ensure-tunnel-only
+EOSU
+)"
+    # TUNNEL_ID extrahieren — robust, weil ensure_out nur die eine Zeile enthält
+    local tunnel_id
+    tunnel_id="$(printf '%s' "$ensure_out" | grep '^TUNNEL_ID=' | cut -d= -f2-)"
+    [[ -n "$tunnel_id" ]] \
+      || err "cf_ensure_tunnel_if_token: Tunnel-Ensure lieferte keine TUNNEL_ID (Output: ${ensure_out})"
+    ok "Tunnel-ID: ${tunnel_id}"
+
+    # ---- Schritt B: Connector-Token holen (GET .../token) ----
+    # Token wird über ein mode-600-Tempfile transportiert (nie in argv/log).
+    # A-2: GET .../token liefert für existierenden Tunnel denselben Token (re-run-sicher).
+    local cf_api_token cf_account_id
+    cf_api_token="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+grep -E "^CLOUDFLARE_API_TOKEN=[[:print:]]" "$APP_DIR/.env" | head -1 | cut -d= -f2-
+EOSU
+)"
+    cf_account_id="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+grep -E "^CLOUDFLARE_ACCOUNT_ID=[[:print:]]" "$APP_DIR/.env" | head -1 | cut -d= -f2-
+EOSU
+)"
+
+    # Token-Tempfile: mode 600, in CLEANUP_FILES registrieren
+    local token_tmp
+    token_tmp="$(sudo -u "$APP_USER" mktemp)"
+    CLEANUP_FILES+=("$token_tmp")
+    chmod 600 "$token_tmp"
+
+    # Token holen und in Tempfile schreiben — kein set -x, kein echo
+    # Zweizeilig: erst zuweisen, dann exportieren (kein export VAR="$(cmd)")
+    sudo -u "$APP_USER" -H \
+      CF_API_TOKEN="$cf_api_token" \
+      CF_ACCOUNT_ID="$cf_account_id" \
+      CF_TUNNEL_ID="$tunnel_id" \
+      TOKEN_TMP="$token_tmp" \
+      bash <<'EOSU'
+set -euo pipefail
+# Connector-Token abrufen (GET /accounts/{acct}/cfd_tunnel/{id}/token)
+# Authorization-Header enthält den API-Token (pre-existing Muster).
+raw="$(curl -sS -w '\n%{http_code}' -X GET \
+  -H "Authorization: Bearer ${CF_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${CF_TUNNEL_ID}/token")"
+http_code="${raw##*$'\n'}"
+resp_body="${raw%$'\n'*}"
+if (( http_code < 200 || http_code >= 300 )); then
+  printf 'Token-Abruf HTTP-Fehler %s\n' "$http_code" >&2
+  exit 1
+fi
+success="$(printf '%s' "$resp_body" | jq -r '.success // false')"
+if [[ "$success" != "true" ]]; then
+  printf 'Token-Abruf CF-Fehler: %s\n' "$(printf '%s' "$resp_body" | jq -c '.errors // .')" >&2
+  exit 1
+fi
+# Token aus .result (String) — kein echo, direkt in Datei
+printf '%s' "$resp_body" | jq -r '.result' > "$TOKEN_TMP"
+EOSU
+
+    # ---- Schritt C: Token in lokale .env schreiben (Variante a, §5.4) ----
+    # Atomisch: erst .env-Kopie ohne die alte Zeile, dann neue Zeile, dann mv.
+    # KEIN set -x ab hier (Token ist sensitiv).
+    local env_tmp
+    env_tmp="$(sudo -u "$APP_USER" mktemp)"
+    CLEANUP_FILES+=("$env_tmp")
+    chmod 600 "$env_tmp"
+
+    sudo -u "$APP_USER" -H \
+      APP_DIR="$APP_DIR" \
+      TOKEN_TMP="$token_tmp" \
+      ENV_TMP="$env_tmp" \
+      bash <<'EOSU'
+set -euo pipefail
+# Neue .env ohne alte CLOUDFLARE_TUNNEL_TOKEN-Zeile + neue Zeile hinten
+grep -v '^CLOUDFLARE_TUNNEL_TOKEN=' "$APP_DIR/.env" > "$ENV_TMP" || true
+# C-2: Token-Bytes direkt via cat durchreichen — KEINE Command-Substitution
+# (kein "$(cat ...)" — das würde den Token als Shell-Wort expandieren und
+# trailing newlines trimmen; außerdem ps-sichtbar wenn in argv).
+{ printf 'CLOUDFLARE_TUNNEL_TOKEN='; cat "$TOKEN_TMP"; printf '\n'; } >> "$ENV_TMP"
+# Atomisch tauschen
+mv "$ENV_TMP" "$APP_DIR/.env"
+chmod 600 "$APP_DIR/.env"   # I-3: Mode nach mv erzwingen (umask-sicher)
+EOSU
+
+    # Tempfiles sofort aufräumen + aus CLEANUP_FILES entfernen
+    rm -f "$token_tmp" "$env_tmp" 2>/dev/null || true
+    mapfile -t CLEANUP_FILES < <(printf '%s\n' "${CLEANUP_FILES[@]}" | grep -vxF "$token_tmp" | grep -vxF "$env_tmp")
+
+    ok "Cloudflare Tunnel-Ensure abgeschlossen (Token in lokaler .env — nicht in .env.gpg)"
+  else
+    echo "  CLOUDFLARE_API_TOKEN nicht gesetzt — Tunnel-Ensure übersprungen."
+    echo "  Token + Tunnel-ID werden pro VPS automatisch gesetzt sobald CLOUDFLARE_API_TOKEN in .env steht."
+  fi
+}
+
+# ================================================================
 # CLOUDFLARE RECONCILE HELPER (wiederverwendbar, nach jedem Container-Start)
 # ================================================================
 cf_reconcile_if_token() {
@@ -364,6 +501,7 @@ action_install_unit() {
     1)
       log "brew_assistent + Supabase installieren/starten"
       echo "  Services: web_assistent supabase-kong (depends_on zieht auth/rest/realtime/storage/meta/db mit)"
+      cf_ensure_tunnel_if_token
       sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
 set -euo pipefail
 cd "$APP_DIR"
@@ -377,6 +515,7 @@ EOSU
     2)
       log "RAPT Dashboard installieren/starten"
       echo "  Service: web_rapt (zustandslos, kein depends_on)"
+      cf_ensure_tunnel_if_token
       sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
 set -euo pipefail
 cd "$APP_DIR"
@@ -391,6 +530,7 @@ EOSU
       # api_proxy hat kein depends_on auf Supabase in docker-compose.yml — muss
       # manuell geprüft werden (§5.1 BOOTSTRAP_MENU_KONZEPT.md Annahme 3).
       echo "  Prüfe, ob supabase-db läuft..."
+      cf_ensure_tunnel_if_token
       local supabase_running=0
       sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU' && supabase_running=1 || supabase_running=0
 docker inspect --format='{{.State.Running}}' supabase-db 2>/dev/null | grep -q '^true$'
@@ -418,6 +558,7 @@ EOSU
     4)
       log "WebPageAlexStuder installieren/starten"
       echo "  Service: web_hauptseite (statisches Nginx, kein depends_on)"
+      cf_ensure_tunnel_if_token
       sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
 set -euo pipefail
 cd "$APP_DIR"
@@ -704,6 +845,8 @@ EOSU
   # ===========================================================================
   log "(c) ${app_name} auf neuem VPS hochziehen"
   # Selektiver Start analog §5.1 (Service-Namen, kein Per-App-Profil).
+  # Tunnel-Ensure VOR dem Container-Start (Reihenfolge §3).
+  cf_ensure_tunnel_if_token
   case "$app_name" in
     brew_assistent)
       echo "  Services: web_assistent supabase-kong (depends_on zieht Supabase-Core mit)"
@@ -864,6 +1007,7 @@ main_menu() {
     case "$menu_choice" in
       1)
         log "Komplett-Stack starten (Profil: vps)"
+        cf_ensure_tunnel_if_token
         sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
 set -euo pipefail
 cd "$APP_DIR"

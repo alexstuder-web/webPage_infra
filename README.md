@@ -85,7 +85,25 @@ Dev-Override aktiviert Localhost-Ports (`:8081` web_assistent, `:8082` web_rapt,
 `:54323` studio). `cloudflared` + `watchtower` laufen lokal **nicht** (sind
 hinter `profiles: [vps]`).
 
-## Cloudflare Tunnel + DNS  (idempotent via API)
+## Cloudflare Tunnel + DNS  (pro VPS dynamisch, idempotent via API)
+
+### Pro-VPS-Tunnel-Modell
+
+Jeder VPS bekommt beim Bootstrap **automatisch seinen eigenen Cloudflare-Tunnel**
+(angelegt per API, Name `brewing-<sanitisierter-hostname>`, idempotent). Der
+`cloudflared`-Container läuft mit dem VPS-eigenen Connector-Token; jeder VPS
+routet nur die Hostnames, deren Ziel-Container **auf ihm tatsächlich laufen**.
+
+Reihenfolge beim Bootstrap:
+1. **Tunnel-Ensure** (`cf_ensure_tunnel_if_token`): sucht `brewing-<hostname>` in der
+   CF-Account-Tunnel-Liste → ID + Token holen oder neuen Tunnel anlegen.
+   Token und ID werden in die **lokale `.env`** geschrieben (nie in `.env.gpg`).
+2. **Container starten** (`docker compose --profile vps up -d … cloudflared`):
+   `cloudflared` liest `TUNNEL_TOKEN` aus `.env` — ist der Token neu, wird der
+   Container beim `up -d` recreated.
+3. **Reconcile** (`cf_reconcile_if_token`): gleicht Tunnel-Ingress + DNS-CNAMEs
+   gegen die laufenden Container ab. Nicht laufende Ziel-Container werden
+   übersprungen (kein Hostname auf diesem VPS beansprucht).
 
 Routing-Map liegt deklarativ in [`scripts/cloudflare-routes.json`](scripts/cloudflare-routes.json):
 
@@ -97,45 +115,56 @@ Routing-Map liegt deklarativ in [`scripts/cloudflare-routes.json`](scripts/cloud
 | `api.alexstuder.cloud` | `api-proxy:3000` | OpenAI/RAPT/Brewfather Proxy |
 | `supabase.alexstuder.cloud` | `supabase-kong:8000` | Auth/REST/Realtime/Storage API |
 | `studio.alexstuder.cloud` | `supabase-studio:3000` | Admin UI — Cloudflare Access davor! |
+| `db-tcp.alexstuder.cloud` | `tcp://supabase-db:5432` | TCP-Postgres cross-VPS |
 
 `./scripts/cloudflare-reconcile.sh` ist **idempotent**: bei jedem Lauf wird
-die Tunnel-Ingress-Config gegen die JSON gediffed, fehlende DNS-CNAMEs
-angelegt, abweichende auf den Tunnel umgebogen. Wird vom `bootstrap.sh`
-automatisch am Ende aufgerufen und kann jederzeit manuell laufen — z.B.
-nach Editieren der `routes.json`.
+die Tunnel-Ingress-Config gegen die JSON gediffed, nur **laufende** Ziel-Container
+werden beansprucht, fehlende DNS-CNAMEs angelegt, abweichende umgebogen.
+Wird vom `bootstrap.sh` automatisch nach dem Container-Start aufgerufen und
+kann jederzeit manuell laufen — z.B. nach Editieren der `routes.json`.
 
-### API-Token erstellen  (einmalig)
+"Was du startest, wird geroutet" — auf einem VPS mit nur `web-rapt` laufend
+wird nur `rapt.alexstuder.cloud` beansprucht; die anderen Hostnames bleiben
+beim VPS, der die jeweiligen Container betreibt.
+
+### API-Token erstellen  (einmalig, geteilt über alle VPS)
 
 1. https://dash.cloudflare.com → Profile → **API Tokens** → *Create Token* → *Custom token*
 2. Name: `webPage_infra-bootstrap`
 3. Permissions:
 
-   | Type | Resource | Permission |
-   |---|---|---|
-   | Account | Cloudflare Tunnel | Edit |
-   | Zone | DNS | Edit |
-   | Zone | Zone | Read |
+   | Type | Resource | Permission | Wofür |
+   |---|---|---|---|
+   | Account | Cloudflare Tunnel | **Edit** | Tunnel anlegen (`POST cfd_tunnel`), Token holen, Ingress schreiben |
+   | Zone | DNS | Edit | CNAMEs anlegen/ändern/löschen |
+   | Zone | Zone | Read | Zone-Auflösung |
+
+   **Hinweis:** `Cloudflare Tunnel: Edit` deckt sowohl das **Anlegen** neuer Tunnel
+   (`POST /accounts/.../cfd_tunnel`) als auch das Schreiben der Ingress-Config
+   (`PUT .../configurations`) ab — kein separater Scope nötig.
 
 4. **Account Resources** → All accounts (oder selektiv)
 5. **Zone Resources** → Specific zone → `alexstuder.cloud`
 6. Create → Token **einmalig** kopieren
 
-Plus drei IDs (alle im Dashboard sichtbar, keine Secrets):
-
-- **Account ID** — Dashboard-Hauptseite, rechte Sidebar
-- **Zone ID** — `alexstuder.cloud` öffnen, rechte Sidebar
-- **Tunnel ID** — Zero Trust → Networks → Tunnels → dein Tunnel → UUID in der URL
-
-Diese 4 Werte in `.env`:
+Nur **drei** Werte in `.env.gpg` (geteilt):
 
 ```env
 CLOUDFLARE_API_TOKEN=<token>
 CLOUDFLARE_ACCOUNT_ID=<id>
 CLOUDFLARE_ZONE_ID=<id>
-CLOUDFLARE_TUNNEL_ID=<id>
 ```
 
-Dann `./scripts/encrypt-env.sh && git add .env.gpg && git commit && git push`.
+`CLOUDFLARE_TUNNEL_TOKEN` und `CLOUDFLARE_TUNNEL_ID` **nicht** in `.env.gpg` eintragen —
+der Bootstrap setzt sie pro VPS automatisch in der **lokalen** `.env`.
+
+```bash
+# Nach dem Setzen der drei geteilten CF-Werte in .env:
+./scripts/encrypt-env.sh && git add .env.gpg && git commit && git push
+```
+
+Die Zone ID steht im Dashboard unter `alexstuder.cloud` rechte Sidebar;
+die Account ID auf der Dashboard-Hauptseite rechte Sidebar.
 
 ## Backup & Restore
 

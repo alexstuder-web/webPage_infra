@@ -43,6 +43,24 @@ Wenn der Proxy (oder eine andere Einheit) auf einem **anderen** VPS läuft als d
 
 > **WICHTIG:** Postgres ist eine TCP-/Nicht-HTTP-Connection. Cloudflare-Tunnel-TCP-Ingress + `cloudflared access tcp` ist genau dafür da. Das ist eine **neue Compose-/cloudflared-Konfiguration** und gehört in Phase 1 (cicd-coder). Die **DB-seitigen** Konsequenzen (Remote-Rollen/Grants, `sslmode`, ob `authenticator`/`postgres` über die Loopback-bridge ankommen) gehören zu Phase 1 (dba-coder).
 
+### Pro-VPS-Tunnel (dynamisch per API) — umgesetzt 2026-05-24
+
+**Früher:** ein geteilter statischer Tunnel (manuell im Dashboard angelegt,
+`CLOUDFLARE_TUNNEL_ID` + `CLOUDFLARE_TUNNEL_TOKEN` geteilt in `.env.gpg`).
+Mehrere Connectoren an demselben Tunnel zertraten gegenseitig die Ingress-Config.
+
+**Jetzt:** jeder VPS bekommt beim Bootstrap automatisch seinen eigenen Tunnel
+(`brewing-<sanitisierter-hostname>`, angelegt per API mit `config_src: cloudflare`,
+idempotent via Name-Lookup). Der Reconcile beansprucht nur Hostnames, deren
+Ziel-Container auf **diesem** VPS laufen (`docker inspect`). Orphan-Cleanup ist
+auf die eigene Tunnel-CNAME (`<id>.cfargotunnel.com`) gescoped — Einträge anderer
+VPS bleiben unangetastet. `CLOUDFLARE_TUNNEL_TOKEN` und `CLOUDFLARE_TUNNEL_ID`
+sind lokal-only in `.env` (nie in `.env.gpg`); der Bootstrap schreibt sie pro VPS.
+Geteilte Werte in `.env.gpg`: nur `CLOUDFLARE_API_TOKEN`, `_ACCOUNT_ID`, `_ZONE_ID`.
+
+Implementierungs-Spec: `CLOUDFLARE_PER_VPS_TUNNEL_KONZEPT.md` (2026-05-24).
+Diese Umstellung löst V-2-1 aus `BOOTSTRAP_MENU_V2_KONZEPT.md` §9.
+
 ### ufw / SSH-Hardening = FROZEN
 Bleiben **unangetastet**. Es wird KEIN Postgres-Port nach außen geöffnet. Der gesamte cross-VPS-Traffic geht durch den Tunnel.
 
