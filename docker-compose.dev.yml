@@ -6,22 +6,31 @@
 #
 # cloudflared + watchtower laufen NICHT (haben profile=vps in der base.yml,
 # das hier nicht aktiviert wird).
+#
+# pull_policy: missing — überschreibt das base-`pull_policy: always` der App-Services lokal.
+# Effekt: lokal gebaute Images werden NICHT durch Hub-Images ersetzt; Docker pullt
+# nur, wenn das Image noch gar nicht lokal vorhanden ist (sichert Erststart auf
+# frischem Checkout). Supabase-Stack absichtlich NICHT angefasst (versionsgepinnt).
 
 services:
 
   web_hauptseite:
+    pull_policy: missing
     ports:
       - "8090:80"   # 8080 lokal oft belegt
 
   web_assistent:
+    pull_policy: missing
     ports:
       - "8081:80"
 
   web_rapt:
+    pull_policy: missing
     ports:
       - "8082:80"
 
   api_proxy:
+    pull_policy: missing
     ports:
       - "8083:3000"
 
