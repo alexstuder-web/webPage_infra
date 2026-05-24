@@ -283,7 +283,7 @@ services:
 
   cloudflared:
     container_name: cloudflared
-    image: cloudflare/cloudflared:latest
+    image: cloudflare/cloudflared:2026.5.0
     profiles: [vps]
     restart: unless-stopped
     command: tunnel --no-autoupdate run

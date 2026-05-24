@@ -22,6 +22,14 @@ Was passiert automatisch: `apt upgrade` → User `alex` + Docker installieren �
 Bitwarden CLI → Repo nach `/home/alex/webPage_infra` clonen → `.env`
 entschlüsseln → `docker compose --profile vps up -d`.
 
+**Threat-Model-Hinweis:** `bootstrap.sh` wird per `curl -fsSL` aus dem privaten
+GitHub-Org-Repo geladen und direkt ausgeführt — ohne gesonderte Checksum-Verifikation.
+Das Sicherheitsmodell lautet "trust your own repo": wer schreibenden Zugriff auf
+`alexstuder-web/webPage_infra` oder den DNS-Namen `raw.githubusercontent.com` kontrolliert,
+kann beliebigen Code als root einschleusen. Mitigations: Org-Repo ist privat,
+GitHub-Account mit 2FA gesichert, Bitwarden-Session und GPG-Passphrase werden erst nach
+der Skript-Ausführung abgerufen und landen nicht im Skript selbst.
+
 ## Enthaltene Services
 
 | Container | Image | Updates |
@@ -38,7 +46,7 @@ entschlüsseln → `docker compose --profile vps up -d`.
 | `supabase-meta` | `supabase/postgres-meta:v0.96.3` | manuell (gepinnt) |
 | `supabase-studio` | `supabase/studio:2026.04.27-sha-5f60601` | manuell (gepinnt) |
 | `supabase-kong` | `kong:2.8.1` | manuell (gepinnt) |
-| `cloudflared` | `cloudflare/cloudflared:latest` | Cloudflare-managed |
+| `cloudflared` | `cloudflare/cloudflared:2026.5.0` | manuell (gepinnt) |
 | `watchtower` | `containrrr/watchtower:latest` | self-update |
 
 App-Container haben das Label `com.centurylinklabs.watchtower.enable=true` →

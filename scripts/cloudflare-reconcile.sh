@@ -30,16 +30,24 @@ err()  { echo -e "\033[1;31m✖ $*\033[0m" >&2; exit 1; }
 command -v jq   >/dev/null || err "jq fehlt (apt install jq)"
 command -v curl >/dev/null || err "curl fehlt"
 
-# .env laden (nur in dieser Subshell, kein Leak)
-set -a
-# shellcheck disable=SC1090
-source "$ENV_FILE"
-set +a
+# Nur die vier benötigten CF-Werte aus .env lesen — kein set -a/source, damit
+# OpenAI/RAPT/Brewfather/Postgres-Keys nicht in den Reconcile-Prozess lecken.
+_cf_get() {
+  local key="$1"
+  local val
+  val="$(grep -E "^${key}=[[:print:]]" "$ENV_FILE" | head -1 | cut -d= -f2-)"
+  printf '%s' "$val"
+}
 
-: "${CLOUDFLARE_API_TOKEN:?fehlt in .env}"
-: "${CLOUDFLARE_ACCOUNT_ID:?fehlt in .env}"
-: "${CLOUDFLARE_ZONE_ID:?fehlt in .env}"
-: "${CLOUDFLARE_TUNNEL_ID:?fehlt in .env}"
+CLOUDFLARE_API_TOKEN="$(_cf_get CLOUDFLARE_API_TOKEN)"
+CLOUDFLARE_ACCOUNT_ID="$(_cf_get CLOUDFLARE_ACCOUNT_ID)"
+CLOUDFLARE_ZONE_ID="$(_cf_get CLOUDFLARE_ZONE_ID)"
+CLOUDFLARE_TUNNEL_ID="$(_cf_get CLOUDFLARE_TUNNEL_ID)"
+
+: "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN fehlt in .env}"
+: "${CLOUDFLARE_ACCOUNT_ID:?CLOUDFLARE_ACCOUNT_ID fehlt in .env}"
+: "${CLOUDFLARE_ZONE_ID:?CLOUDFLARE_ZONE_ID fehlt in .env}"
+: "${CLOUDFLARE_TUNNEL_ID:?CLOUDFLARE_TUNNEL_ID fehlt in .env}"
 
 CF_API="https://api.cloudflare.com/client/v4"
 TUNNEL_CNAME="${CLOUDFLARE_TUNNEL_ID}.cfargotunnel.com"
@@ -139,7 +147,7 @@ while IFS=$'\t' read -r REC_ID REC_NAME REC_CONTENT; do
   # Nur CNAMEs die EXAKT auf unseren Tunnel zeigen → andere bleiben in Ruhe
   [[ "$REC_CONTENT" == "$TUNNEL_CNAME" ]] || continue
   # In routes.json enthalten? → behalten
-  if echo "$DESIRED_HOSTS" | grep -qx "$REC_NAME"; then
+  if echo "$DESIRED_HOSTS" | grep -Fxq -- "$REC_NAME"; then
     continue
   fi
   cf_call DELETE "/zones/${CLOUDFLARE_ZONE_ID}/dns_records/${REC_ID}" >/dev/null
