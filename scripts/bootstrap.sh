@@ -333,7 +333,7 @@ EOF
   # ---------------------------------------------------------------- Marker-Backfill (selbstheilend, E6)
   # Auf bereits gebootstrappten VPS: wenn supabase-db jetzt läuft → Marker idempotent anlegen.
   # Beim Erst-Bootstrap ist supabase-db noch nicht gestartet (Start passiert im Menü via
-  # action_install_unit) — der Marker wird dort nach erfolgreichem docker compose up gesetzt.
+  # action_select_and_start) — der Marker wird dort nach erfolgreichem docker compose up gesetzt.
   # Dieser Backfill ist die Selbstheilung für VPS, die vor der Marker-Einführung gebootstrapped
   # wurden.
   local supabase_marker="${units_dir}/supabase"
@@ -529,7 +529,7 @@ EOSU
 _ensure_supabase_marker() {
   local units_dir="/etc/brewing/stateful-units.d"
   local supabase_marker="${units_dir}/supabase"
-  # Verzeichnis sicherstellen (idempotent, falls action_install_unit vor run_base_bootstrap läuft)
+  # Verzeichnis sicherstellen (idempotent, falls action_select_and_start vor run_base_bootstrap laeuft)
   install -d -m 755 -o "$APP_USER" -g "$APP_USER" "$units_dir" 2>/dev/null || true
   if [[ -f "$supabase_marker" ]]; then
     ok "supabase-Marker bereits vorhanden — ${supabase_marker}"
@@ -548,99 +548,561 @@ EOSU
   fi
 }
 
-action_install_unit() {
-  printf '\n\033[1;34m▶ Welche App installieren/starten?\033[0m\n\n'
-  printf '  1) brew_assistent + Supabase   (web_assistent + kompletter supabase-* Stack)\n'
-  printf '  2) RAPT Dashboard              (web_rapt)\n'
-  printf '  3) brew-proxy (API)            (api_proxy — braucht laufendes Supabase)\n'
-  printf '  4) WebPageAlexStuder           (web_hauptseite, statisches Nginx)\n'
-  printf '  b) zurück\n\n'
-  read -rp "Auswahl [1-4,b]: " unit_choice
+# ================================================================
+# MEHRFACHAUSWAHL-TUI (Pure Bash, keine neue apt-Dependency)
+# §4 BOOTSTRAP_MENU_V2_KONZEPT.md
+#
+# Bedienung:
+#   ↑/↓  Cursor bewegen      (ESC-Sequenz via read -rsn)
+#   SPC  Eintrag togglen     (▣/□)
+#   RET  Auswahl starten
+#   q/Q  Abbrechen
+#
+# Degradations-Fallback (kein TTY/kein ANSI): Nummern-Toggle-Menü.
+#
+# Eingabe-Zeile          Services die gestartet werden  Default
+# ─────────────────────────────────────────────────────────────
+# brew_assistent+Supa    web_assistent supabase-kong    nein
+# RAPT Dashboard         web_rapt                       nein
+# brew-proxy (API)       api_proxy                      nein
+# WebPageAlexStuder      web_hauptseite                 nein
+# Watchtower             watchtower                     JA
+# Portainer              portainer/portainer_edge_agent JA
+#
+# cloudflared wird immer automatisch mitgestartet (kein Eintrag im Menü).
+# ================================================================
 
-  case "$unit_choice" in
-    1)
-      log "brew_assistent + Supabase installieren/starten"
-      echo "  Services: web_assistent supabase-kong (depends_on zieht auth/rest/realtime/storage/meta/db mit)"
-      cf_ensure_tunnel_if_token
-      sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
-set -euo pipefail
-cd "$APP_DIR"
-docker compose pull web_assistent supabase-kong
-# cloudflared via --profile vps mitstarten (App sonst nicht über Tunnel erreichbar)
-docker compose --profile vps up -d web_assistent supabase-kong cloudflared
+# Einheiten-Definition (parallel arrays)
+_TUI_LABELS=(
+  "brew_assistent + Supabase"
+  "RAPT Dashboard"
+  "brew-proxy (API)"
+  "WebPageAlexStuder"
+  "Watchtower (Auto-Update)"
+  "Portainer (Container-Uebersicht)"
+)
+# Default-Vorauswahl: Indices 0-based; 4=Watchtower, 5=Portainer
+_TUI_DEFAULTS=(0 0 0 0 1 1)
+
+# ---------------------------------------------------------------- Portainer-Rollen-Erkennung
+# §5.3 — bestimmt hub|agent|skip; nutzt PORTAINER_ROLE aus .env (auto|hub|agent).
+# Gibt in $1 (nameref) den ermittelten Modus zurück: "hub", "agent", oder "skip" (Fehler).
+_portainer_determine_role() {
+  local -n _role_out=$1
+
+  # Vars aus .env lesen (defensiv, kein set -a/source)
+  local role_env server_url
+  role_env="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+grep -E '^PORTAINER_ROLE=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true
 EOSU
-      ok "brew_assistent + Supabase gestartet"
-      # Marker nach erfolgreichem Start setzen (gegated auf laufenden supabase-db)
-      _ensure_supabase_marker
-      cf_reconcile_if_token
-      ;;
-    2)
-      log "RAPT Dashboard installieren/starten"
-      echo "  Service: web_rapt (zustandslos, kein depends_on)"
-      cf_ensure_tunnel_if_token
-      sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
-set -euo pipefail
-cd "$APP_DIR"
-docker compose pull web_rapt
-docker compose --profile vps up -d web_rapt cloudflared
+)"
+  server_url="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+grep -E '^PORTAINER_SERVER_URL=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true
 EOSU
-      ok "RAPT Dashboard gestartet"
-      cf_reconcile_if_token
-      ;;
-    3)
-      log "brew-proxy (api_proxy) installieren/starten"
-      # api_proxy hat kein depends_on auf Supabase in docker-compose.yml — muss
-      # manuell geprüft werden (§5.1 BOOTSTRAP_MENU_KONZEPT.md Annahme 3).
-      echo "  Prüfe, ob supabase-db läuft..."
-      cf_ensure_tunnel_if_token
-      local supabase_running=0
-      sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU' && supabase_running=1 || supabase_running=0
-docker inspect --format='{{.State.Running}}' supabase-db 2>/dev/null | grep -q '^true$'
-EOSU
-      if (( supabase_running == 0 )); then
-        printf '  \033[1;33m⚠ supabase-db läuft nicht — wird mitgestartet (supabase-kong + deps).\033[0m\n'
-        sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
-set -euo pipefail
-cd "$APP_DIR"
-docker compose pull supabase-kong api_proxy
-docker compose --profile vps up -d supabase-kong api_proxy cloudflared
-EOSU
-        # supabase-db wurde mitgestartet → Marker setzen
-        _ensure_supabase_marker
-      else
-        echo "  Supabase läuft bereits."
-        sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
-set -euo pipefail
-cd "$APP_DIR"
-docker compose pull api_proxy
-docker compose --profile vps up -d api_proxy cloudflared
-EOSU
-        # Supabase lief bereits — Marker sicherstellen (idempotent)
-        _ensure_supabase_marker
-      fi
-      ok "brew-proxy gestartet"
-      cf_reconcile_if_token
-      ;;
-    4)
-      log "WebPageAlexStuder installieren/starten"
-      echo "  Service: web_hauptseite (statisches Nginx, kein depends_on)"
-      cf_ensure_tunnel_if_token
-      sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
-set -euo pipefail
-cd "$APP_DIR"
-docker compose pull web_hauptseite
-docker compose --profile vps up -d web_hauptseite cloudflared
-EOSU
-      ok "web_hauptseite gestartet"
-      cf_reconcile_if_token
-      ;;
-    b|B)
+)"
+  server_url="${server_url:-https://portainer.alexstuder.cloud}"
+  role_env="${role_env:-auto}"
+
+  case "$role_env" in
+    hub)
+      ok "PORTAINER_ROLE=hub — dieser VPS wird Hub"
+      _role_out="hub"
       return 0
       ;;
+    agent)
+      ok "PORTAINER_ROLE=agent — dieser VPS wird Edge-Agent"
+      _role_out="agent"
+      return 0
+      ;;
+    auto)
+      : ;;  # Probe unten
     *)
-      printf '  Ungültige Eingabe: %s\n' "$unit_choice"
+      printf '  \033[1;33m⚠ Unbekannter PORTAINER_ROLE-Wert "%s" — erwarte auto|hub|agent.\033[0m\n' "$role_env"
+      _role_out="skip"
+      return 0
       ;;
   esac
+
+  # Probe: Hub-Endpoint testen (3s Timeout)
+  # http_code und curl-Exit-Code getrennt erfassen, damit "000" und "Verbindungsfehler"
+  # nicht zu "000ERR" konkateniert werden (set -e: Command-Substitution killt das Script
+  # nicht, aber curl_rc=$? muss unmittelbar danach stehen).
+  log "Portainer Hub-Probe: ${server_url}"
+  local probe_status curl_rc
+  probe_status="$(curl -o /dev/null -sS -w '%{http_code}' -m 3 "${server_url}" 2>/dev/null)"
+  curl_rc=$?
+
+  if [[ "$probe_status" =~ ^[2-5][0-9][0-9]$ ]]; then
+    # Hub antwortet mit einem echten HTTP-Status → Agent werden
+    ok "Hub antwortet (HTTP ${probe_status}) → dieser VPS wird Edge-Agent"
+    _role_out="agent"
+  elif [[ "$probe_status" == "000" ]] && (( curl_rc != 28 )); then
+    # 000 + kein Timeout → Connection refused / NXDOMAIN → Hub noch nicht da → Hub werden
+    ok "Hub antwortet nicht (HTTP 000, rc=${curl_rc}) → dieser VPS errichtet den Hub"
+    _role_out="hub"
+  else
+    # curl_rc==28 (Timeout) oder sonstiger unklarer Zustand → Zweit-Hub-Schutz, Abbruch
+    printf '\n\033[1;33m⚠ Portainer-Probe-Ergebnis unklar (HTTP %s, rc=%d).\033[0m\n' \
+      "$probe_status" "$curl_rc"
+    printf '  Sicherheits-Abbruch: bei auto-Modus wird kein Zweit-Hub gebaut wenn der\n'
+    printf '  Hub nur kurz nicht erreichbar ist (False-Negative-Schutz).\n'
+    printf '  Loesung: PORTAINER_ROLE=hub ODER =agent explizit in .env setzen und\n'
+    printf '  Bootstrap erneut starten.\n\n'
+    _role_out="skip"
+  fi
+}
+
+# ---------------------------------------------------------------- Portainer-Hub starten (idempotent)
+# Prueft ob Container bereits laeuft; falls nein, startet via docker compose.
+_portainer_start_hub() {
+  log "Portainer Hub starten"
+
+  # Idempotenz: bereits laufend?
+  local running=0
+  sudo -u "$APP_USER" bash <<'EOSU' 2>/dev/null && running=1 || running=0
+docker inspect --format='{{.State.Running}}' portainer 2>/dev/null | grep -q '^true$'
+EOSU
+  if (( running == 1 )); then
+    ok "Portainer Hub laeuft bereits — nicht erneut aufgesetzt"
+    return 0
+  fi
+
+  sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+set -euo pipefail
+cd "$APP_DIR"
+docker compose --profile vps --profile portainer-hub pull portainer 2>/dev/null || docker compose --profile portainer-hub pull portainer
+docker compose --profile vps --profile portainer-hub up -d portainer cloudflared
+EOSU
+  ok "Portainer Hub gestartet"
+  printf '\n  \033[1;33m⚠ CREDENTIAL-SCHRITT (Portainer Hub, einmalig):\033[0m\n'
+  printf '  1. Portainer-Admin-Passwort im ersten UI-Login setzen:\n'
+  printf '     https://portainer.alexstuder.cloud\n'
+  printf '  2. Wiederverwendbaren Edge-Key (AEEC) erzeugen:\n'
+  printf '     Portainer UI → Environments → Edge Environments → "Add Environment"\n'
+  printf '     → Edge Agent → "Reuse existing key" oder neuen AEEC-Key generieren.\n'
+  printf '  3. Key in .env eintragen: PORTAINER_EDGE_KEY=<key>\n'
+  printf '     Dann .env.gpg neu verschluesseln: ./scripts/encrypt-env.sh\n'
+  printf '     (Passphrase aus Bitwarden: ALEXSTUDER_WEBPAGE_GPG_PASSWORD)\n'
+  printf '  4. Cloudflare Access Policy fuer portainer.alexstuder.cloud anlegen\n'
+  printf '     (Dashboard: Zero Trust → Access → Applications → portainer.alexstuder.cloud).\n'
+  printf '  Hinweis: portainer.+edge. Hostnames werden vom Reconcile NUR auf diesem\n'
+  printf '  Hub-VPS beansprucht (PORTAINER_ROLE=hub Gate in cloudflare-routes.json).\n\n'
+}
+
+# ---------------------------------------------------------------- Portainer Edge-Agent starten (idempotent)
+_portainer_start_agent() {
+  log "Portainer Edge-Agent starten"
+
+  # Edge-Key aus .env lesen — NICHT in argv/log ausgeben
+  local edge_key
+  edge_key="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+grep -E '^PORTAINER_EDGE_KEY=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true
+EOSU
+)"
+  if [[ -z "$edge_key" ]]; then
+    printf '\n\033[1;31m✖ PORTAINER_EDGE_KEY ist nicht in .env gesetzt.\033[0m\n'
+    printf '  Ablauf:\n'
+    printf '    1. Erst Hub-VPS bootstrappen (Portainer Server hochziehen).\n'
+    printf '    2. Edge-Key aus Portainer-UI holen (AEEC-Key).\n'
+    printf '    3. PORTAINER_EDGE_KEY=<key> in .env eintragen.\n'
+    printf '    4. .env.gpg neu verschluesseln (encrypt-env.sh, Credential-Schritt).\n'
+    printf '    5. Bootstrap auf diesem VPS erneut starten.\n'
+    printf '  Portainer-Agent-Start wird uebersprungen.\n\n'
+    return 0
+  fi
+
+  # Idempotenz: bereits laufend?
+  local running=0
+  sudo -u "$APP_USER" bash <<'EOSU' 2>/dev/null && running=1 || running=0
+docker inspect --format='{{.State.Running}}' portainer_edge_agent 2>/dev/null | grep -q '^true$'
+EOSU
+  if (( running == 1 )); then
+    ok "Portainer Edge-Agent laeuft bereits — nicht erneut aufgesetzt"
+    return 0
+  fi
+
+  sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+set -euo pipefail
+cd "$APP_DIR"
+docker compose --profile portainer-agent pull portainer_edge_agent 2>/dev/null || docker compose --profile portainer-agent pull portainer_edge_agent
+# Kein Inbound-Port noetig — Edge-Agent pollt ausgehend.
+# --profile portainer-agent: aktiviert den Service (der sonst nicht im Default-Set ist).
+# Key-Validierung erfolgt bereits oben via edge_key-Guard — compose braucht kein :? mehr.
+# Kein --profile vps: Agent-VPS startet cloudflared fuer seine Apps separat via TUI-Pfad.
+docker compose --profile portainer-agent up -d portainer_edge_agent
+EOSU
+  ok "Portainer Edge-Agent gestartet (verbindet sich ausgehend zum Hub)"
+}
+
+# ---------------------------------------------------------------- TUI-Renderer (ANSI-Modus)
+# Zeichnet die Liste in-place: bewegt Cursor n Zeilen hoch, dann neu zeichnen.
+# $1 = aktueller Cursor-Index (0-basiert)
+# $2 = nameref auf selected-Array (0/1 je Eintrag)
+# $3 = Anzahl zuvor gezeichneter Zeilen (0 beim ersten Mal)
+_tui_draw() {
+  local cursor_idx=$1
+  local -n _sel=$2
+  local prev_lines=$3
+  local n=${#_TUI_LABELS[@]}
+
+  # Cursor zurueck an Anfang der Liste (prev_lines Zeilen hoch)
+  if (( prev_lines > 0 )); then
+    printf '\033[%dA' "$prev_lines"
+  fi
+
+  local i
+  for (( i=0; i<n; i++ )); do
+    # Marker: ▣ (gewählt) oder □ (nicht gewählt)
+    local marker
+    if (( _sel[i] == 1 )); then
+      marker='\033[1;32m▣\033[0m'   # gruen
+    else
+      marker='□'
+    fi
+    # Cursor-Prefix
+    local prefix
+    if (( i == cursor_idx )); then
+      prefix='\033[1;33m→\033[0m '
+    else
+      prefix='  '
+    fi
+    # Aktive Zeile gelb
+    if (( i == cursor_idx )); then
+      printf "  %b \033[1;33m%-40s\033[0m\n" "$prefix$marker" "${_TUI_LABELS[$i]}"
+    else
+      printf "  %b %-40s\n" "$prefix$marker" "${_TUI_LABELS[$i]}"
+    fi
+  done
+  printf '  \033[2m[SPC]=togglen  [↑↓]=bewegen  [RET]=starten  [q]=abbrechen\033[0m\n'
+}
+
+# ---------------------------------------------------------------- TUI-Haupt-Schleife (ANSI-Modus)
+# Gibt in $1 (nameref) ein Array selected[] zurueck (1=gewaehlt).
+# Rueckgabewert: 0=Start, 1=Abbrechen
+_tui_interactive() {
+  local -n _result=$1
+  local n=${#_TUI_LABELS[@]}
+  local cursor=0
+  # Default-Vorauswahl kopieren
+  local selected=("${_TUI_DEFAULTS[@]}")
+  local prev_lines=0
+
+  # stty-Settings sichern, dann raw-Modus (kein Newline noetig fuer Tastendruck).
+  # Einklinken in die bestehende CLEANUP_FILES/_cleanup-Kette:
+  # Wir erweitern die EXIT-trap temporaer um den stty-Restore, damit beim Abbruch
+  # (Ctrl-C / err() → exit) das Terminal nicht im raw-Modus bleibt.
+  # Nach normalem TUI-Ende wird der stty explizit restored und die Trap wieder auf
+  # _cleanup gesetzt.
+  local stty_save
+  stty_save="$(stty -g 2>/dev/null)" || stty_save=""
+  if [[ -n "$stty_save" ]]; then
+    # shellcheck disable=SC2064
+    trap "stty '${stty_save}' 2>/dev/null; _cleanup" EXIT
+    stty -echo -icanon min 1 time 0 2>/dev/null || true
+  fi
+
+  printf '\n\033[1;34m▶ Einheiten auswaehlen & starten\033[0m\n'
+  printf '  cloudflared wird immer automatisch mitgestartet.\n\n'
+
+  # Erste Zeichnung
+  _tui_draw "$cursor" selected 0
+  prev_lines=$(( n + 1 ))  # n Eintrags-Zeilen + 1 Hilfszeile
+
+  local result=1  # Default: abgebrochen
+  while true; do
+    local ch rest
+    IFS= read -rsn1 ch
+
+    case "$ch" in
+      $'\033')
+        # ESC-Sequenz: zwei weitere Zeichen mit kurzem Timeout nachlesen
+        IFS= read -rsn2 -t 0.05 rest 2>/dev/null || rest=""
+        case "$rest" in
+          '[A')  # Pfeil hoch
+            (( cursor > 0 )) && (( cursor-- )) || cursor=$(( n - 1 ))
+            ;;
+          '[B')  # Pfeil runter
+            (( cursor < n-1 )) && (( cursor++ )) || cursor=0
+            ;;
+          *)
+            # Unbekannte Sequenz: schlucken
+            ;;
+        esac
+        ;;
+      ' ')
+        # Leertaste: togglen
+        if (( selected[cursor] == 0 )); then
+          selected[$cursor]=1
+        else
+          selected[$cursor]=0
+        fi
+        ;;
+      '' | $'\n' | $'\r')
+        # Enter: Auswahl bestaetigen
+        result=0
+        break
+        ;;
+      q|Q)
+        result=1
+        break
+        ;;
+      *)
+        # Unbekannte Zeichen: schlucken
+        ;;
+    esac
+
+    _tui_draw "$cursor" selected "$prev_lines"
+    prev_lines=$(( n + 1 ))
+  done
+
+  # stty wiederherstellen
+  [[ -n "$stty_save" ]] && stty "$stty_save" 2>/dev/null || true
+  # EXIT-trap zurueck auf Basis-Cleanup (stty ist schon restored)
+  # shellcheck disable=SC2064
+  trap "_cleanup" EXIT
+
+  printf '\n'
+
+  # Ergebnis kopieren
+  _result=("${selected[@]}")
+  return "$result"
+}
+
+# ---------------------------------------------------------------- Fallback: Nummern-Toggle (kein TTY)
+# Kein interaktiver TTY oder ANSI: zeilenbasiertes Toggle-Menue.
+# Gibt in $1 (nameref) ein Array selected[] zurueck.
+# Rueckgabewert: 0=Start, 1=Abbrechen
+_tui_fallback() {
+  local -n _result_fb=$1
+  local n=${#_TUI_LABELS[@]}
+  local selected=("${_TUI_DEFAULTS[@]}")
+
+  printf '\n\033[1;34m▶ Einheiten auswaehlen & starten (Text-Modus)\033[0m\n'
+  printf '  Eintraege durch Tippen der Nummern togglen.\n'
+  printf '  cloudflared wird immer automatisch mitgestartet.\n\n'
+
+  while true; do
+    local i
+    for (( i=0; i<n; i++ )); do
+      local mk
+      (( selected[i] == 1 )) && mk="[x]" || mk="[ ]"
+      printf '  %d) %s  %s\n' "$(( i+1 ))" "$mk" "${_TUI_LABELS[$i]}"
+    done
+    printf '\n  Eingabe: Nummer(n) zum Togglen (1-%d), a=alle, RET/leer=Starten, q=Abbrechen: ' "$n"
+
+    local ans
+    IFS= read -r ans
+
+    case "$ans" in
+      q|Q)
+        _result_fb=("${selected[@]}")
+        return 1
+        ;;
+      ''|$'\n')
+        break
+        ;;
+      a|A)
+        for (( i=0; i<n; i++ )); do selected[$i]=1; done
+        ;;
+      *)
+        # Nummern-Liste auswerten (mehrere Nummern moeglich, leerzeichen-getrennt).
+        # read -ra verhindert Glob-Expansion (z.B. bei Eingabe "*" oder "?").
+        local -a nums
+        read -ra nums <<< "$ans"
+        local num
+        for num in "${nums[@]}"; do
+          if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= n )); then
+            local idx=$(( num - 1 ))
+            if (( selected[idx] == 0 )); then
+              selected[$idx]=1
+            else
+              selected[$idx]=0
+            fi
+          else
+            printf '  Unbekannte Eingabe: %s (ignoriert)\n' "$num"
+          fi
+        done
+        ;;
+    esac
+    printf '\n'
+  done
+
+  _result_fb=("${selected[@]}")
+  return 0
+}
+
+# ================================================================
+# AKTION: Einheiten auswaehlen und starten (TUI-Dispatch)
+# Zusammenlegung der heutigen Punkte 1+2 (§3.1 BOOTSTRAP_MENU_V2_KONZEPT.md).
+# ================================================================
+action_select_and_start() {
+  # TUI-Modus bestimmen: interaktives TTY + ANSI? → volle TUI; sonst Fallback.
+  local selected=()
+  local tui_exit=1
+
+  if [[ -t 0 && -t 1 ]] && [[ "${TERM:-dumb}" != "dumb" ]]; then
+    # Interaktiver Modus
+    if _tui_interactive selected; then
+      tui_exit=0
+    else
+      tui_exit=1
+    fi
+  else
+    # Kein TTY oder kein ANSI → Fallback
+    printf '  (Kein interaktives Terminal erkannt — Text-Modus)\n'
+    if _tui_fallback selected; then
+      tui_exit=0
+    else
+      tui_exit=1
+    fi
+  fi
+
+  if (( tui_exit != 0 )); then
+    echo "  Abgebrochen — kein Start."
+    return 0
+  fi
+
+  # ---- Service-Liste aufbauen aus der Auswahl ----
+  # Mapping Index → Services (0-basiert):
+  #   0 = brew_assistent+Supabase  → web_assistent supabase-kong
+  #   1 = RAPT Dashboard           → web_rapt
+  #   2 = brew-proxy               → api_proxy
+  #   3 = WebPageAlexStuder        → web_hauptseite
+  #   4 = Watchtower               → watchtower
+  #   5 = Portainer                → portainer ODER portainer_edge_agent (Rolle-Logik)
+  #
+  # cloudflared wird IMMER angehaengt (kein Eintrag im Menue).
+
+  # Service-Liste als assoziatives Set (via string-Suche verhindert Duplikate)
+  local svc_list=""
+  # Merker: wurde supabase-kong explizit oder via Abhaengigkeit aufgenommen?
+  local has_supabase=0
+  local has_portainer=0
+  local portainer_role=""
+
+  # Eintrag 0: brew_assistent + Supabase
+  if (( selected[0] == 1 )); then
+    log "brew_assistent + Supabase ausgewaehlt"
+    echo "  Services: web_assistent supabase-kong (depends_on zieht Supabase-Core mit)"
+    svc_list="${svc_list} web_assistent supabase-kong"
+    has_supabase=1
+  fi
+
+  # Eintrag 1: RAPT Dashboard
+  if (( selected[1] == 1 )); then
+    log "RAPT Dashboard ausgewaehlt"
+    svc_list="${svc_list} web_rapt"
+  fi
+
+  # Eintrag 2: brew-proxy — prueft ob Supabase laeuft
+  if (( selected[2] == 1 )); then
+    log "brew-proxy (api_proxy) ausgewaehlt"
+    echo "  Pruefe, ob supabase-db laeuft..."
+    local supabase_running=0
+    sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU' && supabase_running=1 || supabase_running=0
+docker inspect --format='{{.State.Running}}' supabase-db 2>/dev/null | grep -q '^true$'
+EOSU
+    if (( supabase_running == 0 && has_supabase == 0 )); then
+      printf '  \033[1;33m⚠ supabase-db laeuft nicht und wurde nicht mitausgewaehlt —\033[0m\n'
+      printf '  \033[1;33m  supabase-kong wird automatisch mitgestartet (brew-proxy braucht Supabase).\033[0m\n'
+      svc_list="${svc_list} supabase-kong"
+      has_supabase=1
+    elif (( supabase_running == 1 )); then
+      echo "  Supabase laeuft bereits — kein Mitstart noetig."
+    fi
+    svc_list="${svc_list} api_proxy"
+  fi
+
+  # Eintrag 3: WebPageAlexStuder
+  if (( selected[3] == 1 )); then
+    log "WebPageAlexStuder ausgewaehlt"
+    svc_list="${svc_list} web_hauptseite"
+  fi
+
+  # Eintrag 4: Watchtower (an profiles: [vps] gebunden — --profile vps starten)
+  if (( selected[4] == 1 )); then
+    log "Watchtower ausgewaehlt"
+    svc_list="${svc_list} watchtower"
+  fi
+
+  # Eintrag 5: Portainer — Rolle bestimmen, dann separater Start nach compose up
+  if (( selected[5] == 1 )); then
+    log "Portainer ausgewaehlt — Rolle bestimmen"
+    _portainer_determine_role portainer_role
+    has_portainer=1
+    # Portainer-Services werden NACH dem allgemeinen compose-up separat gestartet
+    # (Hub vs. Agent erfordert unterschiedliche Logik)
+  fi
+
+  # Keine Auswahl? Nur cloudflared starten wuerde keinen Sinn ergeben.
+  local svc_trimmed="${svc_list# }"
+  if [[ -z "$svc_trimmed" && "$has_portainer" -eq 0 ]]; then
+    printf '  Keine Services ausgewaehlt — nichts zu starten.\n'
+    return 0
+  fi
+
+  # ---- Tunnel sicherstellen ----
+  cf_ensure_tunnel_if_token
+
+  # ---- Services starten (Duplikate via sort -u entfernen) ----
+  # Service-Liste bereinigen: Leerzeichen normalisieren, Duplikate entfernen.
+  # tr + sort -u produziert eine korrekte eindeutige Liste.
+  local unique_svcs=""
+  if [[ -n "$svc_trimmed" ]]; then
+    # Word-splitting ist hier BEABSICHTIGT: $svc_trimmed ist eine Leerzeichen-getrennte
+    # Service-Liste die wir in einzelne Zeilen aufteilen wollen. Kein Glob-Risiko
+    # (Service-Namen enthalten keine Glob-Sonderzeichen).
+    # shellcheck disable=SC2086
+    unique_svcs="$(printf '%s\n' $svc_trimmed | sort -u | tr '\n' ' ')"
+    unique_svcs="${unique_svcs% }"
+  fi
+
+  if [[ -n "$unique_svcs" ]]; then
+    log "Starte Services: ${unique_svcs} cloudflared"
+    # --profile vps: benoetigt fuer watchtower und cloudflared (profiles: [vps]).
+    # Schadet nicht fuer reine App-Services.
+    sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" SVCS="$unique_svcs" bash <<'EOSU'
+set -euo pipefail
+cd "$APP_DIR"
+# pull: Service-Liste ohne cloudflared (cloudflared wird getrennt via --profile vps up gestartet)
+# shellcheck disable=SC2086
+docker compose --profile vps pull $SVCS cloudflared
+# shellcheck disable=SC2086
+docker compose --profile vps up -d $SVCS cloudflared
+EOSU
+  else
+    # Nur Portainer: sicherstellen dass cloudflared laeuft
+    log "Nur Portainer ausgewaehlt — cloudflared sicherstellen"
+    sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+set -euo pipefail
+cd "$APP_DIR"
+docker compose --profile vps pull cloudflared
+docker compose --profile vps up -d cloudflared
+EOSU
+  fi
+
+  # ---- Supabase-Marker setzen (falls supabase-kong gestartet wurde) ----
+  if (( has_supabase == 1 )); then
+    _ensure_supabase_marker
+  fi
+
+  # ---- Portainer starten (nach compose up, damit cloudflared bereits laeuft) ----
+  if (( has_portainer == 1 )); then
+    case "$portainer_role" in
+      hub)
+        _portainer_start_hub
+        ;;
+      agent)
+        _portainer_start_agent
+        ;;
+      skip)
+        printf '  \033[1;33m⚠ Portainer-Start uebersprungen (Rolle unklar — siehe Meldung oben).\033[0m\n'
+        ;;
+    esac
+  fi
+
+  # ---- Cloudflare Reconcile ----
+  cf_reconcile_if_token
 }
 
 # ---------------------------------------------------------------- SSH-Verbindung zum alten VPS prüfen
@@ -737,14 +1199,14 @@ REMOTE
 # ---------------------------------------------------------------- Migrations-Aktion
 # Migriert die gesamte Supabase / DB-Unit (core + aibrewgenius + rapt — alle Schemen).
 # Supabase ist die EINZIGE stateful Unit; brew_assistent/rapt_dashboard sind zustandslos
-# (kein Backup/Restore für Frontends — die werden via action_install_unit neu gestartet).
+# (kein Backup/Restore fuer Frontends — die werden via action_select_and_start neu gestartet).
 action_migrate_unit() {
   printf '\n\033[1;34m▶ Was migrieren?\033[0m\n\n'
   printf '  1) Supabase / DB migrieren   (core + aibrewgenius + rapt — gesamte DB)\n'
   printf '  b) zurück\n\n'
   printf '  Hinweis: brew_assistent, rapt_dashboard, brew-proxy und WebPageAlexStuder\n'
   printf '           sind zustandslos — kein Backup/Restore nötig. Auf dem Ziel-VPS\n'
-  printf '           via "Einzelne App installieren" (Option 2) starten.\n\n'
+  printf '           via "Einheiten auswaehlen & starten" (Option 1) starten.\n\n'
   read -rp "Auswahl [1,b]: " mig_choice
 
   case "$mig_choice" in
@@ -1049,7 +1511,7 @@ EOSU
 
   printf '  Zustandslose Frontends verschieben (kein Backup/Restore nötig):\n'
   printf '    brew_assistent / rapt_dashboard / web_hauptseite:\n'
-  printf '    → Auf Ziel-VPS: Bootstrap-Menü → "Einzelne App installieren" (Option 2)\n'
+  printf '    → Auf Ziel-VPS: Bootstrap-Menü → "Einheiten auswaehlen & starten" (Option 1)\n'
   printf '    → Auf altem VPS danach stoppen: docker compose stop web_assistent web_rapt web_hauptseite\n\n'
 
   printf '  Cloudflare-Routing:\n'
@@ -1074,51 +1536,31 @@ EOSU
 }
 
 # ================================================================
-# HAUPT-MENÜ
+# HAUPT-MENÜ (V2)
+# Punkt 1 = Mehrfachauswahl-TUI (Zusammenlegung der alten Punkte 1+2)
+# Punkt 2 = Migrations-Pfad (frueherer Punkt 3 — unveraendert)
 # ================================================================
 main_menu() {
   while true; do
-    printf '\n\033[1;34m▶ Brewing-Stack — Aktion wählen\033[0m\n\n'
-    printf '  1) Komplett-Stack starten        (docker compose --profile vps up -d, wie bisher)\n'
-    printf '  2) Einzelne App installieren     (gezielt einen Stack hochziehen)\n'
-    printf '  3) App migrieren (VPS-Umzug)     (Backup alt → Stop alt → Start neu → Restore)\n'
+    printf '\n\033[1;34m▶ Brewing-Stack — Aktion waehlen\033[0m\n\n'
+    printf '  1) Einheiten auswaehlen & starten   (Mehrfachauswahl: Apps, Watchtower, Portainer)\n'
+    printf '  2) App migrieren (VPS-Umzug)        (Backup alt → Stop alt → Start neu → Restore)\n'
     printf '  q) Beenden\n\n'
-    read -rp "Auswahl [1-3,q]: " menu_choice
+    read -rp "Auswahl [1-2,q]: " menu_choice
 
     case "$menu_choice" in
       1)
-        log "Komplett-Stack starten (Profil: vps)"
-        cf_ensure_tunnel_if_token
-        sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
-set -euo pipefail
-cd "$APP_DIR"
-docker compose --profile vps pull
-docker compose --profile vps up -d
-EOSU
-        ok "Stack läuft"
-        cf_reconcile_if_token
+        action_select_and_start
         ;;
       2)
-        # Schleife im Untermenü — bei 'zurück' wieder Hauptmenü zeigen
-        while true; do
-          action_install_unit
-          # action_install_unit gibt bei gültiger Wahl direkt zurück
-          # Bei 'b' wird 0 returned und wir kommen hier an → Schleife verlassen
-          break
-        done
-        ;;
-      3)
-        while true; do
-          action_migrate_unit
-          break
-        done
+        action_migrate_unit
         ;;
       q|Q)
         echo "  Beenden."
         return 0
         ;;
       *)
-        printf '  Ungültige Eingabe: %s — Bitte 1, 2, 3 oder q eingeben.\n' "$menu_choice"
+        printf '  Ungueltige Eingabe: %s — Bitte 1, 2 oder q eingeben.\n' "$menu_choice"
         ;;
     esac
   done
@@ -1155,14 +1597,18 @@ cat <<EOF
   App-Logs    sudo -u $APP_USER docker logs -f api-proxy
   Tunnel-Log  sudo -u $APP_USER docker logs -f cloudflared
 
-  Auto-Updates der App-Container (web_*, api_proxy) übernimmt Watchtower
+  Auto-Updates der App-Container (web_*, api_proxy) uebernimmt Watchtower
   alle 5 Minuten. Supabase-Stack bleibt auf gepinnten Versionen.
+
+  Portainer    Hub: https://portainer.alexstuder.cloud  (hinter Cloudflare Access)
+               Edge-Endpoint: https://edge.alexstuder.cloud  (oeffentlich, Agents pollen)
+               PORTAINER_ROLE=auto|hub|agent steuert die Rolle dieses VPS.
 
   Cloudflare-Hostnames/DNS: scripts/cloudflare-routes.json editieren →
   ./scripts/cloudflare-reconcile.sh (idempotent).
 
   Backups      nightly 03:00 (cron, als ${APP_USER}, kein sudo) → R2, je drei
-               verschlüsselte Dumps (_supabase_core / brew_assistent / rapt_dashboard).
+               verschluesselte Dumps (_supabase_core / brew_assistent / rapt_dashboard).
                Retention: neueste N=7 pro Ordner (lokal + R2), via BACKUP_KEEP.
                Manuell (als ${APP_USER}): ./scripts/backup.sh
   Backup-Log   tail -f /var/log/brewing-backup.log

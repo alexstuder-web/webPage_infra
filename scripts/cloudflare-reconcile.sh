@@ -269,8 +269,28 @@ TUNNEL_CNAME="${TUNNEL_ID}.cfargotunnel.com"
 
 # ============================================================================
 # VPS-Scoping: desired_routes = nur Routen, deren Ziel-Container laufen
+#
+# Zusaetzliches Gate fuer Portainer-Hub-Routen (_portainer_hub: true):
+#   Diese Routen werden NUR beansprucht wenn PORTAINER_ROLE=hub in .env steht.
+#   Hintergrund: portainer. + edge. sollen exklusiv vom Hub-VPS veroeffentlicht
+#   werden. Der Container-laufend-Check wuerde Spoke-VPS korrekt ausfiltern (Agent
+#   startet "portainer"-Container nicht), aber als zweite Sicherung verhindert das
+#   Gate zusaetzlich DNS/Ingress-Eintraege auf Spoke-VPS die den Agent noch nicht
+#   gestartet haben — und schuetzt vor Split-Brain wenn portainer kurz gestartet
+#   aber noch nicht konfiguriert ist.
+#   Implementierungswahl: Option (b) aus §7 BOOTSTRAP_MENU_V2_KONZEPT.md.
 # ============================================================================
 log "VPS-Scoping: laufende Ziel-Container ermitteln"
+
+# PORTAINER_ROLE aus .env lesen (nur den Wert, kein set -a/source)
+IS_PORTAINER_HUB=0
+_portainer_role_val="$(_cf_get PORTAINER_ROLE)"
+if [[ "${_portainer_role_val:-auto}" == "hub" ]]; then
+  IS_PORTAINER_HUB=1
+  ok "PORTAINER_ROLE=hub — Portainer-Hub-Routen werden beansprucht"
+else
+  echo "  PORTAINER_ROLE=${_portainer_role_val:-auto} (nicht hub) — Portainer-Hub-Routen werden uebersprungen"
+fi
 
 # Alle Routen aus JSON lesen, pro Route Container prüfen.
 # Ergebnis: JSON-Array nur mit den beanspruchten Routen.
@@ -282,6 +302,14 @@ while IFS= read -r route_json; do
   service="$(printf '%s' "$route_json" | jq -r '.service')"
   hostname_val="$(printf '%s' "$route_json" | jq -r '.hostname')"
   container_name="$(_service_to_container "$service")"
+
+  # Portainer-Hub-Gate: _portainer_hub:true-Routen nur auf Hub-VPS beanspruchen.
+  is_hub_route="$(printf '%s' "$route_json" | jq -r '._portainer_hub // false')"
+  if [[ "$is_hub_route" == "true" ]] && (( IS_PORTAINER_HUB == 0 )); then
+    echo "  Uebersprungen (nicht Hub-VPS): ${hostname_val}"
+    SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+    continue
+  fi
 
   running="$(docker inspect --format='{{.State.Running}}' \
     "$container_name" 2>/dev/null || echo "false")"

@@ -119,6 +119,56 @@ Supabase als **eigenständige, cross-VPS-erreichbare** Einheit + konfigurierbare
 
 ---
 
+## 6b. Portainer — zentrale Observability-Schicht (ergaenzt, nicht Teil der 4 funktionalen Einheiten)
+
+> Portainer ist eine **Management-/Observability-Schicht**, keine fuenfte funktionale Einheit.
+> Die vier Einheiten (brew_assistent, rapt_dashboard, proxy, Supabase/DB) bleiben unveraendert.
+
+### Hub-and-Spoke via Edge-Agent
+
+```
+Cloudflare:
+  portainer.alexstuder.cloud (Port 9000, UI) → hinter Cloudflare Access
+  edge.alexstuder.cloud      (Port 8000, Edge-Tunnel) → oeffentlich
+
+         HUB-VPS                        SPOKE-VPS (2..N)
+  portainer (CE Server)  ◄──── polling ── portainer_edge_agent
+  Volume portainer_data                   (nur ausgehend, kein Inbound-Port)
+```
+
+- **Genau ein Hub** ueber alle VPS — auf dem ersten/dedizierten VPS (`PORTAINER_ROLE=hub`).
+- **Jeder weitere VPS** startet nur den Edge-Agent (`portainer_edge_agent`, ausgehend pollend).
+- Edge-Agent erfordert **keinen offenen Inbound-Port** — passend zur frozen-ufw-Policy.
+- Beliebig viele Spoke-VPS moeglich: edge-Endpoint bleibt derselbe, kein Hostname-Konflikt
+  (das Cloudflare "1 Hostname = 1 Tunnel"-Limit gilt nur fuers Veroeffentlichen eines Ingress,
+  nicht fuer ausgehende HTTPS-Clients von Spoke-VPS).
+
+### Cloudflare-Routing (Hub-exklusiv)
+
+`portainer.` und `edge.` Eintraege in `cloudflare-routes.json` werden vom Reconcile
+**nur auf dem Hub-VPS beansprucht** (Gate: `PORTAINER_ROLE=hub` in `.env`).
+Spoke-VPS uebergehen diese Routen — kein konkurriender Ingress, kein CNAME-Konflikt.
+
+### Ersteinrichtung (Chicken-and-Egg, einmalig)
+
+1. Hub-VPS bootstrappen (`PORTAINER_ROLE=hub`) → `portainer`-Container laeuft.
+2. Portainer-Admin-Passwort im ersten UI-Login setzen (**Credential-Schritt**).
+3. AEEC-Key aus Portainer-UI holen → `PORTAINER_EDGE_KEY=` in `.env` → `encrypt-env.sh` → commit (**Credential-Schritt**).
+4. Cloudflare Access Policy fuer `portainer.alexstuder.cloud` anlegen (**Credential-Schritt**).
+5. Ab dann joinen Agents auf weiteren VPS automatisch beim Bootstrap.
+
+### Konfiguration (`.env`)
+
+| Variable | Bedeutung | Default |
+|---|---|---|
+| `PORTAINER_ROLE` | `auto`\|`hub`\|`agent` — Rolle dieses VPS | `auto` |
+| `PORTAINER_SERVER_URL` | Hub-UI-URL fuer die auto-Probe | `https://portainer.alexstuder.cloud` |
+| `PORTAINER_EDGE_URL` | Edge-Endpoint fuer Agents | `https://edge.alexstuder.cloud` |
+| `PORTAINER_EDGE_KEY` | wiederverwendbarer AEEC-Key (nach Hub-Setup) | (leer = Fehler bei agent-Start) |
+| `PORTAINER_EDGE_ID` | optionale feste Agent-UUID | (leer = auto) |
+
+---
+
 ## 7. Umsetzungs-Reihenfolge (historisch)
 Die Arbeit lief in dieser Reihenfolge; die per-Agent-Specs waren transient und sind entfernt — Details in der git-Historie:
 1. **Phase 1 dba-coder** — Connection-Vertrag (Rolle + `DATABASE_URL`/`sslmode`) zuerst.
