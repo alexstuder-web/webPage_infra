@@ -213,6 +213,60 @@ $(printf '%s\n' "$unpushed" | sed 's/^/   /')
   fi
   ok "$APP_DIR auf main"
 
+  # ---------------------------------------------------------------- App-Repos klonen / aktualisieren
+  # Die db-init-Container mounten db_scripts/ read-only aus den App-Repos.
+  # Die Repos müssen als Geschwister von webPage_infra/ existieren:
+  #   $APP_HOME/brew_assistent-new/
+  #   $APP_HOME/RAPT_Brewing_Dashboard-new/
+  # Idempotent: 'git clone' nur wenn noch nicht vorhanden, sonst 'git pull'.
+  # Pull darf keinen lokalen Stand zerstören: nur fetch + merge (kein reset --hard).
+  log "App-Repos klonen / aktualisieren (db_scripts-Mounts für Init-Container)"
+
+  local assistent_repo_url="https://github.com/alexstuder-web/brew_assistent-new.git"
+  local rapt_repo_url="https://github.com/alexstuder-web/RAPT_Brewing_Dashboard-new.git"
+  local assistent_dir="${APP_HOME}/brew_assistent-new"
+  local rapt_dir="${APP_HOME}/RAPT_Brewing_Dashboard-new"
+
+  for _repo_entry in \
+    "${assistent_dir}|${assistent_repo_url}|brew_assistent-new" \
+    "${rapt_dir}|${rapt_repo_url}|RAPT_Brewing_Dashboard-new"
+  do
+    local _rdir _rurl _rname
+    _rdir="${_repo_entry%%|*}"
+    _rurl="${_repo_entry#*|}"
+    _rurl="${_rurl%|*}"
+    _rname="${_repo_entry##*|}"
+
+    if [[ -d "${_rdir}/.git" ]]; then
+      # Repo existiert: nur default-Branch pullen (kein reset --hard — schützt VPS-Hotfixes).
+      # fetch + merge-ff-only: schlägt sauber fehl wenn divergiert.
+      # Pfad/Name via Env-Variablen übergeben (nicht in Command-String interpolieren) —
+      # robust gegen Sonderzeichen, analog BW-/Compose-Blöcke (Lesson 2026-05-24).
+      sudo -u "$APP_USER" -H \
+        _RDIR="$_rdir" \
+        _RNAME="$_rname" \
+        bash <<'EOSU'
+set -euo pipefail
+git -C "$_RDIR" fetch origin main 2>/dev/null
+git -C "$_RDIR" merge --ff-only origin/main 2>/dev/null || {
+  printf 'WARN: %s: merge --ff-only fehlgeschlagen — lokale Aenderungen vorhanden?\n' "$_RNAME" >&2
+}
+EOSU
+      ok "${_rdir} aktualisiert (${_rname})"
+    else
+      # --depth=1: shallow-clone spart Bandbreite (nur db_scripts/ wird gebraucht).
+      # Tradeoff: kein 'git log' auf History; für db-init-Mount ausreichend.
+      sudo -u "$APP_USER" -H \
+        _RURL="$_rurl" \
+        _RDIR="$_rdir" \
+        bash <<'EOSU'
+set -euo pipefail
+git clone "$_RURL" "$_RDIR" --depth=1 2>/dev/null
+EOSU
+      ok "${_rdir} geklont (${_rname})"
+    fi
+  done
+
   # ---------------------------------------------------------------- BW Login + Passphrase (lazy)
   if _env_done && _gpgpass_done; then
     ok ".env + gpg.pass bereits vorhanden — BW-Login übersprungen"
@@ -1147,184 +1201,6 @@ EOSU
   ok "Portainer Edge-Agent gestartet (verbindet sich ausgehend zum Hub)"
 }
 
-# ================================================================
-# DB-BASELINE SICHERSTELLEN (idempotent, selbstheilend)
-#
-# TODO Phase 2 (cicd-coder + dba-coder): Diese Funktion auf Per-App-Runners
-# umbauen (je db-assistent + db-rapt, mit schema_migrations-Tracking).
-# Phase 1 (2026-05-25): Service-Namen auf db-assistent / auth-assistent aktualisiert.
-# Die Funktion bleibt im Code, ist aber de-facto-No-op auf neuen VPS (kein supabase-Marker →
-# Guard greift sofort). Auf bestehenden (alten) VPS mit supabase-Marker muss
-# die Funktion manuell deaktiviert werden; ein Prod-VPS existiert noch nicht.
-#
-# Wann aufrufen:
-#   - Nach erfolgreichem Supabase-Start (action_select_and_start wenn has_supabase==1)
-#   - Reihenfolge: NACH _ensure_supabase_marker, NACH compose up
-#   - NICHT nach Restore-Pfaden (Dump enthält das Schema bereits)
-#
-# Was passiert:
-#   1. Guard: nur ausführen wenn supabase-Marker gesetzt (stateful Unit auf diesem VPS).
-#      → Auf stateless-VPS (kein Marker) = sofortiger No-op.
-#   2. Readiness-Wait: poll bis auth.users existiert (GoTrue hat seine Migrationen
-#      gefahren). Timeout 120 s, klare Fehlermeldung.
-#   3. Sentinel-Check: existiert aibrewgenius.user_profiles bereits?
-#      → ja → "bereits initialisiert", No-op.
-#      → nein → Baseline anwenden.
-#   4. api_proxy stoppen/starten rund um den Apply (Lock-Timeout-Schutz:
-#      rapt-Teil des Baseline setzt lock_timeout='5s' auf telemetry_*;
-#      aktive brew-proxy-Verbindung kann diesen Lock halten).
-#   5. apply-baseline.sh --yes aufrufen (ON_ERROR_STOP=1, non-interaktiv).
-#   6. Ergebnis loggen: "DB-Baseline angewendet" / "bereits initialisiert" / "uebersprungen".
-#
-# Idempotenz: Baseline ist CREATE IF NOT EXISTS / CREATE OR REPLACE — Re-Apply auf
-# vollständig migrierter DB ist ein No-op (sentinel verhindert unnötigen Aufruf).
-# ================================================================
-ensure_db_baseline() {
-  local supabase_marker="/etc/brewing/stateful-units.d/supabase"
-
-  # ---- Guard: nur auf VPS mit Supabase als stateful Unit ----
-  if [[ ! -f "$supabase_marker" ]]; then
-    echo "  DB-Baseline: uebersprungen (kein Supabase-Marker — stateless VPS)."
-    return 0
-  fi
-
-  log "DB-Baseline sicherstellen (idempotent)"
-
-  # ---- Readiness-Wait: warten bis auth.users existiert (GoTrue-Migrationen) ----
-  # GoTrue laeuft nach dem Postgres-initdb und legt auth.users via eigene Migrationen an.
-  # Timeout: 120 s (grosszuegig fuer langsame VPS + Image-Pull).
-  local wait_secs=0
-  local wait_max=120
-  local wait_interval=5
-  local auth_ready=0
-
-  echo "  Warte auf auth.users (GoTrue-Readiness, max ${wait_max}s)..."
-  local psql_error=0
-  while (( wait_secs < wait_max )); do
-    local _chk _psql_rc
-    # psql-Exit-Code getrennt erfassen (Lesson: nie '|| true' direkt in der Subshell,
-    # da das Connection-Fehler (rc=2) und leeres Result gleich aussehen laesst).
-    # Phase 1: db-assistent (neuer Name nach Per-App-DB-Pivot 2026-05-25).
-    _chk="$(sudo -u "$APP_USER" bash <<'EOSU'
-docker exec db-assistent \
-  psql -U supabase_admin -d postgres --no-psqlrc -tAc \
-  "SELECT to_regclass('auth.users')" 2>/dev/null
-printf '\n%d' $?
-EOSU
-)"
-    # Letzte Zeile = Exit-Code, Rest = Abfrageergebnis.
-    _psql_rc="${_chk##*$'\n'}"
-    _chk="${_chk%$'\n'*}"
-    _chk="${_chk//[[:space:]]/}"
-
-    if (( _psql_rc != 0 )); then
-      # Connection- oder Auth-Fehler — nicht GoTrue-Nicht-Bereit; sofort abbrechen.
-      psql_error=1
-      break
-    fi
-
-    if [[ -n "$_chk" ]]; then
-      auth_ready=1
-      break
-    fi
-    sleep "$wait_interval"
-    wait_secs=$(( wait_secs + wait_interval ))
-    printf '  ... %ds / %ds\n' "$wait_secs" "$wait_max"
-  done
-
-  if (( psql_error == 1 )); then
-    # Phase 1: db-assistent (neuer Name nach Per-App-DB-Pivot 2026-05-25).
-    printf '\n\033[1;31m✖ DB-Baseline: psql-Verbindung zu db-assistent fehlgeschlagen (Timeout/Auth).\033[0m\n' >&2
-    printf '  Moegliche Ursachen:\033[0m\n' >&2
-    printf '    - db-assistent laeuft nicht (docker ps | grep db-assistent)\033[0m\n' >&2
-    printf '    - supabase_admin-Passwort fehlt oder falsch (ASSISTENT_POSTGRES_PASSWORD in .env)\033[0m\n' >&2
-    printf '  Massnahmen:\033[0m\n' >&2
-    printf '    1. docker logs db-assistent  (Init-Fehler pruefen)\033[0m\n' >&2
-    printf '    2. docker compose --profile vps ps  (Container-Status)\033[0m\n' >&2
-    printf '    3. Dann manuell: cd ~/webPage_infra && ./scripts/apply-baseline.sh --yes\033[0m\n' >&2
-    return 1
-  fi
-  if (( auth_ready == 0 )); then
-    # Phase 1: auth-assistent (neuer Name nach Per-App-DB-Pivot 2026-05-25).
-    printf '\n\033[1;31m✖ DB-Baseline: auth.users nach %ds nicht gefunden.\033[0m\n' "$wait_max" >&2
-    printf '  GoTrue (auth-assistent-Container) hat seine Migrationen noch nicht abgeschlossen\033[0m\n' >&2
-    printf '  oder der auth-assistent-Container laeuft nicht.\033[0m\n' >&2
-    printf '  Massnahmen:\033[0m\n' >&2
-    printf '    1. docker logs auth-assistent (GoTrue-Migrations-Fehler pruefen)\033[0m\n' >&2
-    printf '    2. docker compose --profile vps ps  (Container-Status)\033[0m\n' >&2
-    printf '    3. Dann manuell: cd ~/webPage_infra && ./scripts/apply-baseline.sh --yes\033[0m\n' >&2
-    return 1
-  fi
-  ok "auth.users vorhanden (GoTrue bereit nach ${wait_secs}s)"
-
-  # ---- Sentinel-Check: Baseline bereits angewendet? ----
-  # Phase 1: db-assistent (neuer Name nach Per-App-DB-Pivot 2026-05-25).
-  local _sentinel
-  _sentinel="$(sudo -u "$APP_USER" bash <<'EOSU' 2>/dev/null
-docker exec db-assistent \
-  psql -U supabase_admin -d postgres -tAc \
-  "SELECT to_regclass('aibrewgenius.user_profiles')" 2>/dev/null || true
-EOSU
-)"
-  _sentinel="${_sentinel//[[:space:]]/}"
-
-  if [[ -n "$_sentinel" ]]; then
-    ok "DB-Baseline bereits initialisiert (aibrewgenius.user_profiles vorhanden) — No-op."
-    return 0
-  fi
-
-  log "DB-Baseline anwenden (frische DB)"
-
-  # ---- api_proxy stoppen (Lock-Timeout-Schutz) ----
-  # rapt-Teil des Baseline setzt lock_timeout='5s' auf telemetry_*. Eine aktive
-  # brew-proxy-Verbindung kann diesen Lock halten. Stoppen → Apply → ggf. starten.
-  local proxy_was_running=0
-  sudo -u "$APP_USER" bash <<'EOSU' 2>/dev/null && proxy_was_running=1 || proxy_was_running=0
-docker inspect --format='{{.State.Running}}' api-proxy 2>/dev/null | grep -q '^true$'  # container_name (Bindestrich), nicht Compose-Service-Name (Unterstrich)
-EOSU
-  if (( proxy_was_running == 1 )); then
-    echo "  api_proxy stoppen (Lock-Timeout-Schutz fuer Baseline-Apply)..."
-    sudo -u "$APP_USER" bash <<'EOSU' 2>/dev/null || true
-docker stop api-proxy 2>/dev/null || true
-EOSU
-  fi
-
-  # ---- apply-baseline.sh --yes aufrufen ----
-  # Als $APP_USER (Owner des Repos + .env); --yes = non-interaktiv (Bestätigung hier eingeholt).
-  # Fehler propagieren: ein fehlschlagender Apply soll den Bootstrap-Schritt fehlschlagen lassen.
-  sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
-set -euo pipefail
-cd "$APP_DIR"
-./scripts/apply-baseline.sh --yes
-EOSU
-
-  ok "DB-Baseline angewendet"
-
-  # ---- api_proxy wieder starten (falls vorher lief) ----
-  if (( proxy_was_running == 1 )); then
-    echo "  api_proxy wieder starten..."
-    sudo -u "$APP_USER" bash <<'EOSU' 2>/dev/null || true
-docker start api-proxy 2>/dev/null || true
-EOSU
-    ok "api_proxy wieder gestartet"
-  fi
-
-  # ---- Post-Deploy-Hinweise (Post-Migrations-Verifikations-Gates) ----
-  printf '\n\033[1;32m  ✓ DB-Schema initialisiert — empfohlene Verifikation (einmalig):\033[0m\n\n'
-  printf '  Gate A — Hypertable-Restore-Test (TimescaleDB):\033[0m\n'
-  printf '    Backup anlegen: ./scripts/backup.sh --label hypertable-gate\033[0m\n'
-  printf '    Restore in isolierten Test-Stack (brewing-test), Counts pruefen:\033[0m\n'
-  printf '      SELECT count(*) FROM rapt.telemetry_controllers; -- muss > 0 nach Restore\033[0m\n'
-  printf '    (Counts = 0 nach Restore → defekte TimescaleDB pre/post_restore-Hooks)\033[0m\n\n'
-  printf '  Gate B — SSO cross-subdomain:\033[0m\n'
-  printf '    Login in brew.alexstuder.cloud → rapt.alexstuder.cloud OHNE zweiten Login.\033[0m\n'
-  printf '    Cookie sb-session muss Domain=.alexstuder.cloud tragen.\033[0m\n\n'
-  printf '  Gate C — Tenant-Isolation:\033[0m\n'
-  printf '    Zweiter Testuser anlegen → sieht KEINE Daten des ersten Users.\033[0m\n'
-  printf '    RLS-Check: SELECT schemaname,tablename,rowsecurity FROM pg_tables\033[0m\n'
-  printf '                WHERE schemaname IN ('"'"'aibrewgenius'"'"','"'"'rapt'"'"') -- alle rowsecurity=t\033[0m\n\n'
-}
-
 # ---------------------------------------------------------------- TUI-Renderer (ANSI-Modus)
 # Zeichnet die Liste in-place: bewegt Cursor n Zeilen hoch, dann neu zeichnen.
 # $1 = aktueller Cursor-Index (0-basiert)
@@ -1669,15 +1545,16 @@ EOSU
   if [[ -n "$unique_svcs" ]]; then
     log "Starte Services: ${unique_svcs} cloudflared"
     # --profile vps: benoetigt fuer watchtower und cloudflared (profiles: [vps]).
-    # Schadet nicht fuer reine App-Services.
+    # --profile mail: benoetigt fuer posteio (profiles: [mail]); schadet nicht wenn kein Mail ausgewaehlt.
+    # Beide Profiles kombinierfbar: kein doppelter compose-Aufruf noetig.
     sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" SVCS="$unique_svcs" bash <<'EOSU'
 set -euo pipefail
 cd "$APP_DIR"
 # pull: Service-Liste ohne cloudflared (cloudflared wird getrennt via --profile vps up gestartet)
 # shellcheck disable=SC2086
-docker compose --profile vps pull $SVCS cloudflared
+docker compose --profile vps --profile mail pull $SVCS cloudflared
 # shellcheck disable=SC2086
-docker compose --profile vps up -d $SVCS cloudflared
+docker compose --profile vps --profile mail up -d $SVCS cloudflared
 EOSU
   else
     # Nur Portainer: sicherstellen dass cloudflared laeuft
@@ -1693,15 +1570,10 @@ EOSU
   # ---- Supabase-Marker setzen (falls kong-assistent gestartet wurde) ----
   if (( has_supabase == 1 )); then
     _ensure_supabase_marker
-    # ---- DB-Baseline sicherstellen (nach Supabase-Start, idempotent) ----
-    # Wendet den konsolidierten Schema-Baseline an, falls die DB noch keine
-    # aibrewgenius.user_profiles-Tabelle hat. No-op wenn bereits initialisiert.
-    # Voraussetzung: auth.users muss existieren (GoTrue-Readiness-Poll innen).
-    # Fehlschlag (Timeout / psql-Fehler) bricht den Bootstrap NICHT ab — Stack
-    # laeuft bereits; Baseline jederzeit nachholbar via apply-baseline.sh.
-    ensure_db_baseline || {
-      printf '[bootstrap] WARN: DB-Baseline nicht angewendet (Stack laeuft; spaeter manuell: scripts/apply-baseline.sh --yes)\n' >&2
-    }
+    # Phase 2: DB-Init übernimmt die db-init-assistent / db-init-rapt Init-Container
+    # beim 'compose up' (Baseline + schema_migrations-getrackte Migrationen).
+    # bootstrap.sh macht keinen DB-Init mehr.
+    ok "DB-Init: wird von db-init-assistent / db-init-rapt Init-Containern beim Stack-Start erledigt."
   fi
 
   # ---- Portainer starten (nach compose up, damit cloudflared bereits laeuft) ----

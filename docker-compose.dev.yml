@@ -60,6 +60,15 @@ services:
     ports:
       - "54332:5432"
 
+  # db-init-Container: pull_policy: missing — lokal gebaute Runner-Images nicht
+  # durch Hub-Images überschreiben (analog App-Services in Dev).
+  # Ports: keine — Init-Container exponiert nichts.
+  db-init-assistent:
+    pull_policy: missing
+
+  db-init-rapt:
+    pull_policy: missing
+
   # posteio: kein Dev-Override nötig — Mail wird lokal nicht gestartet.
   # posteio hat kein 'profiles:' in der base-compose und würde bei einem
   # ungewollten 'docker compose up' (ohne expliziten Service-Namen) mit starten.

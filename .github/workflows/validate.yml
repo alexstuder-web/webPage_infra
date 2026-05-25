@@ -39,11 +39,14 @@ jobs:
           RAPT_SITE_URL: http://placeholder
           # api_proxy — DATABASE_URL muss vollständig angegeben sein (kein Compose-Default).
           DATABASE_URL: postgres://proxy_sync:placeholder@db-rapt:5432/postgres?sslmode=disable
+          # db-init-Container — REQUIRE_PREMIGRATION_BACKUP hat Default 0, optional.
+          # ASSISTENT_DB_SCRIPTS_PATH + RAPT_DB_SCRIPTS_PATH haben Compose-Defaults → kein Pflichtfeld.
 
       - name: Validate dev override
         run: docker compose -f docker-compose.yml -f docker-compose.dev.yml config --quiet
         env:
           DOCKERHUB_USERNAME: placeholder
+          CLOUDFLARE_TUNNEL_TOKEN: placeholder
           # brew_assistent-Stack
           ASSISTENT_POSTGRES_PASSWORD: placeholder
           ASSISTENT_JWT_SECRET: placeholder
@@ -61,6 +64,8 @@ jobs:
           RAPT_SITE_URL: http://placeholder
           # api_proxy — DATABASE_URL muss vollständig angegeben sein (kein Compose-Default).
           DATABASE_URL: postgres://proxy_sync:placeholder@db-rapt:5432/postgres?sslmode=disable
+          # db-init-Container — REQUIRE_PREMIGRATION_BACKUP hat Default 0, optional.
+          # ASSISTENT_DB_SCRIPTS_PATH + RAPT_DB_SCRIPTS_PATH haben Compose-Defaults → kein Pflichtfeld.
 
       - name: Bash syntax check (alle scripts)
-        run: bash -n scripts/bootstrap.sh scripts/decrypt-env.sh scripts/encrypt-env.sh
+        run: bash -n scripts/bootstrap.sh scripts/decrypt-env.sh scripts/encrypt-env.sh scripts/db-init-runner.sh

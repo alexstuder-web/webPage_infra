@@ -20,11 +20,13 @@
 #                      auth-assistent (GoTrue)
 #                      rest-assistent (PostgREST)
 #                      kong-assistent (API-Gateway)
+#                      db-init-assistent (Init, one-shot) —
 # rapt_dashboard       web_rapt                         rapt_net        rapt-db-data
 #                      db-rapt (DB)
 #                      auth-rapt (GoTrue)
 #                      rest-rapt (PostgREST)
 #                      kong-rapt (API-Gateway)
+#                      db-init-rapt (Init, one-shot)    —
 # proxy                api_proxy                        assistent_net   —
 #                                                       (rapt_net ab Phase 3 / Proxy-Split)
 # Hauptseite           web_hauptseite                   brewing_net     —
@@ -244,6 +246,46 @@ services:
       - assistent_net
 
   # ==========================================================================
+  # DB-INIT — brew_assistent-Stack
+  # One-shot Init-Container: Baseline (falls leer) + pending Migrationen.
+  # Läuft bei jedem compose up; ist bei unverändertem Schema ein No-op.
+  # restart: "no" — beendet sich nach dem Apply (oder bei Fehler, Exit≠0).
+  # KEIN Watchtower-Label — Image ist versionsgepinnt (analog Supabase-Konvention).
+  #
+  # Volume-Mount: ../brew_assistent-new/db_scripts:/sql:ro
+  #   Pfad relativ zu webPage_infra/ (Compose-File-Verzeichnis).
+  #   Voraussetzung: brew_assistent-new-Repo ist Geschwister von webPage_infra/
+  #   (bootstrap.sh klont/aktualisiert es unter $APP_HOME).
+  #   Override via ASSISTENT_DB_SCRIPTS_PATH in .env (Default = Geschwister-Pfad).
+  # ==========================================================================
+
+  db-init-assistent:
+    container_name: db-init-assistent
+    # DB_INIT_RUNNER_TAG: gepinnter SHA-Short-Tag aus GHA (z.B. ab12cd3).
+    # Setzen in .env nach jedem Build: DB_INIT_RUNNER_TAG=<sha>.
+    # Default 'latest' nur als Fallback bis zum ersten gepinnten Deploy.
+    image: ${DOCKERHUB_USERNAME}/db_init_runner:${DB_INIT_RUNNER_TAG:-latest}
+    pull_policy: always
+    restart: "no"
+    depends_on:
+      db-assistent:
+        condition: service_healthy
+      auth-assistent:
+        condition: service_started
+    env_file: .env
+    environment:
+      DB_HOST: db-assistent
+      PGPASSWORD: ${ASSISTENT_POSTGRES_PASSWORD}
+      BASELINE_FILE: /sql/full/baseline.sql
+      MIGRATIONS_DIR: /sql/migrations
+      STACK_LABEL: assistent
+      REQUIRE_PREMIGRATION_BACKUP: ${REQUIRE_PREMIGRATION_BACKUP:-0}
+    volumes:
+      - ${ASSISTENT_DB_SCRIPTS_PATH:-../brew_assistent-new/db_scripts}:/sql:ro
+    networks:
+      - assistent_net
+
+  # ==========================================================================
   # LEAN SUPABASE — RAPT_DASHBOARD-STACK
   # db + auth + rest + kong; Schema: rapt + public + graphql_public
   # Netz: rapt_net | Volume: rapt-db-data
@@ -356,6 +398,43 @@ services:
       - rapt_net
 
   # ==========================================================================
+  # DB-INIT — rapt_dashboard-Stack
+  # One-shot Init-Container: Baseline (falls leer) + pending Migrationen.
+  # Identisches Runner-Image wie db-init-assistent; Stack-Spezifisches via Env.
+  # restart: "no" — beendet sich nach dem Apply (oder bei Fehler, Exit≠0).
+  # KEIN Watchtower-Label — Image ist versionsgepinnt.
+  #
+  # Volume-Mount: ../RAPT_Brewing_Dashboard-new/db_scripts:/sql:ro
+  #   rapt-Baseline liegt in db_scripts/baseline.sql (nicht in full/).
+  #   Override via RAPT_DB_SCRIPTS_PATH in .env (Default = Geschwister-Pfad).
+  # ==========================================================================
+
+  db-init-rapt:
+    container_name: db-init-rapt
+    # DB_INIT_RUNNER_TAG: identisch zu db-init-assistent — beide Runner-Container
+    # referenzieren dasselbe Image mit demselben gepinnten Tag.
+    image: ${DOCKERHUB_USERNAME}/db_init_runner:${DB_INIT_RUNNER_TAG:-latest}
+    pull_policy: always
+    restart: "no"
+    depends_on:
+      db-rapt:
+        condition: service_healthy
+      auth-rapt:
+        condition: service_started
+    env_file: .env
+    environment:
+      DB_HOST: db-rapt
+      PGPASSWORD: ${RAPT_POSTGRES_PASSWORD}
+      BASELINE_FILE: /sql/baseline.sql
+      MIGRATIONS_DIR: /sql/migrations
+      STACK_LABEL: rapt
+      REQUIRE_PREMIGRATION_BACKUP: ${REQUIRE_PREMIGRATION_BACKUP:-0}
+    volumes:
+      - ${RAPT_DB_SCRIPTS_PATH:-../RAPT_Brewing_Dashboard-new/db_scripts}:/sql:ro
+    networks:
+      - rapt_net
+
+  # ==========================================================================
   # INFRASTRUCTURE  (Tunnel + Auto-Update)
   # ==========================================================================
 
@@ -420,6 +499,10 @@ services:
   posteio:
     container_name: posteio
     image: analogic/poste.io:2.4
+    # profiles: [mail] — Mail-Server nicht beim dev-up mitgestartet (kein Port 25/465/… lokal).
+    # Starten: docker compose --profile mail up -d posteio
+    # (Bootstrap: via TUI-Option "Mailserver (Poste.io)")
+    profiles: [mail]
     restart: unless-stopped
     hostname: ${MAIL_HOSTNAME:-mail.alexstuder.cloud}
     ports:
