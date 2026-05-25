@@ -135,6 +135,11 @@ services:
       CORS_ORIGIN: ${ASSISTENT_PROXY_CORS_ORIGIN:-}
       # DATABASE_URL wird NICHT gesetzt — assistent-Proxy hat keinen db-sync.
       # OPENAI_API_KEY kommt via env_file: .env (Pflicht für die assistent-Rolle; Proxy-Guard prüft es).
+      # ── SSO Phase 5 (2026-05-25) ────────────────────────────────────────────
+      # SSO_SIGNING_SECRET (aus .env via env_file): assistent-Proxy SIGNIERT Tickets damit.
+      # Kein explizites environment-Mapping nötig — env_file: .env liefert es automatisch.
+      # RAPT_SERVICE_ROLE_KEY wird von diesem Proxy NICHT verwendet (nur rapt-Proxy braucht ihn).
+      # ────────────────────────────────────────────────────────────────────────
     labels:
       com.centurylinklabs.watchtower.enable: "true"
     networks:
@@ -163,6 +168,15 @@ services:
       # CORS_ORIGIN für die rapt-Web-App (leer = kein CORS-Restrict; prod: https://rapt.alexstuder.cloud).
       CORS_ORIGIN: ${RAPT_PROXY_CORS_ORIGIN:-}
       # OPENAI_API_KEY kommt via env_file: .env — für rapt-Rolle irrelevant, wird ignoriert.
+      # ── SSO Phase 5 (2026-05-25) ────────────────────────────────────────────
+      # SSO_SIGNING_SECRET (aus .env via env_file): rapt-Proxy VERIFIZIERT Tickets damit.
+      # Kein explizites environment-Mapping nötig — env_file: .env liefert es automatisch.
+      # RAPT_SERVICE_ROLE_KEY (aus .env via env_file): NUR für SSO-Redeem GoTrue-Admin-Calls
+      # (/api/sso/redeem: User finden/anlegen in Auth R, R-Session per service_role mint).
+      # Kein explizites environment-Mapping nötig — env_file: .env liefert es automatisch.
+      # ISOLATIONS-GARANTIE: RAPT_SERVICE_ROLE_KEY ist rapt-Stack-spezifisch (signiert mit
+      # RAPT_JWT_SECRET); den assistent-Proxy-Code darf er nie erreichen (er liest ihn nicht).
+      # ────────────────────────────────────────────────────────────────────────
     labels:
       com.centurylinklabs.watchtower.enable: "true"
     networks:
