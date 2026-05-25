@@ -1143,6 +1143,173 @@ EOSU
   ok "Portainer Edge-Agent gestartet (verbindet sich ausgehend zum Hub)"
 }
 
+# ================================================================
+# DB-BASELINE SICHERSTELLEN (idempotent, selbstheilend)
+#
+# Wann aufrufen:
+#   - Nach erfolgreichem Supabase-Start (action_select_and_start wenn has_supabase==1)
+#   - Reihenfolge: NACH _ensure_supabase_marker, NACH compose up
+#   - NICHT nach Restore-Pfaden (Dump enthält das Schema bereits)
+#
+# Was passiert:
+#   1. Guard: nur ausführen wenn supabase-Marker gesetzt (stateful Unit auf diesem VPS).
+#      → Auf stateless-VPS (kein Marker) = sofortiger No-op.
+#   2. Readiness-Wait: poll bis auth.users existiert (GoTrue hat seine Migrationen
+#      gefahren). Timeout 120 s, klare Fehlermeldung.
+#   3. Sentinel-Check: existiert aibrewgenius.user_profiles bereits?
+#      → ja → "bereits initialisiert", No-op.
+#      → nein → Baseline anwenden.
+#   4. api_proxy stoppen/starten rund um den Apply (Lock-Timeout-Schutz:
+#      rapt-Teil des Baseline setzt lock_timeout='5s' auf telemetry_*;
+#      aktive brew-proxy-Verbindung kann diesen Lock halten).
+#   5. apply-baseline.sh --yes aufrufen (ON_ERROR_STOP=1, non-interaktiv).
+#   6. Ergebnis loggen: "DB-Baseline angewendet" / "bereits initialisiert" / "uebersprungen".
+#
+# Idempotenz: Baseline ist CREATE IF NOT EXISTS / CREATE OR REPLACE — Re-Apply auf
+# vollständig migrierter DB ist ein No-op (sentinel verhindert unnötigen Aufruf).
+# ================================================================
+ensure_db_baseline() {
+  local supabase_marker="/etc/brewing/stateful-units.d/supabase"
+
+  # ---- Guard: nur auf VPS mit Supabase als stateful Unit ----
+  if [[ ! -f "$supabase_marker" ]]; then
+    echo "  DB-Baseline: uebersprungen (kein Supabase-Marker — stateless VPS)."
+    return 0
+  fi
+
+  log "DB-Baseline sicherstellen (idempotent)"
+
+  # ---- Readiness-Wait: warten bis auth.users existiert (GoTrue-Migrationen) ----
+  # GoTrue laeuft nach dem Postgres-initdb und legt auth.users via eigene Migrationen an.
+  # Timeout: 120 s (grosszuegig fuer langsame VPS + Image-Pull).
+  local wait_secs=0
+  local wait_max=120
+  local wait_interval=5
+  local auth_ready=0
+
+  echo "  Warte auf auth.users (GoTrue-Readiness, max ${wait_max}s)..."
+  local psql_error=0
+  while (( wait_secs < wait_max )); do
+    local _chk _psql_rc
+    # psql-Exit-Code getrennt erfassen (Lesson: nie '|| true' direkt in der Subshell,
+    # da das Connection-Fehler (rc=2) und leeres Result gleich aussehen laesst).
+    _chk="$(sudo -u "$APP_USER" bash <<'EOSU'
+docker exec supabase-db \
+  psql -U supabase_admin -d postgres --no-psqlrc -tAc \
+  "SELECT to_regclass('auth.users')" 2>/dev/null
+printf '\n%d' $?
+EOSU
+)"
+    # Letzte Zeile = Exit-Code, Rest = Abfrageergebnis.
+    _psql_rc="${_chk##*$'\n'}"
+    _chk="${_chk%$'\n'*}"
+    _chk="${_chk//[[:space:]]/}"
+
+    if (( _psql_rc != 0 )); then
+      # Connection- oder Auth-Fehler — nicht GoTrue-Nicht-Bereit; sofort abbrechen.
+      psql_error=1
+      break
+    fi
+
+    if [[ -n "$_chk" ]]; then
+      auth_ready=1
+      break
+    fi
+    sleep "$wait_interval"
+    wait_secs=$(( wait_secs + wait_interval ))
+    printf '  ... %ds / %ds\n' "$wait_secs" "$wait_max"
+  done
+
+  if (( psql_error == 1 )); then
+    printf '\n\033[1;31m✖ DB-Baseline: psql-Verbindung zu supabase-db fehlgeschlagen (Timeout/Auth).\033[0m\n' >&2
+    printf '  Moegliche Ursachen:\033[0m\n' >&2
+    printf '    - supabase-db laeuft nicht (docker ps | grep supabase-db)\033[0m\n' >&2
+    printf '    - supabase_admin-Passwort fehlt oder falsch (POSTGRES_PASSWORD in .env)\033[0m\n' >&2
+    printf '  Massnahmen:\033[0m\n' >&2
+    printf '    1. docker logs supabase-db  (Init-Fehler pruefen)\033[0m\n' >&2
+    printf '    2. docker compose --profile vps ps  (Container-Status)\033[0m\n' >&2
+    printf '    3. Dann manuell: cd ~/webPage_infra && ./scripts/apply-baseline.sh --yes\033[0m\n' >&2
+    return 1
+  fi
+  if (( auth_ready == 0 )); then
+    printf '\n\033[1;31m✖ DB-Baseline: auth.users nach %ds nicht gefunden.\033[0m\n' "$wait_max" >&2
+    printf '  GoTrue (supabase-auth-Container) hat seine Migrationen noch nicht abgeschlossen\033[0m\n' >&2
+    printf '  oder der supabase-auth-Container laeuft nicht.\033[0m\n' >&2
+    printf '  Massnahmen:\033[0m\n' >&2
+    printf '    1. docker logs supabase-auth (GoTrue-Migrations-Fehler pruefen)\033[0m\n' >&2
+    printf '    2. docker compose --profile vps ps  (Container-Status)\033[0m\n' >&2
+    printf '    3. Dann manuell: cd ~/webPage_infra && ./scripts/apply-baseline.sh --yes\033[0m\n' >&2
+    return 1
+  fi
+  ok "auth.users vorhanden (GoTrue bereit nach ${wait_secs}s)"
+
+  # ---- Sentinel-Check: Baseline bereits angewendet? ----
+  local _sentinel
+  _sentinel="$(sudo -u "$APP_USER" bash <<'EOSU' 2>/dev/null
+docker exec supabase-db \
+  psql -U supabase_admin -d postgres -tAc \
+  "SELECT to_regclass('aibrewgenius.user_profiles')" 2>/dev/null || true
+EOSU
+)"
+  _sentinel="${_sentinel//[[:space:]]/}"
+
+  if [[ -n "$_sentinel" ]]; then
+    ok "DB-Baseline bereits initialisiert (aibrewgenius.user_profiles vorhanden) — No-op."
+    return 0
+  fi
+
+  log "DB-Baseline anwenden (frische DB)"
+
+  # ---- api_proxy stoppen (Lock-Timeout-Schutz) ----
+  # rapt-Teil des Baseline setzt lock_timeout='5s' auf telemetry_*. Eine aktive
+  # brew-proxy-Verbindung kann diesen Lock halten. Stoppen → Apply → ggf. starten.
+  local proxy_was_running=0
+  sudo -u "$APP_USER" bash <<'EOSU' 2>/dev/null && proxy_was_running=1 || proxy_was_running=0
+docker inspect --format='{{.State.Running}}' api-proxy 2>/dev/null | grep -q '^true$'  # container_name (Bindestrich), nicht Compose-Service-Name (Unterstrich)
+EOSU
+  if (( proxy_was_running == 1 )); then
+    echo "  api_proxy stoppen (Lock-Timeout-Schutz fuer Baseline-Apply)..."
+    sudo -u "$APP_USER" bash <<'EOSU' 2>/dev/null || true
+docker stop api-proxy 2>/dev/null || true
+EOSU
+  fi
+
+  # ---- apply-baseline.sh --yes aufrufen ----
+  # Als $APP_USER (Owner des Repos + .env); --yes = non-interaktiv (Bestätigung hier eingeholt).
+  # Fehler propagieren: ein fehlschlagender Apply soll den Bootstrap-Schritt fehlschlagen lassen.
+  sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+set -euo pipefail
+cd "$APP_DIR"
+./scripts/apply-baseline.sh --yes
+EOSU
+
+  ok "DB-Baseline angewendet"
+
+  # ---- api_proxy wieder starten (falls vorher lief) ----
+  if (( proxy_was_running == 1 )); then
+    echo "  api_proxy wieder starten..."
+    sudo -u "$APP_USER" bash <<'EOSU' 2>/dev/null || true
+docker start api-proxy 2>/dev/null || true
+EOSU
+    ok "api_proxy wieder gestartet"
+  fi
+
+  # ---- Post-Deploy-Hinweise (Post-Migrations-Verifikations-Gates) ----
+  printf '\n\033[1;32m  ✓ DB-Schema initialisiert — empfohlene Verifikation (einmalig):\033[0m\n\n'
+  printf '  Gate A — Hypertable-Restore-Test (TimescaleDB):\033[0m\n'
+  printf '    Backup anlegen: ./scripts/backup.sh --label hypertable-gate\033[0m\n'
+  printf '    Restore in isolierten Test-Stack (brewing-test), Counts pruefen:\033[0m\n'
+  printf '      SELECT count(*) FROM rapt.telemetry_controllers; -- muss > 0 nach Restore\033[0m\n'
+  printf '    (Counts = 0 nach Restore → defekte TimescaleDB pre/post_restore-Hooks)\033[0m\n\n'
+  printf '  Gate B — SSO cross-subdomain:\033[0m\n'
+  printf '    Login in brew.alexstuder.cloud → rapt.alexstuder.cloud OHNE zweiten Login.\033[0m\n'
+  printf '    Cookie sb-session muss Domain=.alexstuder.cloud tragen.\033[0m\n\n'
+  printf '  Gate C — Tenant-Isolation:\033[0m\n'
+  printf '    Zweiter Testuser anlegen → sieht KEINE Daten des ersten Users.\033[0m\n'
+  printf '    RLS-Check: SELECT schemaname,tablename,rowsecurity FROM pg_tables\033[0m\n'
+  printf '                WHERE schemaname IN ('"'"'aibrewgenius'"'"','"'"'rapt'"'"') -- alle rowsecurity=t\033[0m\n\n'
+}
+
 # ---------------------------------------------------------------- TUI-Renderer (ANSI-Modus)
 # Zeichnet die Liste in-place: bewegt Cursor n Zeilen hoch, dann neu zeichnen.
 # $1 = aktueller Cursor-Index (0-basiert)
@@ -1504,6 +1671,15 @@ EOSU
   # ---- Supabase-Marker setzen (falls supabase-kong gestartet wurde) ----
   if (( has_supabase == 1 )); then
     _ensure_supabase_marker
+    # ---- DB-Baseline sicherstellen (nach Supabase-Start, idempotent) ----
+    # Wendet den konsolidierten Schema-Baseline an, falls die DB noch keine
+    # aibrewgenius.user_profiles-Tabelle hat. No-op wenn bereits initialisiert.
+    # Voraussetzung: auth.users muss existieren (GoTrue-Readiness-Poll innen).
+    # Fehlschlag (Timeout / psql-Fehler) bricht den Bootstrap NICHT ab — Stack
+    # laeuft bereits; Baseline jederzeit nachholbar via apply-baseline.sh.
+    ensure_db_baseline || {
+      printf '[bootstrap] WARN: DB-Baseline nicht angewendet (Stack laeuft; spaeter manuell: scripts/apply-baseline.sh --yes)\n' >&2
+    }
   fi
 
   # ---- Portainer starten (nach compose up, damit cloudflared bereits laeuft) ----
