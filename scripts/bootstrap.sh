@@ -331,24 +331,26 @@ EOF
   ok "Marker-Registry vorhanden: ${units_dir}"
 
   # ---------------------------------------------------------------- Marker-Backfill (selbstheilend, E6)
-  # Auf bereits gebootstrappten VPS: wenn supabase-db jetzt läuft → Marker idempotent anlegen.
-  # Beim Erst-Bootstrap ist supabase-db noch nicht gestartet (Start passiert im Menü via
+  # Auf bereits gebootstrappten VPS: wenn db-assistent jetzt läuft → Marker idempotent anlegen.
+  # Beim Erst-Bootstrap ist db-assistent noch nicht gestartet (Start passiert im Menü via
   # action_select_and_start) — der Marker wird dort nach erfolgreichem docker compose up gesetzt.
   # Dieser Backfill ist die Selbstheilung für VPS, die vor der Marker-Einführung gebootstrapped
   # wurden.
+  # TODO Phase 4 (cicd-coder Backup): Marker auf zwei Units aufteilen:
+  #   db-assistent + db-rapt (getrennte stateful Units, je ein Marker).
   local supabase_marker="${units_dir}/supabase"
   if [[ -f "$supabase_marker" ]]; then
     ok "supabase-Marker bereits vorhanden — Backfill übersprungen"
   else
     local _sb_running=0
     sudo -u "$APP_USER" bash <<'EOSU' 2>/dev/null && _sb_running=1 || _sb_running=0
-docker inspect --format='{{.State.Running}}' supabase-db 2>/dev/null | grep -q '^true$'
+docker inspect --format='{{.State.Running}}' db-assistent 2>/dev/null | grep -q '^true$'
 EOSU
     if (( _sb_running == 1 )); then
       install -m 644 -o "$APP_USER" -g "$APP_USER" /dev/null "$supabase_marker"
-      ok "supabase-Marker gesetzt (Backfill: supabase-db läuft) → ${supabase_marker}"
+      ok "supabase-Marker gesetzt (Backfill: db-assistent läuft) → ${supabase_marker}"
     else
-      echo "  supabase-db läuft noch nicht — Backfill übersprungen (Marker wird beim Install-Unit-Start gesetzt)."
+      echo "  db-assistent läuft noch nicht — Backfill übersprungen (Marker wird beim Install-Unit-Start gesetzt)."
     fi
   fi
 
@@ -524,8 +526,10 @@ EOSU
 
 # ---------------------------------------------------------------- Supabase-Marker idempotent setzen
 # Setzt /etc/brewing/stateful-units.d/supabase (mode 644, owner alex), falls
-# supabase-db jetzt läuft. Idempotent: vorhandener Marker → kein Fehler.
-# Wird nach erfolgreichem docker compose up für Optionen aufgerufen, die supabase-db starten.
+# db-assistent jetzt läuft. Idempotent: vorhandener Marker → kein Fehler.
+# Wird nach erfolgreichem docker compose up für Optionen aufgerufen, die db-assistent starten.
+# TODO Phase 4 (cicd-coder Backup): auf zwei Marker aufteilen:
+#   /etc/brewing/stateful-units.d/db-assistent + .../db-rapt.
 _ensure_supabase_marker() {
   local units_dir="/etc/brewing/stateful-units.d"
   local supabase_marker="${units_dir}/supabase"
@@ -535,16 +539,16 @@ _ensure_supabase_marker() {
     ok "supabase-Marker bereits vorhanden — ${supabase_marker}"
     return 0
   fi
-  # Gegated auf laufenden supabase-db (kein Marker für eine Unit die nicht hochkam)
+  # Gegated auf laufenden db-assistent (kein Marker für eine Unit die nicht hochkam)
   local _sb_running=0
   sudo -u "$APP_USER" bash <<'EOSU' 2>/dev/null && _sb_running=1 || _sb_running=0
-docker inspect --format='{{.State.Running}}' supabase-db 2>/dev/null | grep -q '^true$'
+docker inspect --format='{{.State.Running}}' db-assistent 2>/dev/null | grep -q '^true$'
 EOSU
   if (( _sb_running == 1 )); then
     install -m 644 -o "$APP_USER" -g "$APP_USER" /dev/null "$supabase_marker"
     ok "supabase-Marker gesetzt → ${supabase_marker}"
   else
-    printf '  \033[1;33m⚠ supabase-db läuft noch nicht — Marker NICHT gesetzt (Unit kam nicht hoch?).\033[0m\n'
+    printf '  \033[1;33m⚠ db-assistent laeuft noch nicht — Marker NICHT gesetzt (Unit kam nicht hoch?).\033[0m\n'
   fi
 }
 
@@ -966,7 +970,7 @@ PYEOF
 #
 # Eingabe-Zeile          Services die gestartet werden  Default
 # ─────────────────────────────────────────────────────────────
-# brew_assistent+Supa    web_assistent supabase-kong    nein
+# brew_assistent+Supa    web_assistent kong-assistent   nein  [Phase 1]
 # RAPT Dashboard         web_rapt                       nein
 # brew-proxy (API)       api_proxy                      nein
 # WebPageAlexStuder      web_hauptseite                 nein
@@ -1146,6 +1150,13 @@ EOSU
 # ================================================================
 # DB-BASELINE SICHERSTELLEN (idempotent, selbstheilend)
 #
+# TODO Phase 2 (cicd-coder + dba-coder): Diese Funktion auf Per-App-Runners
+# umbauen (je db-assistent + db-rapt, mit schema_migrations-Tracking).
+# Phase 1 (2026-05-25): Service-Namen auf db-assistent / auth-assistent aktualisiert.
+# Die Funktion bleibt im Code, ist aber de-facto-No-op auf neuen VPS (kein supabase-Marker →
+# Guard greift sofort). Auf bestehenden (alten) VPS mit supabase-Marker muss
+# die Funktion manuell deaktiviert werden; ein Prod-VPS existiert noch nicht.
+#
 # Wann aufrufen:
 #   - Nach erfolgreichem Supabase-Start (action_select_and_start wenn has_supabase==1)
 #   - Reihenfolge: NACH _ensure_supabase_marker, NACH compose up
@@ -1193,8 +1204,9 @@ ensure_db_baseline() {
     local _chk _psql_rc
     # psql-Exit-Code getrennt erfassen (Lesson: nie '|| true' direkt in der Subshell,
     # da das Connection-Fehler (rc=2) und leeres Result gleich aussehen laesst).
+    # Phase 1: db-assistent (neuer Name nach Per-App-DB-Pivot 2026-05-25).
     _chk="$(sudo -u "$APP_USER" bash <<'EOSU'
-docker exec supabase-db \
+docker exec db-assistent \
   psql -U supabase_admin -d postgres --no-psqlrc -tAc \
   "SELECT to_regclass('auth.users')" 2>/dev/null
 printf '\n%d' $?
@@ -1221,22 +1233,24 @@ EOSU
   done
 
   if (( psql_error == 1 )); then
-    printf '\n\033[1;31m✖ DB-Baseline: psql-Verbindung zu supabase-db fehlgeschlagen (Timeout/Auth).\033[0m\n' >&2
+    # Phase 1: db-assistent (neuer Name nach Per-App-DB-Pivot 2026-05-25).
+    printf '\n\033[1;31m✖ DB-Baseline: psql-Verbindung zu db-assistent fehlgeschlagen (Timeout/Auth).\033[0m\n' >&2
     printf '  Moegliche Ursachen:\033[0m\n' >&2
-    printf '    - supabase-db laeuft nicht (docker ps | grep supabase-db)\033[0m\n' >&2
-    printf '    - supabase_admin-Passwort fehlt oder falsch (POSTGRES_PASSWORD in .env)\033[0m\n' >&2
+    printf '    - db-assistent laeuft nicht (docker ps | grep db-assistent)\033[0m\n' >&2
+    printf '    - supabase_admin-Passwort fehlt oder falsch (ASSISTENT_POSTGRES_PASSWORD in .env)\033[0m\n' >&2
     printf '  Massnahmen:\033[0m\n' >&2
-    printf '    1. docker logs supabase-db  (Init-Fehler pruefen)\033[0m\n' >&2
+    printf '    1. docker logs db-assistent  (Init-Fehler pruefen)\033[0m\n' >&2
     printf '    2. docker compose --profile vps ps  (Container-Status)\033[0m\n' >&2
     printf '    3. Dann manuell: cd ~/webPage_infra && ./scripts/apply-baseline.sh --yes\033[0m\n' >&2
     return 1
   fi
   if (( auth_ready == 0 )); then
+    # Phase 1: auth-assistent (neuer Name nach Per-App-DB-Pivot 2026-05-25).
     printf '\n\033[1;31m✖ DB-Baseline: auth.users nach %ds nicht gefunden.\033[0m\n' "$wait_max" >&2
-    printf '  GoTrue (supabase-auth-Container) hat seine Migrationen noch nicht abgeschlossen\033[0m\n' >&2
-    printf '  oder der supabase-auth-Container laeuft nicht.\033[0m\n' >&2
+    printf '  GoTrue (auth-assistent-Container) hat seine Migrationen noch nicht abgeschlossen\033[0m\n' >&2
+    printf '  oder der auth-assistent-Container laeuft nicht.\033[0m\n' >&2
     printf '  Massnahmen:\033[0m\n' >&2
-    printf '    1. docker logs supabase-auth (GoTrue-Migrations-Fehler pruefen)\033[0m\n' >&2
+    printf '    1. docker logs auth-assistent (GoTrue-Migrations-Fehler pruefen)\033[0m\n' >&2
     printf '    2. docker compose --profile vps ps  (Container-Status)\033[0m\n' >&2
     printf '    3. Dann manuell: cd ~/webPage_infra && ./scripts/apply-baseline.sh --yes\033[0m\n' >&2
     return 1
@@ -1244,9 +1258,10 @@ EOSU
   ok "auth.users vorhanden (GoTrue bereit nach ${wait_secs}s)"
 
   # ---- Sentinel-Check: Baseline bereits angewendet? ----
+  # Phase 1: db-assistent (neuer Name nach Per-App-DB-Pivot 2026-05-25).
   local _sentinel
   _sentinel="$(sudo -u "$APP_USER" bash <<'EOSU' 2>/dev/null
-docker exec supabase-db \
+docker exec db-assistent \
   psql -U supabase_admin -d postgres -tAc \
   "SELECT to_regclass('aibrewgenius.user_profiles')" 2>/dev/null || true
 EOSU
@@ -1540,8 +1555,8 @@ action_select_and_start() {
 
   # ---- Service-Liste aufbauen aus der Auswahl ----
   # Mapping Index → Services (0-basiert):
-  #   0 = brew_assistent+Supabase  → web_assistent supabase-kong
-  #   1 = RAPT Dashboard           → web_rapt
+  #   0 = brew_assistent+Supabase  → web_assistent kong-assistent (+ depends_on: db-assistent, auth-assistent, rest-assistent)
+  #   1 = RAPT Dashboard           → web_rapt      kong-rapt      (+ depends_on: db-rapt, auth-rapt, rest-rapt)
   #   2 = brew-proxy               → api_proxy
   #   3 = WebPageAlexStuder        → web_hauptseite
   #   4 = Watchtower               → watchtower
@@ -1549,44 +1564,51 @@ action_select_and_start() {
   #   6 = Mailserver (Poste.io)    → posteio
   #
   # cloudflared wird IMMER angehaengt (kein Eintrag im Menue).
+  #
+  # Phase 1 (2026-05-25): Service-Namen auf Per-App-Stack umgestellt.
+  # Compose-Ziele: kong-assistent / kong-rapt (statt supabase-kong).
+  # db-assistent-Check ersetzt den alten supabase-db-Check (siehe Eintrag 2 unten).
 
   # Service-Liste als assoziatives Set (via string-Suche verhindert Duplikate)
   local svc_list=""
-  # Merker: wurde supabase-kong explizit oder via Abhaengigkeit aufgenommen?
+  # Merker: wurde kong-assistent (assistent-Supabase-Stack) aufgenommen?
   local has_supabase=0
   local has_portainer=0
   local has_mail=0
   local portainer_role=""
 
-  # Eintrag 0: brew_assistent + Supabase
+  # Eintrag 0: brew_assistent + assistent-Supabase-Stack [Phase 1]
   if (( selected[0] == 1 )); then
-    log "brew_assistent + Supabase ausgewaehlt"
-    echo "  Services: web_assistent supabase-kong (depends_on zieht Supabase-Core mit)"
-    svc_list="${svc_list} web_assistent supabase-kong"
+    log "brew_assistent + assistent-Supabase-Stack ausgewaehlt"
+    echo "  Services: web_assistent kong-assistent (depends_on zieht db-assistent, auth-assistent, rest-assistent mit)"
+    svc_list="${svc_list} web_assistent kong-assistent"
     has_supabase=1
   fi
 
-  # Eintrag 1: RAPT Dashboard
+  # Eintrag 1: RAPT Dashboard + rapt-Supabase-Stack [Phase 1]
   if (( selected[1] == 1 )); then
-    log "RAPT Dashboard ausgewaehlt"
-    svc_list="${svc_list} web_rapt"
+    log "RAPT Dashboard + rapt-Supabase-Stack ausgewaehlt"
+    echo "  Services: web_rapt kong-rapt (depends_on zieht db-rapt, auth-rapt, rest-rapt mit)"
+    svc_list="${svc_list} web_rapt kong-rapt"
   fi
 
-  # Eintrag 2: brew-proxy — prueft ob Supabase laeuft
+  # Eintrag 2: brew-proxy — prueft ob assistent-Kong laeuft [Phase 1]
+  # TODO Phase 3 (Proxy-Split): zwei separate Proxies; Check auf kong-assistent
+  # fuer assistent-Proxy und kong-rapt fuer rapt-Proxy.
   if (( selected[2] == 1 )); then
     log "brew-proxy (api_proxy) ausgewaehlt"
-    echo "  Pruefe, ob supabase-db laeuft..."
+    echo "  Pruefe, ob db-assistent laeuft..."
     local supabase_running=0
     sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU' && supabase_running=1 || supabase_running=0
-docker inspect --format='{{.State.Running}}' supabase-db 2>/dev/null | grep -q '^true$'
+docker inspect --format='{{.State.Running}}' db-assistent 2>/dev/null | grep -q '^true$'
 EOSU
     if (( supabase_running == 0 && has_supabase == 0 )); then
-      printf '  \033[1;33m⚠ supabase-db laeuft nicht und wurde nicht mitausgewaehlt —\033[0m\n'
-      printf '  \033[1;33m  supabase-kong wird automatisch mitgestartet (brew-proxy braucht Supabase).\033[0m\n'
-      svc_list="${svc_list} supabase-kong"
+      printf '  \033[1;33m⚠ db-assistent laeuft nicht und wurde nicht mitausgewaehlt —\033[0m\n'
+      printf '  \033[1;33m  kong-assistent wird automatisch mitgestartet (brew-proxy braucht assistent-Supabase).\033[0m\n'
+      svc_list="${svc_list} kong-assistent"
       has_supabase=1
     elif (( supabase_running == 1 )); then
-      echo "  Supabase laeuft bereits — kein Mitstart noetig."
+      echo "  db-assistent laeuft bereits — kein Mitstart noetig."
     fi
     svc_list="${svc_list} api_proxy"
   fi
@@ -1668,7 +1690,7 @@ docker compose --profile vps up -d cloudflared
 EOSU
   fi
 
-  # ---- Supabase-Marker setzen (falls supabase-kong gestartet wurde) ----
+  # ---- Supabase-Marker setzen (falls kong-assistent gestartet wurde) ----
   if (( has_supabase == 1 )); then
     _ensure_supabase_marker
     # ---- DB-Baseline sicherstellen (nach Supabase-Start, idempotent) ----
@@ -1809,6 +1831,14 @@ REMOTE
 # Migriert die gesamte Supabase / DB-Unit (core + aibrewgenius + rapt — alle Schemen).
 # Supabase ist die EINZIGE stateful Unit; brew_assistent/rapt_dashboard sind zustandslos
 # (kein Backup/Restore fuer Frontends — die werden via action_select_and_start neu gestartet).
+#
+# TODO Phase 4 (cicd-coder Backup/Restore):
+#   Diese Funktion auf TWO stateful Units umbauen: db-assistent + db-rapt.
+#   (Phase 1 2026-05-25: Service-Namen bereits auf neue Namen umgestellt — db-assistent,
+#   kong-assistent, auth-assistent, db-rapt, kong-rapt, auth-rapt.)
+#   Zwei separate Restore-Pfade; TimescaleDB-Hooks nur fuer rapt (kein Hypertable in assistent).
+#   R2-Ordner: backup/db-assistent/ + backup/db-rapt/ (statt backup/supabase/).
+#   Bis dahin: Migrations-Pfad nutzt Single-Snapshot-Logik — NICHT produktiv einsetzen bis Phase 4.
 action_migrate_unit() {
   printf '\n\033[1;34m▶ Was migrieren?\033[0m\n\n'
   printf '  1) Supabase / DB migrieren   (core + aibrewgenius + rapt — gesamte DB)\n'
@@ -1830,7 +1860,8 @@ action_migrate_unit() {
   esac
 
   # ---- SSH-Verbindungsdaten abfragen
-  printf '\n\033[1;34m▶ Verbindung zum alten VPS (Quell-VPS mit supabase-db)\033[0m\n\n'
+  # Phase 1: db-assistent (neuer Name nach Per-App-DB-Pivot 2026-05-25).
+  printf '\n\033[1;34m▶ Verbindung zum alten VPS (Quell-VPS mit db-assistent/db-rapt)\033[0m\n\n'
   local old_host old_user old_port
   read -rp "Hostname / IP des alten VPS: " old_host
   [[ -n "$old_host" ]] || err "Kein Host eingegeben"
@@ -1861,14 +1892,14 @@ action_migrate_unit() {
   # Wenn ja: Abbruch statt blindes Überschreiben (könnte fremde User zerstören).
   #
   # Zwei getrennte Checks:
-  #   1. Läuft supabase-db überhaupt?
+  #   1. Läuft db-assistent überhaupt? (Phase 1: neuer Name nach Per-App-DB-Pivot)
   #   2. .env laden + COUNT abfragen.
   # Trennung verhindert, dass ein .env-Fehler als "existing_users=0" maskiert wird
   # und ein destruktiver Restore ohne Warnung durchläuft.
-  log "Supabase-Core-Konflikt-Schutz: auth.users auf neuem VPS prüfen"
+  log "Supabase-Core-Konflikt-Schutz: auth.users auf neuem VPS prüfen (db-assistent)"
   local existing_users=0 db_running=0
   sudo -u "$APP_USER" -H bash <<'EOSU' 2>/dev/null && db_running=1 || db_running=0
-docker inspect --format='{{.State.Running}}' supabase-db 2>/dev/null | grep -q '^true$'
+docker inspect --format='{{.State.Running}}' db-assistent 2>/dev/null | grep -q '^true$'
 EOSU
 
   if (( db_running == 1 )); then
@@ -1877,15 +1908,16 @@ set -euo pipefail
 cd "$APP_DIR"
 [[ -f .env ]] || { printf 'FEHLER: .env fehlt in %s — Migration nicht sicher fortsetzbar.\n' "$APP_DIR" >&2; exit 1; }
 set -a; source .env; set +a
-[[ -n "${POSTGRES_PASSWORD:-}" ]] || { printf 'FEHLER: POSTGRES_PASSWORD nicht in .env gesetzt.\n' >&2; exit 1; }
-docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" supabase-db \
+# TODO Phase 4: ASSISTENT_POSTGRES_PASSWORD (ggf. auch RAPT-DB pruefen).
+[[ -n "${ASSISTENT_POSTGRES_PASSWORD:-}" ]] || { printf 'FEHLER: ASSISTENT_POSTGRES_PASSWORD nicht in .env gesetzt.\n' >&2; exit 1; }
+docker exec -e PGPASSWORD="$ASSISTENT_POSTGRES_PASSWORD" db-assistent \
   psql -tA -U supabase_admin -d postgres \
   -c "SELECT count(*) FROM auth.users;"
 EOSU
 )"
     existing_users="${existing_users//[[:space:]]/}"
     if [[ "$existing_users" =~ ^[0-9]+$ ]] && (( existing_users > 0 )); then
-      printf '\n\033[1;31m✖ KONFLIKT: Auf dem neuen VPS existieren bereits %s auth.users.\033[0m\n' "$existing_users"
+      printf '\n\033[1;31m✖ KONFLIKT: Auf dem neuen VPS existieren bereits %s auth.users (db-assistent).\033[0m\n' "$existing_users"
       printf '  Ein Whole-DB-Restore (--clean) würde diese überschreiben.\n'
       printf '  Szenarien:\n'
       printf '  a) Neuer VPS ist dediziert für diese Migration → Benutzer explizit löschen, dann erneut starten.\n'
@@ -1897,7 +1929,7 @@ EOSU
       printf '  \033[1;33m⚠ WARNUNG: Fortfahren — bestehende auth.users werden durch Restore überschrieben.\033[0m\n'
     fi
   else
-    echo "  supabase-db läuft noch nicht auf neuem VPS — core-Restore unkritisch."
+    echo "  db-assistent läuft noch nicht auf neuem VPS — core-Restore unkritisch."
   fi
 
   # ---- Zusammenfassung + Bestätigung vor destruktivem Teil
@@ -1906,7 +1938,7 @@ EOSU
   printf '  Umzug:   Supabase / gesamte DB (core + aibrewgenius + rapt)\n'
   printf '  Schritte:\n'
   printf '    (a) Backup auf altem VPS (--label pre-migration) + R2-Verifikation (1 Whole-DB-Dump)\n'
-  printf '    (b) Supabase-Stack auf altem VPS stoppen (supabase-db + Frontend)\n'
+  printf '    (b) Supabase-Stacks auf altem VPS stoppen (db-assistent + db-rapt + Frontends)\n'
   printf '    (c) Supabase auf neuem VPS hochziehen\n'
   printf '    (d) Whole-DB-Dump restoren (supabase/ → all) via --clean\n'
   printf '    (e) supabase-Marker auf altem VPS entfernen (Backup wird No-op)\n'
@@ -1947,43 +1979,47 @@ EOSU
   # ===========================================================================
   # SCHRITT (b) — Supabase-Stack auf altem VPS stoppen
   # ===========================================================================
-  log "(b) Supabase-Stack (supabase-db + Frontends) auf altem VPS stoppen"
-  # Supabase-Stack stoppen (inkl. supabase-db): verhindert neue Writes nach dem
-  # pre-migration-Backup. Frontends werden ebenfalls gestoppt (zustandslos, kein Datenverlust).
-  # 'docker compose stop' ohne Argument stoppt alle laufenden Services in der Compose-Datei.
-  # Robuster Ansatz: explizit supabase-db + bekannte Frontend-Services — verhindert
+  # Phase 1: Service-Namen auf neue Lean-Stack-Namen umgestellt (2026-05-25).
+  # db-assistent/kong-assistent/auth-assistent/rest-assistent + rapt-Entsprechungen.
+  # TODO Phase 4 (Backup/Restore): zwei separate Stop-Pfade für db-assistent + db-rapt.
+  log "(b) Supabase-Stacks (db-assistent + db-rapt + Frontends) auf altem VPS stoppen"
+  # Stoppen verhindert neue Writes nach dem pre-migration-Backup.
+  # Frontends werden ebenfalls gestoppt (zustandslos, kein Datenverlust).
+  # Robuster Ansatz: explizit alle bekannten Services benennen — verhindert
   # versehentliches Stoppen von Services auf dem neuen VPS (falscher Host).
   ssh -o BatchMode=yes -o ConnectTimeout=15 \
       -o StrictHostKeyChecking=accept-new \
       -p "$old_port" "${old_user}@${old_host}" \
-      'cd ~/webPage_infra && docker compose stop supabase-db supabase-kong supabase-auth supabase-rest supabase-realtime supabase-storage supabase-meta supabase-functions web_assistent web_rapt api_proxy 2>/dev/null || true
+      'cd ~/webPage_infra && docker compose stop db-assistent kong-assistent auth-assistent rest-assistent db-rapt kong-rapt auth-rapt rest-rapt web_assistent web_rapt api_proxy 2>/dev/null || true
        docker compose stop 2>/dev/null || true' \
     || err "Stop auf altem VPS fehlgeschlagen. Bitte manuell prüfen: ssh ${old_user}@${old_host} 'cd ~/webPage_infra && docker compose ps'"
 
   # C1: Separater Verifikations-SSH-Call — NICHT auf Exit-Code von 'docker compose stop'
-  # verlassen (der ist immer 0, auch wenn supabase-db noch läuft oder gar nicht existiert).
-  # Erst wenn docker inspect bestätigt, dass supabase-db nicht mehr läuft (oder gar nicht
+  # verlassen (der ist immer 0, auch wenn db-assistent noch läuft oder gar nicht existiert).
+  # Erst wenn docker inspect bestätigt, dass db-assistent nicht mehr läuft (oder gar nicht
   # existiert), ist der Stop sicher — sonst würde Schritt (d) auf eine noch schreibende DB
   # restoren (pre-migration-Dump ungültig, Datenverlust-Risiko).
-  log "(b) Verifikation: supabase-db auf altem VPS wirklich gestoppt?"
+  # Phase 1: db-assistent (neuer Name nach Per-App-DB-Pivot 2026-05-25).
+  log "(b) Verifikation: db-assistent auf altem VPS wirklich gestoppt?"
   if ! ssh -o BatchMode=yes -o ConnectTimeout=15 \
            -o StrictHostKeyChecking=accept-new \
            -p "$old_port" "${old_user}@${old_host}" bash -s <<'REMOTE'
 set -euo pipefail
 # Zwei erlaubte Zustände: Container existiert + Running=false  ODER  Container existiert nicht.
-state="$(docker inspect --format='{{.State.Running}}' supabase-db 2>/dev/null || echo 'absent')"
+# TODO Phase 4: Auch db-rapt prüfen.
+state="$(docker inspect --format='{{.State.Running}}' db-assistent 2>/dev/null || echo 'absent')"
 if [[ "$state" == "false" || "$state" == "absent" ]]; then
-  exit 0   # supabase-db gestoppt oder gar nicht vorhanden — Migration sicher
+  exit 0   # db-assistent gestoppt oder gar nicht vorhanden — Migration sicher
 fi
 # state == "true" → Container läuft noch
-printf 'supabase-db läuft noch (State.Running=%s) — Stop war nicht vollständig.\n' "$state" >&2
+printf 'db-assistent laeuft noch (State.Running=%s) — Stop war nicht vollstaendig.\n' "$state" >&2
 exit 1
 REMOTE
   then
-    err "(b) ABORT: supabase-db auf altem VPS läuft noch — Migration abgebrochen.
-   Alter Stand bleibt unverändert (kein Datenverlust).
-   Manuell prüfen + ggf. stop wiederholen:
-     ssh ${old_user}@${old_host} 'cd ~/webPage_infra && docker compose stop supabase-db && docker inspect --format={{.State.Running}} supabase-db'"
+    err "(b) ABORT: db-assistent auf altem VPS laeuft noch — Migration abgebrochen.
+   Alter Stand bleibt unveraendert (kein Datenverlust).
+   Manuell pruefen + ggf. stop wiederholen:
+     ssh ${old_user}@${old_host} 'cd ~/webPage_infra && docker compose stop db-assistent && docker inspect --format={{.State.Running}} db-assistent'"
   fi
   ok "(b) Supabase-Stack auf altem VPS gestoppt + verifiziert"
   printf '  Rollback: ssh %s@%s "cd ~/webPage_infra && docker compose up -d"\n' \
@@ -1992,18 +2028,19 @@ REMOTE
   # ===========================================================================
   # SCHRITT (c) — Supabase auf neuem VPS hochziehen
   # ===========================================================================
-  log "(c) Supabase auf neuem VPS hochziehen"
-  echo "  Services: web_assistent supabase-kong (depends_on zieht Supabase-Core mit)"
+  # TODO Phase 4: web_rapt + kong-rapt ebenfalls hochziehen (zweite stateful Unit).
+  log "(c) Supabase-Stacks auf neuem VPS hochziehen (assistent + rapt)"
+  echo "  Services: web_assistent kong-assistent web_rapt kong-rapt (depends_on zieht DBs mit)"
   cf_ensure_tunnel_if_token
   sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
 set -euo pipefail
 cd "$APP_DIR"
-docker compose pull web_assistent supabase-kong
-docker compose --profile vps up -d web_assistent supabase-kong cloudflared
+docker compose pull web_assistent kong-assistent web_rapt kong-rapt
+docker compose --profile vps up -d web_assistent kong-assistent web_rapt kong-rapt cloudflared
 EOSU
-  ok "(c) Supabase auf neuem VPS gestartet"
+  ok "(c) Supabase-Stacks auf neuem VPS gestartet"
   # Marker auf neuem VPS sicherstellen (Schritt f wird nach Restore explizit gemacht,
-  # aber setzen wir ihn schon hier da supabase-db jetzt läuft)
+  # aber setzen wir ihn schon hier da db-assistent jetzt läuft)
   _ensure_supabase_marker
 
   # ===========================================================================
@@ -2171,24 +2208,25 @@ EOSU
   fi
   ok "Vorbedingungen OK"
 
-  # ---- Supabase hochziehen (idempotent) ----
-  log "Supabase-Stack sicherstellen (falls nicht laufend)"
+  # ---- Supabase-Stacks hochziehen (idempotent) ----
+  # TODO Phase 4: Auch db-rapt + kong-rapt hochziehen; R2-Ordner fuer beide Stacks pruefen.
+  log "Supabase-Stacks sicherstellen (falls nicht laufend)"
   local _sb_running=0
   sudo -u "$APP_USER" bash <<'EOSU' && _sb_running=1 || _sb_running=0
-docker inspect --format='{{.State.Running}}' supabase-db 2>/dev/null | grep -q '^true$'
+docker inspect --format='{{.State.Running}}' db-assistent 2>/dev/null | grep -q '^true$'
 EOSU
   if (( _sb_running == 0 )); then
-    log "supabase-db laeuft noch nicht — hochziehen"
+    log "db-assistent laeuft noch nicht — Stacks hochziehen"
     cf_ensure_tunnel_if_token
     sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
 set -euo pipefail
 cd "$APP_DIR"
-docker compose pull web_assistent supabase-kong
-docker compose --profile vps up -d web_assistent supabase-kong cloudflared
+docker compose pull web_assistent kong-assistent web_rapt kong-rapt
+docker compose --profile vps up -d web_assistent kong-assistent web_rapt kong-rapt cloudflared
 EOSU
-    ok "Supabase-Stack gestartet"
+    ok "Supabase-Stacks gestartet"
   else
-    ok "supabase-db laeuft bereits"
+    ok "db-assistent laeuft bereits"
   fi
 
   # supabase-Marker setzen (idempotent)
@@ -2268,14 +2306,15 @@ EOSU
   # ---- Ueberschreib-Schutz: auth.users auf neuem VPS pruefen ----
   # IMPORTANT 2-Fix: Heredoc ohne -e; psql-Fehler / leere Ausgabe → Sentinel "UNKNOWN",
   # das der Aufrufer konservativ als "nicht leer" behandelt.
-  log "Ueberschreib-Schutz: auth.users-Count pruefen"
+  # TODO Phase 4: Auch db-rapt-Count pruefen (zwei stateful Units nach Per-App-DB-Pivot).
+  log "Ueberschreib-Schutz: auth.users-Count pruefen (db-assistent)"
   local _existing_users
   _existing_users="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
 set -uo pipefail
 set -a; source "$APP_DIR/.env" || { printf 'UNKNOWN'; exit 0; }; set +a
-[[ -n "${POSTGRES_PASSWORD:-}" ]] \
+[[ -n "${ASSISTENT_POSTGRES_PASSWORD:-}" ]] \
   || { printf 'UNKNOWN'; exit 0; }
-count="$(docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" supabase-db \
+count="$(docker exec -e PGPASSWORD="$ASSISTENT_POSTGRES_PASSWORD" db-assistent \
   psql -tA -U supabase_admin -d postgres \
   -c "SELECT count(*) FROM auth.users;" 2>/dev/null)"
 psql_exit=$?
@@ -2310,7 +2349,7 @@ EOSU
   # ---- Sicherheits-Bestaetigung ----
   printf '\n\033[1;34m▶ Restore-Plan — bitte bestaetigen\033[0m\n\n'
   printf '  Quelle:  juengstes Whole-DB-Backup aus R2 (supabase/, latest)\n'
-  printf '  Ziel:    Container supabase-db → DB postgres\n'
+  printf '  Ziel:    Container db-assistent → DB postgres\n'
   printf '  Aktion:  ein Whole-DB pg_restore (restore.sh all latest)\n'
   printf '  ACHTUNG: --clean droppt vorhandene Objekte vor dem Neuanlegen.\n\n'
 
@@ -2325,7 +2364,7 @@ EOSU
   # Bei TTY + UNKNOWN bleibt der konservative force-restore-Prompt (s. u.).
   if [[ "$_existing_users" == "UNKNOWN" && "$_assume_yes" == "1" ]]; then
     printf '\033[1;31m✖ UNKNOWN DB-State + ASSUME_YES=1 — automatisierter destruktiver Restore verweigert.\033[0m\n' >&2
-    printf '  DB-Health zuerst klaeren (POSTGRES_PASSWORD in .env pruefen, supabase-db-Container pruefen).\n' >&2
+    printf '  DB-Health zuerst klaeren (ASSISTENT_POSTGRES_PASSWORD in .env pruefen, db-assistent-Container pruefen).\n' >&2
     return 1
   fi
 

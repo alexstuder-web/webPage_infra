@@ -8,34 +8,48 @@
 # Lokales Dev: docker-compose.dev.yml (Ports exposed, kein Tunnel/Watchtower).
 #
 # ==========================================================================
-# EINHEITEN-MAPPING — Phase 1 Multi-VPS (Phase 2 Bootstrap-Menü nutzt dies)
+# EINHEITEN-MAPPING — Per-App-DB-Pivot (Phase 1, 2026-05-25)
 # ==========================================================================
-# Jede Einheit ist über Service-Namen gezielt startbar.
-# Per-Einheit-Profile (profiles: [assistent|rapt|proxy|supabase]) wurden
-# NICHT eingeführt — Freigabe fehlt (§8 PHASE1_COMPOSE_TUNNEL_CICD.md).
-# Stattdessen: explizite Service-Gruppen per Kommando.
+# Zwei getrennte Lean-Supabase-Stacks (je db+auth+rest+kong), einer pro App.
+# realtime/storage/studio/meta entfallen in BEIDEN Stacks (verifiziert ungenutzt).
 #
-# Einheit            Befehl                                    Zieht mit
-# ─────────────────────────────────────────────────────────────────────────
-# brew_assistent     docker compose up -d web_assistent        (zustandslos)
-# rapt_dashboard     docker compose up -d web_rapt             (zustandslos)
-# proxy              docker compose up -d api_proxy            kein depends_on
-#                                                               Supabase muss
-#                                                               erreichbar sein
-# Supabase/DB        docker compose up -d supabase-kong        depends_on zieht
-#                                                               alle Supabase-
-#                                                               Services + DB
-# cloudflared+wt     docker compose --profile vps up -d        cloudflared +
-#                                                               watchtower
-# Alle (VPS)         docker compose --profile vps up -d
+# Einheit              Services                         Netz            Volumes
+# ──────────────────────────────────────────────────────────────────────────────
+# brew_assistent       web_assistent                    assistent_net   —
+#                      db-assistent (DB)                                assistent-db-data
+#                      auth-assistent (GoTrue)
+#                      rest-assistent (PostgREST)
+#                      kong-assistent (API-Gateway)
+# rapt_dashboard       web_rapt                         rapt_net        rapt-db-data
+#                      db-rapt (DB)
+#                      auth-rapt (GoTrue)
+#                      rest-rapt (PostgREST)
+#                      kong-rapt (API-Gateway)
+# proxy                api_proxy                        assistent_net   —
+#                                                       (rapt_net ab Phase 3 / Proxy-Split)
+# Hauptseite           web_hauptseite                   brewing_net     —
+# Infra                cloudflared (profiles: vps)      assistent_net   —
+#                                                       rapt_net
+#                      watchtower (profiles: vps)       brewing_net
 #
-# Cross-VPS-DB via Cloudflare Tunnel (TCP):
-#   DB-VPS (tunnel-ingress): docker compose -f docker-compose.yml \
-#                              -f docker-compose.tunnel-tcp.yml up -d cloudflared-db-tcp
-#   Proxy-VPS (access-tcp):  docker compose -f docker-compose.yml \
-#                              -f docker-compose.tunnel-tcp.yml up -d cloudflared-access-tcp
-# Loopback-Port für den access-tcp-Client: 15432 (frei von Dev-Ports 54321-54323/8081-8083/8090)
-# Single-VPS: kein Tunnel-Hop — DATABASE_URL zeigt direkt auf supabase-db:5432 (default).
+# Dev-Ports (docker-compose.dev.yml):
+#   assistent-Stack: kong-assistent 54321:8000, db-assistent 54322:5432
+#   rapt-Stack:      kong-rapt      54331:8000, db-rapt      54332:5432
+#
+# Loopback-Port für Cross-VPS-DB-Tunnel: 15432 (frei von Dev-Ports oben)
+#
+# TODO (DEFERRED — braucht CF-Credentials):
+#   Cloudflare-Tunnel-Routes für:
+#     db-assistent.<domain> → http://kong-assistent:8000
+#     db-rapt.<domain>      → http://kong-rapt:8000
+#   Bis dahin: lokal via host/port (54321/54331) erreichen.
+#
+# DEPRECATED: supabase.alexstuder.cloud → supabase-kong:8000
+#   (ehemaliger Single-Stack-Endpunkt, Phase 0)
+#   Entfernen aus cloudflare-routes.json + DNS sobald ALLE drei Bedingungen erfüllt:
+#     1. db-assistent.alexstuder.cloud Tunnel-Route live + Flutter angepasst (Phase 5)
+#     2. Kein aktiver Client referenziert mehr supabase.alexstuder.cloud
+#     3. cloudflare-reconcile.sh erfolgreich auf dem VPS gelaufen (Route aus Tunnel-Ingress entfernt)
 # ==========================================================================
 
 name: alexstuder
@@ -64,7 +78,7 @@ services:
     labels:
       com.centurylinklabs.watchtower.enable: "true"
     networks:
-      - brewing_net
+      - assistent_net
 
   web_rapt:
     container_name: web-rapt
@@ -74,10 +88,14 @@ services:
     labels:
       com.centurylinklabs.watchtower.enable: "true"
     networks:
-      - brewing_net
+      - rapt_net
 
   # ==========================================================================
   # API LAYER
+  # Phase 1: api_proxy hängt an assistent_net → kong-assistent.
+  # Phase 3 (Proxy-Split / proxy-coder): zweiter rapt-Proxy kommt dazu;
+  #   dieser Service wird auf assistent-only beschränkt.
+  # Cross-Team-Handoff Phase 3: proxy-coder splittet server.js → zwei Proxies.
   # ==========================================================================
 
   api_proxy:
@@ -87,30 +105,47 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      # DATABASE_URL: Lokal/Single-VPS → proxy_sync auf supabase-db:5432 (direkter Service-Name).
-      # Cross-VPS (Proxy auf anderem VPS als DB): auf host.docker.internal des cloudflared access tcp:
-      #   DATABASE_URL=postgres://proxy_sync:${PROXY_SYNC_PASSWORD}@host.docker.internal:15432/postgres?sslmode=disable
-      # sslmode=disable ist korrekt: supabase/postgres hat SSL=off; TLS übernimmt der Cloudflare-Tunnel.
-      # WICHTIG: Beide Vars müssen in .env gesetzt sein — PROXY_SYNC_PASSWORD (dediziertes Passwort
-      # für proxy_sync, nicht POSTGRES_PASSWORD) und bei Cross-VPS DATABASE_URL explizit überschreiben.
-      # Wert aus .env überschreibt diesen Default, falls DATABASE_URL dort gesetzt ist.
-      DATABASE_URL: ${DATABASE_URL:-postgres://proxy_sync:${PROXY_SYNC_PASSWORD}@supabase-db:5432/postgres?sslmode=disable}
-      # SUPABASE_INTERNAL_URL: Kong-Endpunkt für Proxy→Supabase-Verbindung im selben Docker-Netz.
-      # server.js bevorzugt SUPABASE_INTERNAL_URL vor SUPABASE_PUBLIC_URL (Z. 22-26).
-      # Cross-VPS: über Cloudflare HTTP-Tunnel via supabase.alexstuder.cloud (dann aus .env setzen).
-      SUPABASE_INTERNAL_URL: ${SUPABASE_INTERNAL_URL:-http://supabase-kong:8000}
+      # DATABASE_URL: Phase 1 → proxy_sync gegen db-rapt (db-sync schreibt rapt).
+      # Phase 3 (Proxy-Split): rapt-Proxy bekommt eigene DATABASE_URL; dieser
+      # assistent-Proxy braucht keine DB-Verbindung mehr.
+      # sslmode=disable korrekt: supabase/postgres hat SSL=off; TLS = Cloudflare Tunnel.
+      #
+      # Fix 2026-05-25: kein verschachteltes ${VAR:-${ANDERE_VAR}} — Compose löst den
+      # Default-Ausdruck literalisch auf wenn DATABASE_URL leer ist; ${RAPT_PROXY_SYNC_PASSWORD}
+      # bliebe ein Literal-String in der Conn-String. Stattdessen: DATABASE_URL IMMER
+      # vollständig in .env/.env.example vorgeben; Compose referenziert nur ${DATABASE_URL}.
+      # .env.example enthält die Single-VPS-Default-URL (mit proxy_sync@db-rapt).
+      # Leer lassen für Single-VPS → env_file: .env liefert den Wert aus .env.example-Default.
+      DATABASE_URL: ${DATABASE_URL}
+      # SUPABASE_INTERNAL_URL: Kong-Endpunkt für Proxy→assistent-Supabase im selben Netz.
+      # Phase 3: wird auf assistent-Kong beschränkt; RAPT-Routen wandern zum rapt-Proxy.
+      SUPABASE_INTERNAL_URL: ${SUPABASE_INTERNAL_URL:-http://kong-assistent:8000}
     labels:
       com.centurylinklabs.watchtower.enable: "true"
     networks:
-      - brewing_net
+      - assistent_net
 
   # ==========================================================================
-  # SUPABASE STACK  (Versionen gepinnt — kein Watchtower-Label)
-  # Postgres + Auth + REST + Realtime + Storage + Meta + Studio + Kong
+  # LEAN SUPABASE — BREW_ASSISTENT-STACK
+  # db + auth + rest + kong; Schema: aibrewgenius + public + graphql_public
+  # Netz: assistent_net | Volume: assistent-db-data
+  # Versionen gepinnt — KEIN Watchtower-Label (Konvention).
+  #
+  # Secret-Vars: ASSISTENT_POSTGRES_PASSWORD, ASSISTENT_JWT_SECRET,
+  #              ASSISTENT_ANON_KEY, ASSISTENT_SERVICE_ROLE_KEY
+  # (Vorgänger-Vars POSTGRES_PASSWORD / JWT_SECRET / ANON_KEY / SERVICE_ROLE_KEY
+  #  umbenannt für Eindeutigkeit im Zwei-Stack-Kontext.)
+  #
+  # Verwaiste Vars (durch Wegfall realtime/storage/studio/meta):
+  #   SECRET_KEY_BASE, PG_META_CRYPTO_KEY, DASHBOARD_USERNAME, DASHBOARD_PASSWORD,
+  #   DEFAULT_ORGANIZATION_NAME, DEFAULT_PROJECT_NAME
+  # → noch in .env vorhanden (bewusst belassen bis User confirm + encrypt-env.sh);
+  #   NICHT mehr in compose referenziert — werden beim nächsten encrypt-env.sh-Lauf
+  #   durch den User bereinigt.
   # ==========================================================================
 
-  supabase-db:
-    container_name: supabase-db
+  db-assistent:
+    container_name: db-assistent
     image: supabase/postgres:15.8.1.060
     restart: unless-stopped
     healthcheck:
@@ -122,190 +157,80 @@ services:
       POSTGRES_HOST: /var/run/postgresql
       POSTGRES_DB: postgres
       POSTGRES_PORT: 5432
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${ASSISTENT_POSTGRES_PASSWORD}
       PGPORT: 5432
-      PGPASSWORD: ${POSTGRES_PASSWORD}
-      JWT_SECRET: ${JWT_SECRET}
+      PGPASSWORD: ${ASSISTENT_POSTGRES_PASSWORD}
+      JWT_SECRET: ${ASSISTENT_JWT_SECRET}
       JWT_EXP: 3600
-      # PROXY_SYNC_PASSWORD muss explizit durchgereicht werden, damit
+      # ASSISTENT_POSTGRES_PASSWORD: explizit durchreichen damit
       # docker-entrypoint-initdb.d/zz-set-role-passwords.sh es sieht.
-      # supabase-db hat kein env_file — nur explizit gelistete Vars landen
-      # im Container-Environment.
-      PROXY_SYNC_PASSWORD: ${PROXY_SYNC_PASSWORD}
+      # (Lesson 2026-05-24: Container-Vars müssen im environment:-Block stehen.)
+      ASSISTENT_POSTGRES_PASSWORD: ${ASSISTENT_POSTGRES_PASSWORD}
     volumes:
-      - supabase-db-data:/var/lib/postgresql/data
-      # Einzeldatei-Mounts mit zz- Prefix, damit sie alphabetisch NACH der
-      # supabase/postgres-eigenen migrate.sh laufen.
-      - ./supabase/db_init/zz-set-role-passwords.sh:/docker-entrypoint-initdb.d/zz-set-role-passwords.sh:ro
-      - ./supabase/db_init/zz-create-realtime-internal-schema.sql:/docker-entrypoint-initdb.d/zz-create-realtime-internal-schema.sql:ro
+      - assistent-db-data:/var/lib/postgresql/data
+      - ./supabase/db_init_assistent/zz-set-role-passwords.sh:/docker-entrypoint-initdb.d/zz-set-role-passwords.sh:ro
+      # zz-create-realtime-internal-schema.sql entfällt: kein realtime-Service in diesem Stack.
+      # Verifiziert: _realtime-Schema wird weder von GoTrue noch von PostgREST benötigt.
     networks:
-      - brewing_net
+      - assistent_net
 
-  supabase-auth:
-    container_name: supabase-auth
+  auth-assistent:
+    container_name: auth-assistent
     image: supabase/gotrue:v2.176.1
     depends_on:
-      supabase-db:
+      db-assistent:
         condition: service_healthy
     restart: unless-stopped
     environment:
       GOTRUE_API_HOST: 0.0.0.0
       GOTRUE_API_PORT: 9999
-      API_EXTERNAL_URL: ${SUPABASE_PUBLIC_URL}
+      API_EXTERNAL_URL: ${ASSISTENT_PUBLIC_URL}
       GOTRUE_DB_DRIVER: postgres
-      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
-      GOTRUE_SITE_URL: ${SITE_URL}
-      GOTRUE_URI_ALLOW_LIST: ${ADDITIONAL_REDIRECT_URLS}
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${ASSISTENT_POSTGRES_PASSWORD}@db-assistent:5432/postgres
+      GOTRUE_SITE_URL: ${ASSISTENT_SITE_URL}
+      GOTRUE_URI_ALLOW_LIST: ${ASSISTENT_ADDITIONAL_REDIRECT_URLS:-}
       GOTRUE_DISABLE_SIGNUP: "false"
       GOTRUE_JWT_ADMIN_ROLES: service_role
       GOTRUE_JWT_AUD: authenticated
       GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
       GOTRUE_JWT_EXP: 3600
-      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+      GOTRUE_JWT_SECRET: ${ASSISTENT_JWT_SECRET}
       GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
       GOTRUE_MAILER_AUTOCONFIRM: "true"
     networks:
-      - brewing_net
+      - assistent_net
 
-  supabase-rest:
-    container_name: supabase-rest
+  rest-assistent:
+    container_name: rest-assistent
     image: postgrest/postgrest:v12.2.10
     depends_on:
-      supabase-db:
+      db-assistent:
         condition: service_healthy
     restart: unless-stopped
     environment:
-      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
-      PGRST_DB_SCHEMAS: public,storage,graphql_public,aibrewgenius,rapt
+      PGRST_DB_URI: postgres://authenticator:${ASSISTENT_POSTGRES_PASSWORD}@db-assistent:5432/postgres
+      # storage entfällt (kein Storage-Service) — nur assistent-eigene Schemas.
+      PGRST_DB_SCHEMAS: public,graphql_public,aibrewgenius
       PGRST_DB_ANON_ROLE: anon
-      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_JWT_SECRET: ${ASSISTENT_JWT_SECRET}
       PGRST_DB_USE_LEGACY_GUCS: "false"
-      PGRST_APP_SETTINGS_JWT_SECRET: ${JWT_SECRET}
+      PGRST_APP_SETTINGS_JWT_SECRET: ${ASSISTENT_JWT_SECRET}
       PGRST_APP_SETTINGS_JWT_EXP: 3600
     command: postgrest
     networks:
-      - brewing_net
+      - assistent_net
 
-  supabase-realtime:
-    container_name: supabase-realtime
-    image: supabase/realtime:v2.34.43
-    depends_on:
-      supabase-db:
-        condition: service_healthy
-    restart: unless-stopped
-    environment:
-      PORT: 4000
-      DB_HOST: supabase-db
-      DB_PORT: 5432
-      DB_USER: supabase_admin
-      DB_PASSWORD: ${POSTGRES_PASSWORD}
-      DB_NAME: postgres
-      DB_AFTER_CONNECT_QUERY: 'SET search_path TO _realtime'
-      DB_ENC_KEY: supabaserealtime
-      API_JWT_SECRET: ${JWT_SECRET}
-      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
-      ERL_AFLAGS: -proto_dist inet_tcp
-      DNS_NODES: "''"
-      RLIMIT_NOFILE: "10000"
-      APP_NAME: realtime
-      SEED_SELF_HOST: "true"
-      RUN_JANITOR: "true"
-    networks:
-      - brewing_net
-
-  supabase-storage:
-    container_name: supabase-storage
-    image: supabase/storage-api:v1.13.3
-    depends_on:
-      supabase-db:
-        condition: service_healthy
-      supabase-rest:
-        condition: service_started
-    restart: unless-stopped
-    volumes:
-      - supabase-storage-data:/var/lib/storage
-    environment:
-      ANON_KEY: ${ANON_KEY}
-      SERVICE_KEY: ${SERVICE_ROLE_KEY}
-      POSTGREST_URL: http://supabase-rest:3000
-      PGRST_JWT_SECRET: ${JWT_SECRET}
-      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
-      FILE_SIZE_LIMIT: 52428800
-      STORAGE_BACKEND: file
-      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
-      TENANT_ID: stub
-      REGION: stub
-      GLOBAL_S3_BUCKET: stub
-      ENABLE_IMAGE_TRANSFORMATION: "false"
-    networks:
-      - brewing_net
-
-  supabase-meta:
-    container_name: supabase-meta
-    image: supabase/postgres-meta:v0.96.3
-    depends_on:
-      supabase-db:
-        condition: service_healthy
-    restart: unless-stopped
-    environment:
-      PG_META_PORT: 8080
-      PG_META_DB_HOST: supabase-db
-      PG_META_DB_PORT: 5432
-      PG_META_DB_NAME: postgres
-      PG_META_DB_USER: supabase_admin
-      PG_META_DB_PASSWORD: ${POSTGRES_PASSWORD}
-      CRYPTO_KEY: ${PG_META_CRYPTO_KEY}
-    networks:
-      - brewing_net
-
-  supabase-studio:
-    container_name: supabase-studio
-    image: supabase/studio:2026.04.27-sha-5f60601
-    depends_on:
-      supabase-meta:
-        condition: service_started
-    restart: unless-stopped
-    environment:
-      # IPv4 binding — sonst kriegt Healthcheck ECONNREFUSED auf 127.0.0.1.
-      HOSTNAME: "0.0.0.0"
-      STUDIO_PG_META_URL: http://supabase-meta:8080
-      POSTGRES_HOST: supabase-db
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      PG_META_CRYPTO_KEY: ${PG_META_CRYPTO_KEY}
-      DEFAULT_ORGANIZATION_NAME: ${DEFAULT_ORGANIZATION_NAME:-Brewing}
-      DEFAULT_PROJECT_NAME: ${DEFAULT_PROJECT_NAME:-aibrewgenius}
-      SUPABASE_URL: http://supabase-kong:8000
-      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL}
-      SUPABASE_ANON_KEY: ${ANON_KEY}
-      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
-      AUTH_JWT_SECRET: ${JWT_SECRET}
-      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-supabase}
-      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
-      # Pflicht-Vars seit Next.js-16-Studio-Builds.
-      EDGE_FUNCTIONS_MANAGEMENT_FOLDER: /tmp/edge-functions
-      SNIPPETS_MANAGEMENT_FOLDER: /tmp/snippets
-    networks:
-      - brewing_net
-
-  supabase-kong:
-    container_name: supabase-kong
+  kong-assistent:
+    container_name: kong-assistent
     image: kong:2.8.1
     depends_on:
-      supabase-auth:
+      auth-assistent:
         condition: service_started
-      supabase-rest:
-        condition: service_started
-      supabase-realtime:
-        condition: service_started
-      supabase-storage:
-        condition: service_started
-      supabase-meta:
+      rest-assistent:
         condition: service_started
     restart: unless-stopped
     volumes:
-      - ./supabase/kong.yml:/var/lib/kong/kong.yml:ro
+      - ./supabase/kong-assistent/kong.yml:/var/lib/kong/kong.yml:ro
     environment:
       KONG_DATABASE: "off"
       KONG_DECLARATIVE_CONFIG: /var/lib/kong/kong.yml
@@ -313,12 +238,122 @@ services:
       KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth
       KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
       KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
-      SUPABASE_ANON_KEY: ${ANON_KEY}
-      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
-      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-supabase}
-      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
+      SUPABASE_ANON_KEY: ${ASSISTENT_ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${ASSISTENT_SERVICE_ROLE_KEY}
     networks:
-      - brewing_net
+      - assistent_net
+
+  # ==========================================================================
+  # LEAN SUPABASE — RAPT_DASHBOARD-STACK
+  # db + auth + rest + kong; Schema: rapt + public + graphql_public
+  # Netz: rapt_net | Volume: rapt-db-data
+  # Versionen gepinnt — KEIN Watchtower-Label (Konvention).
+  #
+  # Secret-Vars: RAPT_POSTGRES_PASSWORD, RAPT_JWT_SECRET,
+  #              RAPT_ANON_KEY, RAPT_SERVICE_ROLE_KEY,
+  #              RAPT_PROXY_SYNC_PASSWORD (proxy_sync-Rolle, nur in rapt-DB)
+  #
+  # proxy_sync NUR in rapt-DB (db-sync schreibt nur rapt — Konzept §3).
+  # Grants auf rapt-Tabellen: dba-coder Phase 2 (Cross-Team-Handoff).
+  # ==========================================================================
+
+  db-rapt:
+    container_name: db-rapt
+    image: supabase/postgres:15.8.1.060
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    environment:
+      POSTGRES_HOST: /var/run/postgresql
+      POSTGRES_DB: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_PASSWORD: ${RAPT_POSTGRES_PASSWORD}
+      PGPORT: 5432
+      PGPASSWORD: ${RAPT_POSTGRES_PASSWORD}
+      JWT_SECRET: ${RAPT_JWT_SECRET}
+      JWT_EXP: 3600
+      # Explizit durchreichen damit db_init_rapt/zz-set-role-passwords.sh die Vars sieht.
+      # (Lesson 2026-05-24: Container-Vars müssen im environment:-Block stehen.)
+      RAPT_POSTGRES_PASSWORD: ${RAPT_POSTGRES_PASSWORD}
+      RAPT_PROXY_SYNC_PASSWORD: ${RAPT_PROXY_SYNC_PASSWORD}
+    volumes:
+      - rapt-db-data:/var/lib/postgresql/data
+      - ./supabase/db_init_rapt/zz-set-role-passwords.sh:/docker-entrypoint-initdb.d/zz-set-role-passwords.sh:ro
+      # zz-create-realtime-internal-schema.sql entfällt: kein realtime-Service in diesem Stack.
+    networks:
+      - rapt_net
+
+  auth-rapt:
+    container_name: auth-rapt
+    image: supabase/gotrue:v2.176.1
+    depends_on:
+      db-rapt:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      API_EXTERNAL_URL: ${RAPT_PUBLIC_URL}
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${RAPT_POSTGRES_PASSWORD}@db-rapt:5432/postgres
+      GOTRUE_SITE_URL: ${RAPT_SITE_URL}
+      GOTRUE_URI_ALLOW_LIST: ${RAPT_ADDITIONAL_REDIRECT_URLS:-}
+      GOTRUE_DISABLE_SIGNUP: "false"
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: 3600
+      GOTRUE_JWT_SECRET: ${RAPT_JWT_SECRET}
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_MAILER_AUTOCONFIRM: "true"
+    networks:
+      - rapt_net
+
+  rest-rapt:
+    container_name: rest-rapt
+    image: postgrest/postgrest:v12.2.10
+    depends_on:
+      db-rapt:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${RAPT_POSTGRES_PASSWORD}@db-rapt:5432/postgres
+      # storage entfällt (kein Storage-Service) — nur rapt-eigene Schemas.
+      PGRST_DB_SCHEMAS: public,graphql_public,rapt
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${RAPT_JWT_SECRET}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+      PGRST_APP_SETTINGS_JWT_SECRET: ${RAPT_JWT_SECRET}
+      PGRST_APP_SETTINGS_JWT_EXP: 3600
+    command: postgrest
+    networks:
+      - rapt_net
+
+  kong-rapt:
+    container_name: kong-rapt
+    image: kong:2.8.1
+    depends_on:
+      auth-rapt:
+        condition: service_started
+      rest-rapt:
+        condition: service_started
+    restart: unless-stopped
+    volumes:
+      - ./supabase/kong-rapt/kong.yml:/var/lib/kong/kong.yml:ro
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /var/lib/kong/kong.yml
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth
+      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
+      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
+      SUPABASE_ANON_KEY: ${RAPT_ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${RAPT_SERVICE_ROLE_KEY}
+    networks:
+      - rapt_net
 
   # ==========================================================================
   # INFRASTRUCTURE  (Tunnel + Auto-Update)
@@ -341,16 +376,11 @@ services:
   #
   # Edge-Agent-Prinzip: Hub erreichbar via edge.alexstuder.cloud (oeffentlich).
   # Agents pollen NUR ausgehend — kein Inbound-Port, keine ufw-Aenderung.
-  # Beliebig viele Spoke-VPS = einfach weitere Agents, kein Hostname-Konflikt
-  # (Cloudflare "1 Hostname = 1 Tunnel"-Limit gilt nur fuers Veroeffentlichen,
-  # nicht fuer ausgehende HTTPS-Clients).
 
   portainer:
     container_name: portainer
     # Pinned CE — kein Watchtower-Label (Management-Tool versionsgepinnt halten).
     # Aktuelle stabile CE-Version: 2.27.3 (Stand 2026-05).
-    # profiles: [portainer-hub] — nur aktiv wenn --profile portainer-hub uebergeben wird.
-    # Verhindert, dass PORTAINER_EDGE_KEY-Interpolation beim allgemeinen compose-Aufruf feuert.
     image: portainer/portainer-ce:2.27.3
     profiles: [portainer-hub]
     restart: unless-stopped
@@ -363,29 +393,20 @@ services:
   portainer_edge_agent:
     container_name: portainer_edge_agent
     # Portainer Agent (Edge-Modus via EDGE=1).
-    # Pinned auf dieselbe Minor-Version wie der Hub (2.27.3 → Agent-Tag: 2.27.3).
-    # profiles: [portainer-agent] — EDGE_KEY:? feuert NUR wenn dieser Profile aktiv ist.
+    # Pinned auf dieselbe Minor-Version wie der Hub (2.27.3).
+    # profiles: [portainer-agent] — EDGE_KEY Interpolation feuert NUR wenn dieser Profile aktiv ist.
     # Chicken-and-Egg-Sicherung: Hub-VPS hat beim Erst-Bootstrap keinen Key; der Agent-
     # Service muss aus dem Default-Set raus, damit compose ohne Key ladbar bleibt.
-    # Edge-Vars werden HIER explizit gesetzt (Lesson 2026-05-24: Container-gelesene
-    # Vars muessen im environment:-Block stehen, nicht nur in env_file).
-    # EDGE_KEY wird aus .env gelesen — NIE in logs/argv ausgeben.
-    # EDGE_INSECURE_POLL=1 nur setzen wenn der Hub kein HTTPS hat (hier nicht noetig).
+    # Lesson 2026-05-24: Container-Vars müssen im environment:-Block stehen.
+    # Lesson 2026-05-24: :? in compose environment wäre filewide — ${VAR:-} ist korrekt.
     image: portainer/agent:2.27.3
     profiles: [portainer-agent]
     restart: unless-stopped
     environment:
       EDGE: "1"
-      # PORTAINER_EDGE_KEY: Compose v2 interpoliert alle Services dateiweit beim Laden,
-      # unabhaengig von aktiven Profilen. :? hier wuerde jeden compose-Aufruf brechen wenn
-      # der Key leer ist (Chicken-and-Egg: Key entsteht erst nach Hub-Start).
-      # Validierung erfolgt in scripts/bootstrap.sh _portainer_start_agent (fail-fast dort).
       EDGE_KEY: ${PORTAINER_EDGE_KEY:-}
       EDGE_ID: ${PORTAINER_EDGE_ID:-}
       EDGE_INACTIVITY_TIMEOUT: "5m"
-      # Edge-Agent pollt ausgehend gegen den Hub-Edge-Endpoint.
-      # AGENT_SERVER_HOST/PORT: lokal fuer den Edge-Tunnel-Callback (Standard: 0.0.0.0:80).
-      # Kein Inbound-Port noetig — Agent pollt nur ausgehend (kein ports: mapping).
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /var/lib/docker/volumes:/var/lib/docker/volumes:ro
@@ -395,43 +416,21 @@ services:
   # ==========================================================================
   # MAILSERVER  (Poste.io — All-in-one SMTP/IMAP/Webmail, versionsgepinnt)
   # ==========================================================================
-  #
-  # Mail ist die bewusste Ausnahme zum Tunnel-Only-Prinzip (offene Inbound-Ports
-  # 25/465/587/143/993 + ungeproxytes A-Record). Freigabe erteilt 2026-05-25.
-  # Kein Watchtower-Label — versionsgepinnt analog Supabase/Portainer.
-  #
-  # Webmail/Admin-UI (Port 80 container-intern) wird NICHT als Host-Port
-  # gemappt, sondern über den Cloudflare-Tunnel exponiert:
-  #   webmail.${MAIL_DOMAIN} → http://posteio:80  (routes.json + reconcile)
-  # HTTPS=OFF: Poste.io liefert intern Plain-HTTP; Cloudflare terminiert TLS am Edge.
-  #
-  # Aktivierung: bootstrap.sh-Menü → "Mailserver (Poste.io)" auswählen.
-  # Marker: /etc/brewing/stateful-units.d/mail
-  # Backup: scripts/backup.sh (archive_one, tar | gpg → backups/mail/)
-  # DNS:    scripts/cloudflare-reconcile.sh (MX/A-unproxied/SPF/DMARC)
-  # Cert:   certbot DNS-01 → bootstrap._mail_provision_cert
 
   posteio:
     container_name: posteio
-    # Gepinnte Version — KEIN Watchtower-Label (versionsgepinnt wie Supabase/Portainer).
-    # analogic/poste.io 2.4 ist der aktuelle stabile Release-Zweig.
     image: analogic/poste.io:2.4
     restart: unless-stopped
     hostname: ${MAIL_HOSTNAME:-mail.alexstuder.cloud}
     ports:
-      - "25:25"     # SMTP  (eingehende Mail von anderen Servern, Inbound-only)
-      - "465:465"   # SMTPS (implizit TLS)
-      - "587:587"   # Submission (Clients mit STARTTLS)
-      - "143:143"   # IMAP
-      - "993:993"   # IMAPS
-      # Port 80/443 wird NICHT gemappt — Webmail läuft über Cloudflare-Tunnel:
-      # webmail.${MAIL_DOMAIN} → http://posteio:80 (routes.json, Item 9)
-    # no env_file by design — relay creds live in /data/admin/settings (patched by bootstrap)
+      - "25:25"
+      - "465:465"
+      - "587:587"
+      - "143:143"
+      - "993:993"
     environment:
       TZ: Europe/Zurich
       HTTPS: "OFF"
-      # SMTP_RELAY_*: werden via bootstrap._mail_configure_relay in Poste.io gesetzt.
-      # Nicht als compose-Env — Poste.io liest Relay-Creds aus seiner internen Config.
     tmpfs:
       - /var/lib/rspamd
     volumes:
@@ -441,8 +440,9 @@ services:
       - brewing_net
 
   # cloudflared + watchtower laufen NUR auf dem VPS, nicht lokal in Dev.
+  # cloudflared hängt an BEIDEN App-Netzen, damit es beide Kong-Gateways
+  # (kong-assistent:8000, kong-rapt:8000) über den Tunnel erreichbar machen kann.
   # → `profiles: [vps]` heißt: nur aktiv mit `docker compose --profile vps up -d`.
-  # Bootstrap-Script + README setzen das automatisch.
 
   cloudflared:
     container_name: cloudflared
@@ -453,7 +453,8 @@ services:
     environment:
       TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
     networks:
-      - brewing_net
+      - assistent_net
+      - rapt_net
 
   watchtower:
     container_name: watchtower
@@ -469,10 +470,14 @@ services:
       - brewing_net
 
 volumes:
-  supabase-db-data:
-  supabase-storage-data:
+  assistent-db-data:
+  rapt-db-data:
   portainer_data:     # Hub-only — leer auf Spoke-VPS (wird nie gemountet wenn nur Agent laeuft)
 
 networks:
   brewing_net:
+    driver: bridge
+  assistent_net:
+    driver: bridge
+  rapt_net:
     driver: bridge

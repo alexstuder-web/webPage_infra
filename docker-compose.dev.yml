@@ -11,6 +11,14 @@
 # Effekt: lokal gebaute Images werden NICHT durch Hub-Images ersetzt; Docker pullt
 # nur, wenn das Image noch gar nicht lokal vorhanden ist (sichert Erststart auf
 # frischem Checkout). Supabase-Stack absichtlich NICHT angefasst (versionsgepinnt).
+#
+# Zwei Lean-Supabase-Stacks — kollisionsfreie Ports:
+#   assistent-Stack: kong-assistent 54321:8000 (Kong/API), db-assistent 54322:5432 (Postgres)
+#   rapt-Stack:      kong-rapt      54331:8000 (Kong/API), db-rapt      54332:5432 (Postgres)
+# Studio-Port 54323 entfällt (kein Studio mehr in beiden Stacks).
+#
+# Optionales lokales Studio: als separater Dev-only-Service mit profiles: [studio]
+# hinzufügbar — NICHT im Prod-Stack (versionsgepinnt, keine App-Abhängigkeit).
 
 services:
 
@@ -34,27 +42,28 @@ services:
     ports:
       - "8083:3000"
 
-  supabase-kong:
+  # brew_assistent-Stack (assistent_net): Kong + DB
+  kong-assistent:
     ports:
       - "54321:8000"
 
-  supabase-db:
+  db-assistent:
     ports:
       - "54322:5432"
 
-  supabase-studio:
+  # rapt_dashboard-Stack (rapt_net): Kong + DB
+  kong-rapt:
     ports:
-      - "54323:3000"
+      - "54331:8000"
+
+  db-rapt:
+    ports:
+      - "54332:5432"
 
   # posteio: kein Dev-Override nötig — Mail wird lokal nicht gestartet.
   # posteio hat kein 'profiles:' in der base-compose und würde bei einem
   # ungewollten 'docker compose up' (ohne expliziten Service-Namen) mit starten.
   # Schutz: posteio nur via 'docker compose up -d posteio' explizit starten.
   # Dev-Start verhindert außerdem die Port-Belegung (25/465/587/143/993 lokal).
-  # Soll posteio trotzdem lokal getestet werden, muss es explizit aufgerufen werden:
-  #   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d posteio
-  #
-  # pull_policy: missing verhindert, dass ein 'compose up' ohne Service-Filter
-  # das posteio-Image bei fehlendem lokalem Image automatisch pullt.
   posteio:
     pull_policy: missing

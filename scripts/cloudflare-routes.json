@@ -5,15 +5,30 @@
 
   "_comment_portainer": "portainer.+ edge. werden NUR auf dem Hub-VPS beansprucht. cloudflare-reconcile.sh filtert diese Eintraege via PORTAINER_ROLE-Gate (Option b aus §7 BOOTSTRAP_MENU_V2_KONZEPT.md): wenn PORTAINER_ROLE!=hub (oder nicht gesetzt), werden _portainer_hub:true Routen nicht in desired_routes aufgenommen — auch wenn der portainer-Container nicht laeuft (VPS-Scoping wuerde das zwar auch bereits korrekt ausfiltern, aber der Gate verhindert zusaetzlich CNAME-Eintrag-Konflikte bei Spoke-VPS die portainer noch nicht gestartet haben). Spoke-VPS beanspruchen diese Hostnames NIE — sie sind reine ausgehende Clients von edge.alexstuder.cloud.",
 
+  "_comment_per_app_db": "Per-App-DB-Pivot (Phase 1, 2026-05-25): zwei Lean-Supabase-Stacks (assistent + rapt). Neue Hostnames db-assistent.* und db-rapt.* ersetzen supabase.*. DEFERRED: Anlage der CF-Tunnel-Routes + DNS für db-assistent.* / db-rapt.* braucht CF-Credentials (Credential-Schritt). supabase.* und studio.* werden bis zum Prod-Deploy belassen; danach: supabase.* auf db-assistent.* umlenken oder entfernen.",
+
   "routes": [
     { "hostname": "alexstuder.cloud",              "service": "http://web-hauptseite:80" },
     { "hostname": "aibrewgenius.alexstuder.cloud", "service": "http://web-assistent:80" },
     { "hostname": "rapt.alexstuder.cloud",         "service": "http://web-rapt:80" },
     { "hostname": "api.alexstuder.cloud",          "service": "http://api-proxy:3000" },
-    { "hostname": "supabase.alexstuder.cloud",     "service": "http://supabase-kong:8000" },
-    { "hostname": "studio.alexstuder.cloud",       "service": "http://supabase-studio:3000" },
-    { "hostname": "db-tcp.alexstuder.cloud",       "service": "tcp://supabase-db:5432",
-      "_comment": "TCP-Ingress für Postgres cross-VPS. Kein HTTP — cloudflared tunnelt roh-TCP. Nur aktiv wenn Supabase-Block auf diesem VPS läuft. DNS-CNAME wird vom Reconcile wie HTTP-Hostnames angelegt." },
+    {
+      "hostname": "db-assistent.alexstuder.cloud",
+      "service": "http://kong-assistent:8000",
+      "_comment": "TODO DEFERRED: Cloudflare DNS + Tunnel-Route anlegen (CF-Credentials nötig). Ersetzt supabase.alexstuder.cloud für den brew_assistent-Stack."
+    },
+    {
+      "hostname": "db-rapt.alexstuder.cloud",
+      "service": "http://kong-rapt:8000",
+      "_comment": "TODO DEFERRED: Cloudflare DNS + Tunnel-Route anlegen (CF-Credentials nötig). Neuer Hostname für den rapt_dashboard-Stack."
+    },
+    {
+      "hostname": "supabase.alexstuder.cloud",
+      "service": "http://kong-assistent:8000",
+      "_comment": "DEPRECATED: Zeigt jetzt auf kong-assistent (war supabase-kong). Nach Prod-Deploy auf db-assistent.alexstuder.cloud umlenken oder entfernen. DEFERRED bis CF-Credentials verfügbar."
+    },
+    { "hostname": "db-tcp.alexstuder.cloud",       "service": "tcp://db-assistent:5432",
+      "_comment": "TCP-Ingress für Postgres cross-VPS (assistent-DB). Kein HTTP — cloudflared tunnelt roh-TCP. Nur aktiv wenn assistent-Block auf diesem VPS läuft. DNS-CNAME wird vom Reconcile wie HTTP-Hostnames angelegt. TODO: Analoger Eintrag für db-rapt (rapt-DB cross-VPS) bei Bedarf ergänzen." },
     { "hostname": "portainer.alexstuder.cloud",    "service": "http://portainer:9000",
       "_portainer_hub": true,
       "_comment": "NUR HUB-VPS. Portainer UI (Port 9000). Hinter Cloudflare Access schützen (Credential-Schritt). Reconcile beansprucht diesen Eintrag nur wenn PORTAINER_ROLE=hub in .env gesetzt ist." },

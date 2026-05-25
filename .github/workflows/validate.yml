@@ -6,42 +6,61 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout pinned to SHA (v4.2.2, 2024-10-23).
+      # Verify: https://github.com/actions/checkout/releases/tag/v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Validate production compose (--profile vps)
         run: docker compose -f docker-compose.yml --profile vps config --quiet
         env:
           DOCKERHUB_USERNAME: placeholder
           CLOUDFLARE_TUNNEL_TOKEN: placeholder
-          POSTGRES_PASSWORD: placeholder
-          JWT_SECRET: placeholder
-          SECRET_KEY_BASE: placeholder
-          ANON_KEY: placeholder
-          SERVICE_ROLE_KEY: placeholder
-          DASHBOARD_PASSWORD: placeholder
-          PG_META_CRYPTO_KEY: placeholder
-          SUPABASE_PUBLIC_URL: http://placeholder
-          SITE_URL: http://placeholder
-          ADDITIONAL_REDIRECT_URLS: ""
+          # brew_assistent-Stack
+          ASSISTENT_POSTGRES_PASSWORD: placeholder
+          ASSISTENT_JWT_SECRET: placeholder
+          ASSISTENT_ANON_KEY: placeholder
+          ASSISTENT_SERVICE_ROLE_KEY: placeholder
+          ASSISTENT_PUBLIC_URL: http://placeholder
+          ASSISTENT_SITE_URL: http://placeholder
+          # rapt_dashboard-Stack
+          RAPT_POSTGRES_PASSWORD: placeholder
+          RAPT_JWT_SECRET: placeholder
+          RAPT_ANON_KEY: placeholder
+          RAPT_SERVICE_ROLE_KEY: placeholder
+          RAPT_PROXY_SYNC_PASSWORD: placeholder
+          RAPT_PUBLIC_URL: http://placeholder
+          RAPT_SITE_URL: http://placeholder
+          # api_proxy — DATABASE_URL muss vollständig angegeben sein (kein Compose-Default).
+          DATABASE_URL: postgres://proxy_sync:placeholder@db-rapt:5432/postgres?sslmode=disable
 
       - name: Validate dev override
         run: docker compose -f docker-compose.yml -f docker-compose.dev.yml config --quiet
         env:
           DOCKERHUB_USERNAME: placeholder
-          POSTGRES_PASSWORD: placeholder
-          JWT_SECRET: placeholder
-          SECRET_KEY_BASE: placeholder
-          ANON_KEY: placeholder
-          SERVICE_ROLE_KEY: placeholder
-          DASHBOARD_PASSWORD: placeholder
-          PG_META_CRYPTO_KEY: placeholder
-          SUPABASE_PUBLIC_URL: http://placeholder
-          SITE_URL: http://placeholder
-          ADDITIONAL_REDIRECT_URLS: ""
+          # brew_assistent-Stack
+          ASSISTENT_POSTGRES_PASSWORD: placeholder
+          ASSISTENT_JWT_SECRET: placeholder
+          ASSISTENT_ANON_KEY: placeholder
+          ASSISTENT_SERVICE_ROLE_KEY: placeholder
+          ASSISTENT_PUBLIC_URL: http://placeholder
+          ASSISTENT_SITE_URL: http://placeholder
+          # rapt_dashboard-Stack
+          RAPT_POSTGRES_PASSWORD: placeholder
+          RAPT_JWT_SECRET: placeholder
+          RAPT_ANON_KEY: placeholder
+          RAPT_SERVICE_ROLE_KEY: placeholder
+          RAPT_PROXY_SYNC_PASSWORD: placeholder
+          RAPT_PUBLIC_URL: http://placeholder
+          RAPT_SITE_URL: http://placeholder
+          # api_proxy — DATABASE_URL muss vollständig angegeben sein (kein Compose-Default).
+          DATABASE_URL: postgres://proxy_sync:placeholder@db-rapt:5432/postgres?sslmode=disable
 
       - name: Bash syntax check (alle scripts)
         run: bash -n scripts/bootstrap.sh scripts/decrypt-env.sh scripts/encrypt-env.sh
