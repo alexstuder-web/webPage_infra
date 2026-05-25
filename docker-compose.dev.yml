@@ -37,10 +37,20 @@ services:
     ports:
       - "8082:80"
 
-  api_proxy:
+  # Phase 3 Proxy-Split: zwei Proxy-Dev-Overrides (assistent 8083, rapt 8085).
+  # Port 8083 = etablierter assistent-Proxy-Port (von Flutter-Smoke-Probe + flutter-coder erwartet).
+  # Port 8085 = rapt-Proxy-Port (8081/8082/8083/8090 belegt; 8084 = flutter-Smoke-Port → 8085).
+  # env_file/environment-Wiring (PROXY_ROLE, SUPABASE_INTERNAL_URL, DATABASE_URL, CORS_ORIGIN)
+  # wird vollständig aus der Base-Compose (docker-compose.yml) geerbt — hier nur Port-Override.
+  api_proxy_assistent:
     pull_policy: missing
     ports:
       - "8083:3000"
+
+  api_proxy_rapt:
+    pull_policy: missing
+    ports:
+      - "8085:3000"
 
   # brew_assistent-Stack (assistent_net): Kong + DB
   kong-assistent:

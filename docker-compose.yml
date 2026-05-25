@@ -27,8 +27,9 @@
 #                      rest-rapt (PostgREST)
 #                      kong-rapt (API-Gateway)
 #                      db-init-rapt (Init, one-shot)    —
-# proxy                api_proxy                        assistent_net   —
-#                                                       (rapt_net ab Phase 3 / Proxy-Split)
+# proxy                api_proxy_assistent              assistent_net   —
+#                      api_proxy_rapt                   rapt_net        —
+#                      (Phase 3 Proxy-Split 2026-05-25: ein Image, zwei Container)
 # Hauptseite           web_hauptseite                   brewing_net     —
 # Infra                cloudflared (profiles: vps)      assistent_net   —
 #                                                       rapt_net
@@ -93,39 +94,79 @@ services:
       - rapt_net
 
   # ==========================================================================
-  # API LAYER
-  # Phase 1: api_proxy hängt an assistent_net → kong-assistent.
-  # Phase 3 (Proxy-Split / proxy-coder): zweiter rapt-Proxy kommt dazu;
-  #   dieser Service wird auf assistent-only beschränkt.
-  # Cross-Team-Handoff Phase 3: proxy-coder splittet server.js → zwei Proxies.
+  # API LAYER — Phase 3: Proxy-Split (2026-05-25)
+  # Ein Image (brew_proxy), zwei Container: je an eigenem App-Netz + Stack.
+  # PROXY_ROLE differenziert das Verhalten zur Laufzeit.
+  #
+  # assistent-Proxy: OpenAI + Brewfather; gegen kong-assistent (assistent_net).
+  #   KEIN DATABASE_URL — kein db-sync in dieser Rolle.
+  #   OPENAI_API_KEY kommt via env_file: .env.
+  # rapt-Proxy:      RAPT-Telemetrie + db-sync; gegen kong-rapt (rapt_net).
+  #   DATABASE_URL → RAPT_PROXY_DATABASE_URL (proxy_sync@db-rapt).
+  #   OPENAI_API_KEY nicht forciert — kommt via env_file: .env, wird ignoriert.
+  #
+  # Netz-Isolation (Auth-Isolation auf Netz-Ebene, zusätzlich zur JWT-Prüfung):
+  #   api_proxy_assistent  ∈ assistent_net  (sieht kong-assistent, web_assistent; NICHT kong-rapt)
+  #   api_proxy_rapt       ∈ rapt_net       (sieht kong-rapt, web_rapt; NICHT kong-assistent)
+  #
+  # Cloudflare-Tunnel (cloudflared hängt an BEIDEN Netzen — sieht beide Proxies):
+  #   api-assistent.alexstuder.cloud → api-proxy-assistent:3000  [DEFERRED]
+  #   api-rapt.alexstuder.cloud      → api-proxy-rapt:3000        [DEFERRED]
+  #   api.alexstuder.cloud           → api-proxy-assistent:3000   [DEPRECATED — bis Flutter umgestellt]
+  #
+  # Cross-Team-Handoff Phase 3: proxy-coder liefert PROXY_ROLE-fähige server.js.
   # ==========================================================================
 
-  api_proxy:
-    container_name: api-proxy
+  api_proxy_assistent:
+    container_name: api-proxy-assistent
     image: ${DOCKERHUB_USERNAME}/brew_proxy:latest
     pull_policy: always
     restart: unless-stopped
+    depends_on:
+      kong-assistent:
+        condition: service_started
     env_file: .env
     environment:
-      # DATABASE_URL: Phase 1 → proxy_sync gegen db-rapt (db-sync schreibt rapt).
-      # Phase 3 (Proxy-Split): rapt-Proxy bekommt eigene DATABASE_URL; dieser
-      # assistent-Proxy braucht keine DB-Verbindung mehr.
-      # sslmode=disable korrekt: supabase/postgres hat SSL=off; TLS = Cloudflare Tunnel.
-      #
-      # Fix 2026-05-25: kein verschachteltes ${VAR:-${ANDERE_VAR}} — Compose löst den
-      # Default-Ausdruck literalisch auf wenn DATABASE_URL leer ist; ${RAPT_PROXY_SYNC_PASSWORD}
-      # bliebe ein Literal-String in der Conn-String. Stattdessen: DATABASE_URL IMMER
-      # vollständig in .env/.env.example vorgeben; Compose referenziert nur ${DATABASE_URL}.
-      # .env.example enthält die Single-VPS-Default-URL (mit proxy_sync@db-rapt).
-      # Leer lassen für Single-VPS → env_file: .env liefert den Wert aus .env.example-Default.
-      DATABASE_URL: ${DATABASE_URL}
-      # SUPABASE_INTERNAL_URL: Kong-Endpunkt für Proxy→assistent-Supabase im selben Netz.
-      # Phase 3: wird auf assistent-Kong beschränkt; RAPT-Routen wandern zum rapt-Proxy.
-      SUPABASE_INTERNAL_URL: ${SUPABASE_INTERNAL_URL:-http://kong-assistent:8000}
+      PROXY_ROLE: assistent
+      # SUPABASE_INTERNAL_URL für diese Rolle: kong-assistent im selben assistent_net.
+      # Default greift wenn ASSISTENT_PROXY_SUPABASE_URL in .env nicht gesetzt.
+      SUPABASE_INTERNAL_URL: ${ASSISTENT_PROXY_SUPABASE_URL:-http://kong-assistent:8000}
+      # CORS_ORIGIN für die assistent-Web-App (leer = kein CORS-Restrict; prod: https://aibrewgenius.alexstuder.cloud).
+      CORS_ORIGIN: ${ASSISTENT_PROXY_CORS_ORIGIN:-}
+      # DATABASE_URL wird NICHT gesetzt — assistent-Proxy hat keinen db-sync.
+      # OPENAI_API_KEY kommt via env_file: .env (Pflicht für die assistent-Rolle; Proxy-Guard prüft es).
     labels:
       com.centurylinklabs.watchtower.enable: "true"
     networks:
       - assistent_net
+
+  api_proxy_rapt:
+    container_name: api-proxy-rapt
+    image: ${DOCKERHUB_USERNAME}/brew_proxy:latest
+    pull_policy: always
+    restart: unless-stopped
+    depends_on:
+      kong-rapt:
+        condition: service_started
+    env_file: .env
+    environment:
+      PROXY_ROLE: rapt
+      # SUPABASE_INTERNAL_URL für diese Rolle: kong-rapt im selben rapt_net.
+      # Default greift wenn RAPT_PROXY_SUPABASE_URL in .env nicht gesetzt.
+      SUPABASE_INTERNAL_URL: ${RAPT_PROXY_SUPABASE_URL:-http://kong-rapt:8000}
+      # DATABASE_URL für db-sync (proxy_sync@db-rapt).
+      # Vollständiger Conn-String IMMER in .env — kein verschachteltes ${:-} (cicd-Lesson 2026-05-24).
+      # sslmode=disable korrekt: Postgres hat SSL=off; TLS = Cloudflare Tunnel (Cross-VPS).
+      DATABASE_URL: ${RAPT_PROXY_DATABASE_URL}
+      # RAPT_SYNC_ENABLED: db-sync-Schalter. Default true.
+      RAPT_SYNC_ENABLED: ${RAPT_SYNC_ENABLED:-true}
+      # CORS_ORIGIN für die rapt-Web-App (leer = kein CORS-Restrict; prod: https://rapt.alexstuder.cloud).
+      CORS_ORIGIN: ${RAPT_PROXY_CORS_ORIGIN:-}
+      # OPENAI_API_KEY kommt via env_file: .env — für rapt-Rolle irrelevant, wird ignoriert.
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    networks:
+      - rapt_net
 
   # ==========================================================================
   # LEAN SUPABASE — BREW_ASSISTENT-STACK

@@ -1026,7 +1026,7 @@ PYEOF
 # ─────────────────────────────────────────────────────────────
 # brew_assistent+Supa    web_assistent kong-assistent   nein  [Phase 1]
 # RAPT Dashboard         web_rapt                       nein
-# brew-proxy (API)       api_proxy                      nein
+# brew-proxy (API)       api_proxy_assistent + api_proxy_rapt  nein  [Phase 3]
 # WebPageAlexStuder      web_hauptseite                 nein
 # Watchtower             watchtower                     JA
 # Portainer              portainer/portainer_edge_agent JA
@@ -1433,7 +1433,7 @@ action_select_and_start() {
   # Mapping Index → Services (0-basiert):
   #   0 = brew_assistent+Supabase  → web_assistent kong-assistent (+ depends_on: db-assistent, auth-assistent, rest-assistent)
   #   1 = RAPT Dashboard           → web_rapt      kong-rapt      (+ depends_on: db-rapt, auth-rapt, rest-rapt)
-  #   2 = brew-proxy               → api_proxy
+  #   2 = brew-proxy               → api_proxy_assistent + api_proxy_rapt  # TODO Phase 3 Proxy-Split
   #   3 = WebPageAlexStuder        → web_hauptseite
   #   4 = Watchtower               → watchtower
   #   5 = Portainer                → portainer ODER portainer_edge_agent (Rolle-Logik)
@@ -1468,25 +1468,43 @@ action_select_and_start() {
     svc_list="${svc_list} web_rapt kong-rapt"
   fi
 
-  # Eintrag 2: brew-proxy — prueft ob assistent-Kong laeuft [Phase 1]
-  # TODO Phase 3 (Proxy-Split): zwei separate Proxies; Check auf kong-assistent
-  # fuer assistent-Proxy und kong-rapt fuer rapt-Proxy.
+  # Eintrag 2: brew-proxy — Phase 3 Proxy-Split (2026-05-25).
+  # Zwei separate Proxies: api_proxy_assistent (assistent_net) + api_proxy_rapt (rapt_net).
+  # assistent-Proxy braucht kong-assistent; rapt-Proxy braucht kong-rapt.
+  # Dependency-Guard: fehlende Kong-Instanz wird automatisch mitgestartet.
   if (( selected[2] == 1 )); then
-    log "brew-proxy (api_proxy) ausgewaehlt"
+    log "brew-proxy ausgewaehlt (api_proxy_assistent + api_proxy_rapt)"
+
+    # --- assistent-Proxy: kong-assistent / db-assistent sicherstellen ---
     echo "  Pruefe, ob db-assistent laeuft..."
-    local supabase_running=0
-    sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU' && supabase_running=1 || supabase_running=0
+    local assistent_running=0
+    sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU' && assistent_running=1 || assistent_running=0
 docker inspect --format='{{.State.Running}}' db-assistent 2>/dev/null | grep -q '^true$'
 EOSU
-    if (( supabase_running == 0 && has_supabase == 0 )); then
+    if (( assistent_running == 0 && has_supabase == 0 )); then
       printf '  \033[1;33m⚠ db-assistent laeuft nicht und wurde nicht mitausgewaehlt —\033[0m\n'
-      printf '  \033[1;33m  kong-assistent wird automatisch mitgestartet (brew-proxy braucht assistent-Supabase).\033[0m\n'
+      printf '  \033[1;33m  kong-assistent wird automatisch mitgestartet (assistent-Proxy braucht assistent-Supabase).\033[0m\n'
       svc_list="${svc_list} kong-assistent"
       has_supabase=1
-    elif (( supabase_running == 1 )); then
+    elif (( assistent_running == 1 )); then
       echo "  db-assistent laeuft bereits — kein Mitstart noetig."
     fi
-    svc_list="${svc_list} api_proxy"
+
+    # --- rapt-Proxy: kong-rapt / db-rapt sicherstellen ---
+    echo "  Pruefe, ob db-rapt laeuft..."
+    local rapt_running=0
+    sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU' && rapt_running=1 || rapt_running=0
+docker inspect --format='{{.State.Running}}' db-rapt 2>/dev/null | grep -q '^true$'
+EOSU
+    if (( rapt_running == 0 && selected[1] == 0 )); then
+      printf '  \033[1;33m⚠ db-rapt laeuft nicht und wurde nicht mitausgewaehlt —\033[0m\n'
+      printf '  \033[1;33m  kong-rapt wird automatisch mitgestartet (rapt-Proxy braucht rapt-Supabase).\033[0m\n'
+      svc_list="${svc_list} kong-rapt"
+    elif (( rapt_running == 1 )); then
+      echo "  db-rapt laeuft bereits — kein Mitstart noetig."
+    fi
+
+    svc_list="${svc_list} api_proxy_assistent api_proxy_rapt"
   fi
 
   # Eintrag 3: WebPageAlexStuder
@@ -1862,7 +1880,7 @@ EOSU
   ssh -o BatchMode=yes -o ConnectTimeout=15 \
       -o StrictHostKeyChecking=accept-new \
       -p "$old_port" "${old_user}@${old_host}" \
-      'cd ~/webPage_infra && docker compose stop db-assistent kong-assistent auth-assistent rest-assistent db-rapt kong-rapt auth-rapt rest-rapt web_assistent web_rapt api_proxy 2>/dev/null || true
+      'cd ~/webPage_infra && docker compose stop db-assistent kong-assistent auth-assistent rest-assistent db-rapt kong-rapt auth-rapt rest-rapt web_assistent web_rapt api_proxy_assistent api_proxy_rapt 2>/dev/null || true
        docker compose stop 2>/dev/null || true' \
     || err "Stop auf altem VPS fehlgeschlagen. Bitte manuell prüfen: ssh ${old_user}@${old_host} 'cd ~/webPage_infra && docker compose ps'"
 
@@ -2018,13 +2036,14 @@ EOSU
   printf '      ./scripts/encrypt-env.sh   (braucht GPG-Passphrase aus Bitwarden)\n'
   printf '    Credential-Schritt: ALEXSTUDER_WEBPAGE_GPG_PASSWORD aus Bitwarden holen.\n\n'
 
-  # V-10: Wenn Proxy auf einem anderen VPS als die DB landet (DB wurde migriert),
-  # muss DATABASE_URL in der .env des Proxy-VPS angepasst werden.
+  # V-10: Wenn rapt-Proxy auf einem anderen VPS als die rapt-DB landet (DB wurde migriert),
+  # muss RAPT_PROXY_DATABASE_URL in der .env des Proxy-VPS angepasst werden.
+  # TODO Phase 3 Proxy-Split: api_proxy → api_proxy_rapt (rapt-Proxy trägt db-sync).
   printf '  Cross-VPS-DB-Hinweis (V-10):\n'
-  printf '    Wenn api_proxy auf einem anderen VPS als die DB läuft:\n'
-  printf '    DATABASE_URL in .env auf den Cloudflare-TCP-Tunnel-Loopback setzen:\n'
-  printf '    DATABASE_URL=postgres://proxy_sync:<PROXY_SYNC_PASSWORD>@host.docker.internal:15432/postgres?sslmode=disable\n'
-  printf '    (PROXY_SYNC_PASSWORD ist eine dedizierte Var — nicht POSTGRES_PASSWORD)\n'
+  printf '    Wenn api_proxy_rapt auf einem anderen VPS als db-rapt läuft:\n'
+  printf '    RAPT_PROXY_DATABASE_URL in .env auf den Cloudflare-TCP-Tunnel-Loopback setzen:\n'
+  printf '    RAPT_PROXY_DATABASE_URL=postgres://proxy_sync:<RAPT_PROXY_SYNC_PASSWORD>@host.docker.internal:15432/postgres?sslmode=disable\n'
+  printf '    (RAPT_PROXY_SYNC_PASSWORD ist eine dedizierte Var — nicht RAPT_POSTGRES_PASSWORD)\n'
   printf '    Dann .env.gpg neu verschlüsseln (encrypt-env.sh, Credential-Schritt).\n\n'
 }
 
@@ -2353,10 +2372,11 @@ cat <<EOF
   Login:      ssh ${APP_USER}@<vps-ip>
 
   Status      cd $APP_DIR && sudo -u $APP_USER docker compose --profile vps ps
-  App-Logs    sudo -u $APP_USER docker logs -f api-proxy
+  App-Logs    sudo -u $APP_USER docker logs -f api-proxy-assistent
+              sudo -u $APP_USER docker logs -f api-proxy-rapt
   Tunnel-Log  sudo -u $APP_USER docker logs -f cloudflared
 
-  Auto-Updates der App-Container (web_*, api_proxy) uebernimmt Watchtower
+  Auto-Updates der App-Container (web_*, api_proxy_assistent, api_proxy_rapt) uebernimmt Watchtower
   alle 5 Minuten. Supabase-Stack bleibt auf gepinnten Versionen.
 
   Portainer    Hub: https://portainer.alexstuder.cloud  (hinter Cloudflare Access)

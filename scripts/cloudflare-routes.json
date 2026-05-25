@@ -11,7 +11,21 @@
     { "hostname": "alexstuder.cloud",              "service": "http://web-hauptseite:80" },
     { "hostname": "aibrewgenius.alexstuder.cloud", "service": "http://web-assistent:80" },
     { "hostname": "rapt.alexstuder.cloud",         "service": "http://web-rapt:80" },
-    { "hostname": "api.alexstuder.cloud",          "service": "http://api-proxy:3000" },
+    {
+      "hostname": "api-assistent.alexstuder.cloud",
+      "service": "http://api-proxy-assistent:3000",
+      "_comment": "TODO DEFERRED: Cloudflare DNS + Tunnel-Route anlegen (CF-Credentials nötig). Ersetzt api.alexstuder.cloud nach dem Proxy-Split (Phase 3). Flutter-App auf diesen Host umstellen (Phase 3 flutter-coder)."
+    },
+    {
+      "hostname": "api-rapt.alexstuder.cloud",
+      "service": "http://api-proxy-rapt:3000",
+      "_comment": "TODO DEFERRED: Cloudflare DNS + Tunnel-Route anlegen (CF-Credentials nötig). Neuer Hostname für den rapt-Proxy (Phase 3). Flutter-App auf diesen Host umstellen (Phase 3 flutter-coder)."
+    },
+    {
+      "hostname": "api.alexstuder.cloud",
+      "service": "http://api-proxy-assistent:3000",
+      "_comment": "DEPRECATED: Phase-0-Einzel-Proxy-Hostname. Zeigt jetzt auf api-proxy-assistent (war api-proxy). Entfernen aus DNS + Tunnel sobald BEIDE Bedingungen erfüllt: 1. api-assistent.alexstuder.cloud + api-rapt.alexstuder.cloud Tunnel-Routen live. 2. Kein Client referenziert mehr api.alexstuder.cloud (flutter-coder Phase 3 abgeschlossen). DEFERRED bis CF-Credentials verfügbar."
+    },
     {
       "hostname": "db-assistent.alexstuder.cloud",
       "service": "http://kong-assistent:8000",
