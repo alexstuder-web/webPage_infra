@@ -4,28 +4,35 @@
 #
 #   restore.sh <target> [file|latest] [--yes]
 #
-#   target:  all | aibrewgenius | rapt
-#   quelle:  'latest' (default) → jüngste .fc.gpg aus R2 backup/supabase/
+#   target:  all | db-assistent | db-rapt
+#   quelle:  'latest' (default) → jüngste .fc.gpg aus R2 backup/<target>/
 #            <pfad>             → lokale .fc.gpg-Datei einspielen
+#                                 (nur für ein einzelnes Ziel; bei 'all' + Pfad → Fehler)
 #
-#   restore.sh all                         → Whole-DB-Restore (empfohlen, eine Operation)
-#   restore.sh all latest                  → Whole-DB aus jüngstem R2-Dump
-#   restore.sh aibrewgenius latest         → nur Schema aibrewgenius, aus jüngstem R2-Dump
-#   restore.sh rapt backups/supabase/supabase_20260523_030000.fc.gpg
-#                                          → nur Schema rapt, aus lokalem Dump
+#   restore.sh all                             → beide DBs restoren (latest aus je eigenem Ordner)
+#   restore.sh db-assistent latest             → db-assistent aus jüngstem R2-Dump
+#   restore.sh db-rapt latest                  → db-rapt aus jüngstem R2-Dump (TimescaleDB-Hooks)
+#   restore.sh db-rapt backups/db-rapt/db-rapt_20260525_030000.fc.gpg
+#                                              → db-rapt aus lokaler Datei
 #
-# Flow:
+# Flow pro DB:
 #   (R2 holen) → entschlüsseln (gpg, kein Klartext-Dump bleibt liegen) →
-#   pg_restore --clean --if-exists --no-owner [-schema=<schema>] -U supabase_admin -d postgres
+#   pg_restore --clean --if-exists --no-owner -U supabase_admin -d postgres
+#   (TimescaleDB pre/post_restore-Hooks automatisch per pg_extension-Guard)
 #
-# QUELLE: alle Ziele lesen aus demselben einen Dump (R2 backup/supabase/).
-# 'all' = ein Whole-DB pg_restore ohne --schema. 'aibrewgenius'/'rapt' = selektiver
-# pg_restore --schema=<name> aus demselben Dump.
+# TimescaleDB-Handling:
+#   - db-rapt: Hat Hypertables → Guard erkennt 'timescaledb'-Extension, ruft
+#     timescaledb_pre_restore() VOR und timescaledb_post_restore() NACH pg_restore.
+#     post_restore MUSS nach pg_restore laufen — auch bei pg_restore-Fehlern.
+#     Bei post_restore-Fehler: harter Abbruch (DB nicht vertrauen).
+#   - db-assistent: Keine Hypertables → Guard erkennt fehlende Extension, Skip.
+#   Guard ist NICHT hardgekodiert auf "nur db-rapt" — er prüft die Extension
+#   zur Laufzeit im jeweiligen Container (zukunftssicher).
 #
-# ⚠️  SELEKTIVER RESTORE (aibrewgenius/rapt): setzt voraus, dass die FK-Ziele in
-#     auth.* und vault.* zum Stand des Dumps passen. Für Disaster Recovery /
-#     VPS-Umzug immer 'all' (Whole-DB) verwenden. Selektiv ist nur für gezielte
-#     Einzel-Schema-Rollbacks, bei denen core unverändert bleibt.
+# QUELLE: jede DB hat ihren eigenen R2-Ordner:
+#   db-assistent → R2 backup/db-assistent/
+#   db-rapt      → R2 backup/db-rapt/
+# 'all' = beide DBs nacheinander, jede aus ihrem eigenen Ordner.
 #
 # ⚠️  --clean droppt vorhandene Objekte vor dem Neuanlegen. Läuft NIE ohne
 #     explizites Ziel-Argument + interaktive Bestätigung (oder --yes).
@@ -49,7 +56,6 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO_DIR="$(pwd)"
 ENV_FILE="${REPO_DIR}/.env"
-DB_CONTAINER="${DB_CONTAINER:-supabase-db}"
 PASS_FILE="${GPG_PASS_FILE:-/etc/brewing/gpg.pass}"
 
 # ---------------------------------------------------------------- Helpers
@@ -59,46 +65,61 @@ err()  { echo -e "\n\033[1;31m✖ $*\033[0m" >&2; exit 1; }
 
 usage() {
   cat >&2 <<EOF
-Usage: $0 <all|aibrewgenius|rapt> [file|latest] [--yes]
+Usage: $0 <all|db-assistent|db-rapt> [file|latest] [--yes]
 
-  all              Whole-DB-Restore aus dem supabase/-Dump (empfohlen).
-                   Ein einziger pg_restore ohne --schema — stellt alle Schemas wieder her.
-  aibrewgenius     Selektiver Restore: nur Schema aibrewgenius aus dem supabase/-Dump.
-  rapt             Selektiver Restore: nur Schema rapt aus dem supabase/-Dump.
+  all              Beide DBs restoren (jede aus ihrem eigenen R2-Ordner, latest).
+                   Nur mit 'latest' kombinierbar — ein Dateipfad kann nicht beide
+                   DBs füttern. Für all + Pfad: Fehler.
+  db-assistent     Whole-DB-Restore aus backup/db-assistent/ (kein TimescaleDB).
+  db-rapt          Whole-DB-Restore aus backup/db-rapt/ (TimescaleDB-Hooks auto).
 
-  [file|latest]    'latest' (default) zieht die jüngste .fc.gpg aus R2 backup/supabase/.
-                   Ein Pfad spielt eine lokale Datei ein (funktioniert mit allen Zielen,
-                   da alle Ziele aus demselben einen Dump lesen).
+  [file|latest]    'latest' (default) zieht die jüngste .fc.gpg aus dem eigenen R2-Ordner.
+                   Ein Pfad spielt eine lokale Datei ein (nur für ein einzelnes Ziel).
   --yes            Sicherheitsabfrage überspringen (für Automatisierung).
-
-  WARNUNG selektiv: aibrewgenius/rapt setzen voraus, dass FK-Ziele in auth.*/vault.*
-  zum Stand des Dumps passen. Für Disaster Recovery immer 'all' verwenden.
 
   Beispiele:
     $0 all
     $0 all latest
-    $0 rapt latest
-    $0 aibrewgenius backups/supabase/supabase_20260523_030000.fc.gpg
+    $0 db-rapt latest
+    $0 db-assistent backups/db-assistent/db-assistent_20260525_030000.fc.gpg
 EOF
   exit 1
 }
 
-# Alle Ziele lesen aus demselben einen R2-Ordner: supabase/.
-target_folder() {
+# ---------------------------------------------------------------- Per-Target: Container + Passwort
+# db_container_for <target>: Container-Name für das Restore-Ziel.
+db_container_for() {
   case "$1" in
-    all|aibrewgenius|rapt) echo "supabase" ;;
-    *) err "Unbekanntes Ziel: $1" ;;
+    db-assistent) printf 'db-assistent' ;;
+    db-rapt)      printf 'db-rapt' ;;
+    *)            err "db_container_for: unbekanntes Ziel '$1'" ;;
   esac
 }
 
-# pg_restore --schema-Argument je Ziel.
-# all → kein --schema (Whole-DB). aibrewgenius/rapt → selektiv.
-restore_schema_arg() {
+# db_password_for <target>: PGPASSWORD aus dem bereits gesourcten .env.
+db_password_for() {
   case "$1" in
-    all)          echo "" ;;
-    aibrewgenius) echo "--schema=aibrewgenius" ;;
-    rapt)         echo "--schema=rapt" ;;
-    *)            err "Unbekanntes Ziel: $1" ;;
+    db-assistent)
+      [[ -n "${ASSISTENT_POSTGRES_PASSWORD:-}" ]] \
+        || err "ASSISTENT_POSTGRES_PASSWORD fehlt in .env — für Ziel 'db-assistent' erforderlich"
+      printf '%s' "$ASSISTENT_POSTGRES_PASSWORD"
+      ;;
+    db-rapt)
+      [[ -n "${RAPT_POSTGRES_PASSWORD:-}" ]] \
+        || err "RAPT_POSTGRES_PASSWORD fehlt in .env — für Ziel 'db-rapt' erforderlich"
+      printf '%s' "$RAPT_POSTGRES_PASSWORD"
+      ;;
+    *)
+      err "db_password_for: unbekanntes Ziel '$1'" ;;
+  esac
+}
+
+# target_folder <target>: R2-Ordner für ein einzelnes Ziel.
+target_folder() {
+  case "$1" in
+    db-assistent) printf 'db-assistent' ;;
+    db-rapt)      printf 'db-rapt' ;;
+    *)            err "target_folder: unbekanntes Ziel '$1'" ;;
   esac
 }
 
@@ -124,23 +145,41 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "$TARGET" ]] || usage
-case "$TARGET" in all|aibrewgenius|rapt) ;; *) err "Ungültiges Ziel '$TARGET'"; ;; esac
+case "$TARGET" in all|db-assistent|db-rapt) ;; *) err "Ungültiges Ziel '$TARGET' (erwartet: all|db-assistent|db-rapt)"; ;; esac
 [[ -n "$SOURCE" ]] || SOURCE="latest"
-# Kein all+non-latest-Verbot mehr: es gibt genau einen Dump-Ordner (supabase/),
-# ein expliziter Dateipfad ist daher mit allen Zielen eindeutig verwendbar.
+
+# 'all' + expliziter Pfad ist nicht sinnvoll (ein Dump kann nicht beide DBs füttern).
+if [[ "$TARGET" == "all" && "$SOURCE" != "latest" ]]; then
+  err "Ziel 'all' ist nur mit 'latest' kombinierbar (ein Dateipfad kann nicht beide DBs füttern).
+   Für einzelne DB mit Dateipfad: restore.sh db-assistent <pfad> bzw. restore.sh db-rapt <pfad>"
+fi
 
 # ---------------------------------------------------------------- Pre-flight
 command -v docker >/dev/null 2>&1 || err "docker fehlt"
 command -v gpg    >/dev/null 2>&1 || err "gpg fehlt"
 [[ -f "$ENV_FILE" ]] || err "Keine .env — erst ./scripts/decrypt-env.sh"
-docker inspect "$DB_CONTAINER" >/dev/null 2>&1 \
-  || err "Container '$DB_CONTAINER' läuft nicht — Stack starten"
+
+# Container-Checks pro Ziel
+_check_container() {
+  local t="$1"
+  local c; c="$(db_container_for "$t")"
+  docker inspect "$c" >/dev/null 2>&1 \
+    || err "Container '$c' läuft nicht — Stack starten (docker compose ... up -d)"
+}
+case "$TARGET" in
+  all)
+    _check_container db-assistent
+    _check_container db-rapt
+    ;;
+  db-assistent|db-rapt)
+    _check_container "$TARGET"
+    ;;
+esac
 
 set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 set +a
-: "${POSTGRES_PASSWORD:?fehlt in .env}"
 
 # ---------------------------------------------------------------- Temp-Workspace
 WORK_DIR="$(mktemp -d)"
@@ -208,6 +247,8 @@ fetch_latest_from_r2() {
 restore_one() {
   local target="$1" source="$2"
   local folder; folder="$(target_folder "$target")"
+  local container; container="$(db_container_for "$target")"
+  local pgpassword; pgpassword="$(db_password_for "$target")"
   local enc_file desc
 
   if [[ "$source" == "latest" ]]; then
@@ -228,22 +269,8 @@ restore_one() {
     || err "[$target] Entschlüsselung fehlgeschlagen (falsche Passphrase / korrupte Datei?)"
   [[ -s "$dump" ]] || err "[$target] Entschlüsselter Dump ist leer"
 
-  # Schema-Argumente: all → kein --schema (Whole-DB). aibrewgenius/rapt → selektiv.
-  local _sa _sa_str schema_args=()
-  _sa="$(restore_schema_arg "$target")"
-  if [[ -n "$_sa" ]]; then
-    schema_args=("$_sa")
-    _sa_str=" (selektiv: ${_sa})"
-    # D4-Warnung: selektiver Restore setzt konsistenten core voraus.
-    echo "  WARNUNG: Selektiver Schema-Restore. FK-Ziele in auth.*/vault.* müssen"
-    echo "           zum Stand dieses Dumps passen — sonst FK-Verletzungen möglich."
-    echo "           Für Disaster Recovery / VPS-Umzug: 'all' (Whole-DB) verwenden."
-  else
-    _sa_str=" (Whole-DB)"
-  fi
-
-  log "[$target] pg_restore${_sa_str} (Quelle: ${desc})"
-  echo "  Ziel: Container ${DB_CONTAINER} → DB 'postgres' (--clean --if-exists --no-owner)"
+  log "[$target] pg_restore Whole-DB (Quelle: ${desc})"
+  echo "  Ziel: Container ${container} → DB 'postgres' (--clean --if-exists --no-owner)"
 
   # ---- TimescaleDB-Restore-Hooks (bedingt) ----
   # timescaledb_pre_restore() / timescaledb_post_restore() existieren nur wenn die
@@ -252,7 +279,11 @@ restore_one() {
   # Telemetrie-Queries trotz physisch vorhandener Chunk-Tabellen.
   #
   # Guard: prüft ob die Extension vorhanden ist, BEVOR pre_restore aufgerufen wird.
-  # Wenn nicht installiert: sauberer Skip (kein Abbruch — Plain-Table-Dumps laufen ohne Hooks).
+  # NICHT hardgekodiert auf "nur db-rapt" — erkennt Extension zur Laufzeit pro Container.
+  #
+  # Skip-vs-Abort-Diskriminierung (Lesson 2026-05-25):
+  #   psql-Fehler (Exit != 0) beim Guard ≠ "Extension absent" → harter Abbruch.
+  #   Nur "COUNT=0" bedeutet sicher absent → sauberer Skip.
   #
   # post_restore MUSS auch laufen wenn pg_restore selbst non-zero zurückgibt (Supabase
   # emittiert bekannte nicht-fatale Fehler); sonst bleibt die DB im pre-restore-Modus.
@@ -262,7 +293,7 @@ restore_one() {
   local _tsdb_pre_rc=0 _tsdb_post_rc=0
 
   local _tsdb_present _tsdb_guard_rc=0
-  _tsdb_present="$(docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" "$DB_CONTAINER" \
+  _tsdb_present="$(docker exec -e PGPASSWORD="$pgpassword" "$container" \
     psql -tA -U supabase_admin -d postgres \
     -c "SELECT count(*) FROM pg_extension WHERE extname = 'timescaledb';" 2>/dev/null)" \
     || _tsdb_guard_rc=$?
@@ -274,7 +305,7 @@ restore_one() {
   if [[ "$_tsdb_present" == "1" ]]; then
     _tsdb_active=1
     log "[$target] TimescaleDB gefunden — timescaledb_pre_restore() aufrufen"
-    docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" "$DB_CONTAINER" \
+    docker exec -e PGPASSWORD="$pgpassword" "$container" \
       psql -U supabase_admin -d postgres \
       -c "SELECT public.timescaledb_pre_restore();" \
       || { _tsdb_pre_rc=$?
@@ -298,8 +329,8 @@ restore_one() {
   # neutralisiert errexit nur für genau dieses Kommando. Kein 'set +e/-e'-Paar,
   # das bei vorzeitigem Abbruch errexit dauerhaft falsch hinterlassen könnte.
   local rc=0
-  docker exec -i -e PGPASSWORD="$POSTGRES_PASSWORD" "$DB_CONTAINER" \
-    pg_restore --clean --if-exists --no-owner "${schema_args[@]}" \
+  docker exec -i -e PGPASSWORD="$pgpassword" "$container" \
+    pg_restore --clean --if-exists --no-owner \
                -U supabase_admin -d postgres < "$dump" \
     || rc=$?
   if (( rc != 0 )); then
@@ -309,7 +340,7 @@ restore_one() {
   # ---- TimescaleDB post_restore — unbedingt ausführen (auch bei pg_restore-Fehler) ----
   if (( _tsdb_active == 1 )); then
     log "[$target] timescaledb_post_restore() aufrufen (unbedingt, auch nach pg_restore-Fehler)"
-    docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" "$DB_CONTAINER" \
+    docker exec -e PGPASSWORD="$pgpassword" "$container" \
       psql -U supabase_admin -d postgres \
       -c "SELECT public.timescaledb_post_restore();" \
       || { _tsdb_post_rc=$?
@@ -328,24 +359,54 @@ restore_one() {
 
 # ---------------------------------------------------------------- Verifikation
 verify_count() {
-  local schema="$1" tbl="$2"
+  local target="$1" schema="$2" tbl="$3"
+  local container; container="$(db_container_for "$target")"
+  local pgpassword; pgpassword="$(db_password_for "$target")"
   local n
-  n="$(docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" "$DB_CONTAINER" \
+  n="$(docker exec -e PGPASSWORD="$pgpassword" "$container" \
         psql -tA -U supabase_admin -d postgres \
         -c "SELECT count(*) FROM ${schema}.${tbl};" 2>/dev/null || echo "n/a")"
-  printf '  %-32s %s\n' "${schema}.${tbl}" "$n"
+  printf '  [%s] %-32s %s\n' "$target" "${schema}.${tbl}" "$n"
+}
+
+run_verify() {
+  local target="$1"
+  case "$target" in
+    db-assistent)
+      verify_count db-assistent auth users
+      verify_count db-assistent aibrewgenius recipes 2>/dev/null || true
+      ;;
+    db-rapt)
+      # Hypertable-Counts (telemetry_*): 0 nach Restore = starker Indikator für
+      # kaputte Chunk-Verknüpfung (TimescaleDB post_restore fehlgeschlagen/fehlt).
+      verify_count db-rapt auth users
+      verify_count db-rapt rapt brew_sessions 2>/dev/null || true
+      verify_count db-rapt rapt telemetry_controllers 2>/dev/null || true
+      verify_count db-rapt rapt telemetry_hydrometers 2>/dev/null || true
+      ;;
+  esac
 }
 
 # ---------------------------------------------------------------- Plan + Bestätigung
-# 'all' = ein Whole-DB pg_restore (kein --schema). Selektive Ziele = ein pg_restore
-# mit --schema=<name> aus demselben supabase/-Dump. Core-first-Reihenfolge entfällt.
-declare -a PLAN=("$TARGET")
+# Ziele aufbauen: all = beide DBs, sonst Einzel-Ziel.
+declare -a PLAN=()
+case "$TARGET" in
+  all)
+    PLAN=(db-assistent db-rapt)
+    ;;
+  *)
+    PLAN=("$TARGET")
+    ;;
+esac
 
 log "RESTORE — destruktiv"
 echo "  Ziel:        ${TARGET}"
 echo "  Quelle:      ${SOURCE}"
-echo "  Dump-Ordner: supabase/"
-echo "  Ziel-DB:     Container ${DB_CONTAINER} → DB 'postgres'"
+for t in "${PLAN[@]}"; do
+  folder="$(target_folder "$t")"
+  container="$(db_container_for "$t")"
+  echo "  DB ${t}: Ordner ${folder}/, Container ${container}"
+done
 echo "  Hinweis:     --clean --if-exists droppt vorhandene Objekte vor dem Neuanlegen."
 echo
 if (( ASSUME_YES == 0 )); then
@@ -361,29 +422,10 @@ done
 
 # ---------------------------------------------------------------- Verifikation
 log "Verifikation (Tabellen-Counts je Schema)"
-case "$TARGET" in
-  all)
-    # Whole-DB: alle relevanten Counts prüfen.
-    # Hypertable-Counts (telemetry_*): 0 nach Restore = starker Indikator für
-    # kaputte Chunk-Verknüpfung (TimescaleDB post_restore nicht gelaufen oder fehlgeschlagen).
-    verify_count auth users
-    verify_count aibrewgenius recipes 2>/dev/null || true
-    verify_count rapt brew_sessions 2>/dev/null || true
-    verify_count rapt telemetry_controllers 2>/dev/null || true
-    verify_count rapt telemetry_hydrometers 2>/dev/null || true
-    ;;
-  aibrewgenius)
-    verify_count aibrewgenius recipes 2>/dev/null || true
-    ;;
-  rapt)
-    # Hypertable-Counts mit || true: ein 0-Count nach Restore ist DER Indikator
-    # für kaputte TimescaleDB-Chunk-Verknüpfung (post_restore fehlgeschlagen/fehlt).
-    verify_count rapt brew_sessions 2>/dev/null || true
-    verify_count rapt telemetry_controllers 2>/dev/null || true
-    verify_count rapt telemetry_hydrometers 2>/dev/null || true
-    ;;
-esac
+for t in "${PLAN[@]}"; do
+  run_verify "$t"
+done
 
 log "✓ Restore abgeschlossen"
-echo "  Nächster Smoke-Check: Login in der App + je eine Query auf aibrewgenius.* und rapt.*"
-echo "  Für selektive Restores: FK-Konsistenz zu auth.*/vault.* manuell prüfen (→ README §8)."
+echo "  Nächster Smoke-Check: Login in der App + je eine Query pro Schema."
+echo "  Für db-rapt: telemetry_*-Count > 0 ist Indikator für korrekte TimescaleDB-Chunk-Verknüpfung."

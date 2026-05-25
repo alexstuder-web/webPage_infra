@@ -384,28 +384,40 @@ EOF
   install -d -m 755 -o "$APP_USER" -g "$APP_USER" "$units_dir"
   ok "Marker-Registry vorhanden: ${units_dir}"
 
-  # ---------------------------------------------------------------- Marker-Backfill (selbstheilend, E6)
-  # Auf bereits gebootstrappten VPS: wenn db-assistent jetzt läuft → Marker idempotent anlegen.
-  # Beim Erst-Bootstrap ist db-assistent noch nicht gestartet (Start passiert im Menü via
-  # action_select_and_start) — der Marker wird dort nach erfolgreichem docker compose up gesetzt.
+  # ---------------------------------------------------------------- Marker-Backfill (selbstheilend, Phase 4)
+  # Auf bereits gebootstrappten VPS: wenn db-assistent / db-rapt läuft → Marker idempotent anlegen.
+  # Beim Erst-Bootstrap sind die Container noch nicht gestartet (Start passiert im Menü via
+  # action_select_and_start) — die Marker werden dort nach erfolgreichem docker compose up gesetzt.
   # Dieser Backfill ist die Selbstheilung für VPS, die vor der Marker-Einführung gebootstrapped
-  # wurden.
-  # TODO Phase 4 (cicd-coder Backup): Marker auf zwei Units aufteilen:
-  #   db-assistent + db-rapt (getrennte stateful Units, je ein Marker).
-  local supabase_marker="${units_dir}/supabase"
-  if [[ -f "$supabase_marker" ]]; then
-    ok "supabase-Marker bereits vorhanden — Backfill übersprungen"
-  else
-    local _sb_running=0
-    sudo -u "$APP_USER" bash <<'EOSU' 2>/dev/null && _sb_running=1 || _sb_running=0
+  # wurden. Pro DB unabhängig: db-assistent läuft, db-rapt nicht → nur erster Marker.
+  local _assistent_running=0
+  sudo -u "$APP_USER" bash <<'EOSU' 2>/dev/null && _assistent_running=1 || _assistent_running=0
 docker inspect --format='{{.State.Running}}' db-assistent 2>/dev/null | grep -q '^true$'
 EOSU
-    if (( _sb_running == 1 )); then
-      install -m 644 -o "$APP_USER" -g "$APP_USER" /dev/null "$supabase_marker"
-      ok "supabase-Marker gesetzt (Backfill: db-assistent läuft) → ${supabase_marker}"
-    else
-      echo "  db-assistent läuft noch nicht — Backfill übersprungen (Marker wird beim Install-Unit-Start gesetzt)."
-    fi
+  local _rapt_running=0
+  sudo -u "$APP_USER" bash <<'EOSU' 2>/dev/null && _rapt_running=1 || _rapt_running=0
+docker inspect --format='{{.State.Running}}' db-rapt 2>/dev/null | grep -q '^true$'
+EOSU
+
+  local assistent_marker="${units_dir}/db-assistent"
+  local rapt_marker="${units_dir}/db-rapt"
+
+  if [[ -f "$assistent_marker" ]]; then
+    ok "db-assistent-Marker bereits vorhanden — ${assistent_marker}"
+  elif (( _assistent_running == 1 )); then
+    install -m 644 -o "$APP_USER" -g "$APP_USER" /dev/null "$assistent_marker"
+    ok "db-assistent-Marker gesetzt (Backfill: db-assistent läuft) → ${assistent_marker}"
+  else
+    echo "  db-assistent läuft noch nicht — Backfill übersprungen (Marker wird beim Install-Unit-Start gesetzt)."
+  fi
+
+  if [[ -f "$rapt_marker" ]]; then
+    ok "db-rapt-Marker bereits vorhanden — ${rapt_marker}"
+  elif (( _rapt_running == 1 )); then
+    install -m 644 -o "$APP_USER" -g "$APP_USER" /dev/null "$rapt_marker"
+    ok "db-rapt-Marker gesetzt (Backfill: db-rapt läuft) → ${rapt_marker}"
+  else
+    echo "  db-rapt läuft noch nicht — Backfill übersprungen (Marker wird beim Install-Unit-Start gesetzt)."
   fi
 
 } # end run_base_bootstrap
@@ -578,31 +590,35 @@ EOSU
 # mitgestartet (App wäre ohne Tunnel nicht erreichbar); separater Befehl, damit
 # der Service-Namens-Aufruf und der Profile-Aufruf klar getrennt sind.
 
-# ---------------------------------------------------------------- Supabase-Marker idempotent setzen
-# Setzt /etc/brewing/stateful-units.d/supabase (mode 644, owner alex), falls
-# db-assistent jetzt läuft. Idempotent: vorhandener Marker → kein Fehler.
-# Wird nach erfolgreichem docker compose up für Optionen aufgerufen, die db-assistent starten.
-# TODO Phase 4 (cicd-coder Backup): auf zwei Marker aufteilen:
-#   /etc/brewing/stateful-units.d/db-assistent + .../db-rapt.
-_ensure_supabase_marker() {
+# ---------------------------------------------------------------- DB-Marker idempotent setzen (Phase 4)
+# Setzt /etc/brewing/stateful-units.d/<db-assistent|db-rapt> (mode 644, owner alex),
+# falls der jeweilige Container jetzt läuft. Idempotent: vorhandener Marker → kein Fehler.
+# Wird nach erfolgreichem docker compose up für die jeweilige DB aufgerufen.
+# $1 = db-assistent | db-rapt  (Container-Name = Marker-Name)
+_ensure_db_marker() {
+  local db_unit="$1"
+  case "$db_unit" in
+    db-assistent|db-rapt) ;;
+    *) printf '\033[1;31m✖ _ensure_db_marker: unbekannte Unit "%s"\033[0m\n' "$db_unit" >&2; return 1 ;;
+  esac
   local units_dir="/etc/brewing/stateful-units.d"
-  local supabase_marker="${units_dir}/supabase"
+  local db_marker="${units_dir}/${db_unit}"
   # Verzeichnis sicherstellen (idempotent, falls action_select_and_start vor run_base_bootstrap laeuft)
   install -d -m 755 -o "$APP_USER" -g "$APP_USER" "$units_dir" 2>/dev/null || true
-  if [[ -f "$supabase_marker" ]]; then
-    ok "supabase-Marker bereits vorhanden — ${supabase_marker}"
+  if [[ -f "$db_marker" ]]; then
+    ok "${db_unit}-Marker bereits vorhanden — ${db_marker}"
     return 0
   fi
-  # Gegated auf laufenden db-assistent (kein Marker für eine Unit die nicht hochkam)
-  local _sb_running=0
-  sudo -u "$APP_USER" bash <<'EOSU' 2>/dev/null && _sb_running=1 || _sb_running=0
-docker inspect --format='{{.State.Running}}' db-assistent 2>/dev/null | grep -q '^true$'
+  # Gegated auf laufenden Container (kein Marker für eine Unit die nicht hochkam)
+  local _running=0
+  sudo -u "$APP_USER" DB_UNIT="$db_unit" bash <<'EOSU' 2>/dev/null && _running=1 || _running=0
+docker inspect --format='{{.State.Running}}' "$DB_UNIT" 2>/dev/null | grep -q '^true$'
 EOSU
-  if (( _sb_running == 1 )); then
-    install -m 644 -o "$APP_USER" -g "$APP_USER" /dev/null "$supabase_marker"
-    ok "supabase-Marker gesetzt → ${supabase_marker}"
+  if (( _running == 1 )); then
+    install -m 644 -o "$APP_USER" -g "$APP_USER" /dev/null "$db_marker"
+    ok "${db_unit}-Marker gesetzt → ${db_marker}"
   else
-    printf '  \033[1;33m⚠ db-assistent laeuft noch nicht — Marker NICHT gesetzt (Unit kam nicht hoch?).\033[0m\n'
+    printf '  \033[1;33m⚠ %s laeuft noch nicht — Marker NICHT gesetzt (Unit kam nicht hoch?).\033[0m\n' "$db_unit"
   fi
 }
 
@@ -1585,12 +1601,22 @@ docker compose --profile vps up -d cloudflared
 EOSU
   fi
 
-  # ---- Supabase-Marker setzen (falls kong-assistent gestartet wurde) ----
-  if (( has_supabase == 1 )); then
-    _ensure_supabase_marker
-    # Phase 2: DB-Init übernimmt die db-init-assistent / db-init-rapt Init-Container
-    # beim 'compose up' (Baseline + schema_migrations-getrackte Migrationen).
-    # bootstrap.sh macht keinen DB-Init mehr.
+  # ---- DB-Marker setzen (je gestarteter DB) ----
+  # Für jede hochgezogene DB den passenden Marker setzen (Phase 4: zwei unabhängige Marker).
+  if (( selected[0] == 1 || has_supabase == 1 )); then
+    _ensure_db_marker db-assistent
+  fi
+  # db-rapt-Marker: direkte Auswahl (1) ODER brew-proxy allein ausgewaehlt + db-rapt laeuft/gestartet.
+  # Letzteres: rapt_running==1 bedeutet db-rapt war schon oben; ohne diesen Guard wuerde der
+  # Backup-Cron db-rapt nicht sichern, obwohl es laeuft (Should-Fix aus der Review-Liste).
+  if (( selected[1] == 1 )) \
+    || { (( selected[2] == 1 )) && [[ -n "${rapt_running+x}" ]] && (( rapt_running == 1 )); }; then
+    _ensure_db_marker db-rapt
+  fi
+  # Phase 2: DB-Init übernimmt die db-init-assistent / db-init-rapt Init-Container
+  # beim 'compose up' (Baseline + schema_migrations-getrackte Migrationen).
+  # bootstrap.sh macht keinen DB-Init mehr.
+  if (( has_supabase == 1 || selected[1] == 1 )); then
     ok "DB-Init: wird von db-init-assistent / db-init-rapt Init-Containern beim Stack-Start erledigt."
   fi
 
@@ -1649,15 +1675,17 @@ _check_ssh_access() {
       "${user}@${host}" true 2>/dev/null
 }
 
-# ---------------------------------------------------------------- R2-Setup für Verifikation
+# ---------------------------------------------------------------- R2-Setup für Verifikation (Phase 4)
 # Setzt RCLONE_CONFIG_R2_* aus .env (gleiche Logik wie backup.sh/restore.sh).
-# Prüft den pre-migration-Dump der supabase-Unit in R2 (Ordner: supabase/).
-# Gibt einen Dateinamen zurück oder schlägt fehl.
+# Prüft die pre-migration-Dumps beider App-DBs in R2 (Ordner: db-assistent/ + db-rapt/).
+# Gibt zwei Dateinamen (newline-getrennt) zurück oder schlägt fehl.
 # Fehler-Diskriminierung: SSH-/Netzwerk-Fehler → return 2 (sofortiger Abbruch);
 # Backup nicht gefunden → return 1 (Aufrufer meldet).
+# $1 = zu prüfende Unit (db-assistent|db-rapt|both)
 _verify_backup_in_r2() {
-  # Aufruf: _verify_backup_in_r2 <old_user> <old_host> <old_port>
+  # Aufruf: _verify_backup_in_r2 <old_user> <old_host> <old_port> [unit]
   local old_user="$1" old_host="$2" old_port="$3"
+  local check_unit="${4:-both}"
 
   local ssh_opts=(-o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new)
 
@@ -1704,59 +1732,73 @@ REMOTE
     printf '%s' "$_out"
   }
 
-  # Einziger Dump-Ordner: supabase/ (Whole-DB-Dump seit Phase 4).
-  local supabase_file
-  supabase_file="$(_r2_find_premig "supabase")" || return 2
+  # Beide App-DB-Ordner prüfen: db-assistent/ + db-rapt/ (Phase 4).
+  local assistent_file rapt_file
+  local _missing_units=""
 
-  if [[ -z "$supabase_file" ]]; then
-    printf '\033[1;31m✖ Whole-DB-Dump mit Label "pre-migration" nicht in R2 gefunden (R2:<bucket>/supabase/).\033[0m\n' >&2
+  if [[ "$check_unit" == "db-assistent" || "$check_unit" == "both" ]]; then
+    assistent_file="$(_r2_find_premig "db-assistent")" || return 2
+    if [[ -z "$assistent_file" ]]; then
+      _missing_units="${_missing_units} db-assistent"
+    fi
+  else
+    assistent_file=""
+  fi
+
+  if [[ "$check_unit" == "db-rapt" || "$check_unit" == "both" ]]; then
+    rapt_file="$(_r2_find_premig "db-rapt")" || return 2
+    if [[ -z "$rapt_file" ]]; then
+      _missing_units="${_missing_units} db-rapt"
+    fi
+  else
+    rapt_file=""
+  fi
+
+  if [[ -n "$_missing_units" ]]; then
+    printf '\033[1;31m✖ pre-migration-Dump(s) nicht in R2 gefunden (Ordner:%s).\033[0m\n' "$_missing_units" >&2
     return 1
   fi
 
-  # Gibt einen Dateinamen zurück (supabase/_pre-migration-Dump)
-  printf '%s\n' "$supabase_file"
+  # Gibt die gefundenen Dateinamen zurück (newline-getrennt: assistent\nrapt)
+  [[ -n "$assistent_file" ]] && printf '%s\n' "$assistent_file"
+  [[ -n "$rapt_file" ]] && printf '%s\n' "$rapt_file"
 }
 
 # ---------------------------------------------------------------- Migrations-Aktion
-# Migriert die gesamte Supabase / DB-Unit (core + aibrewgenius + rapt — alle Schemen).
-# Supabase ist die EINZIGE stateful Unit; brew_assistent/rapt_dashboard sind zustandslos
-# (kein Backup/Restore fuer Frontends — die werden via action_select_and_start neu gestartet).
-#
-# TODO Phase 4 (cicd-coder Backup/Restore):
-#   Diese Funktion auf TWO stateful Units umbauen: db-assistent + db-rapt.
-#   (Phase 1 2026-05-25: Service-Namen bereits auf neue Namen umgestellt — db-assistent,
-#   kong-assistent, auth-assistent, db-rapt, kong-rapt, auth-rapt.)
-#   Zwei separate Restore-Pfade; TimescaleDB-Hooks nur fuer rapt (kein Hypertable in assistent).
-#   R2-Ordner: backup/db-assistent/ + backup/db-rapt/ (statt backup/supabase/).
-#   Bis dahin: Migrations-Pfad nutzt Single-Snapshot-Logik — NICHT produktiv einsetzen bis Phase 4.
+# Migriert eine oder beide stateful DB-Units: db-assistent und/oder db-rapt.
+# Jede Unit hat ihren eigenen R2-Ordner (backup/db-assistent/ / backup/db-rapt/),
+# ihren eigenen Marker und wird unabhaengig restoriert.
+# brew_assistent, rapt_dashboard, brew-proxy, WebPageAlexStuder sind zustandslos —
+# kein Backup/Restore; einfach via action_select_and_start (Option 1) neu starten.
 action_migrate_unit() {
-  printf '\n\033[1;34m▶ Was migrieren?\033[0m\n\n'
-  printf '  1) Supabase / DB migrieren   (core + aibrewgenius + rapt — gesamte DB)\n'
+  printf '\n\033[1;34m▶ Welche DB-Unit migrieren?\033[0m\n\n'
+  printf '  1) db-assistent   (App-Assistent-DB — aibrewgenius + auth)\n'
+  printf '  2) db-rapt        (RAPT-DB — rapt + auth; inkl. TimescaleDB-Hypertables)\n'
+  printf '  3) beide          (db-assistent UND db-rapt — zwei unabhaengige Restores)\n'
   printf '  b) zurück\n\n'
   printf '  Hinweis: brew_assistent, rapt_dashboard, brew-proxy und WebPageAlexStuder\n'
-  printf '           sind zustandslos — kein Backup/Restore nötig. Auf dem Ziel-VPS\n'
+  printf '           sind zustandslos — kein Backup/Restore noetig. Auf dem Ziel-VPS\n'
   printf '           via "Einheiten auswaehlen & starten" (Option 1) starten.\n\n'
-  read -rp "Auswahl [1,b]: " mig_choice
+  read -rp "Auswahl [1-3,b]: " mig_choice
 
+  local do_assistent=0 do_rapt=0
   case "$mig_choice" in
-    1) : ;;  # weiter unten behandelt
-    b|B)
-      return 0
-      ;;
+    1) do_assistent=1 ;;
+    2) do_rapt=1 ;;
+    3) do_assistent=1; do_rapt=1 ;;
+    b|B) return 0 ;;
     *)
-      printf '  Ungültige Eingabe: %s\n' "$mig_choice"
+      printf '  Ungueltige Eingabe: %s\n' "$mig_choice"
       return 0
       ;;
   esac
 
   # ---- SSH-Verbindungsdaten abfragen
-  # Phase 1: db-assistent (neuer Name nach Per-App-DB-Pivot 2026-05-25).
-  printf '\n\033[1;34m▶ Verbindung zum alten VPS (Quell-VPS mit db-assistent/db-rapt)\033[0m\n\n'
+  printf '\n\033[1;34m▶ Verbindung zum alten VPS (Quell-VPS)\033[0m\n\n'
   local old_host old_user old_port
   read -rp "Hostname / IP des alten VPS: " old_host
   [[ -n "$old_host" ]] || err "Kein Host eingegeben"
-  # I1: Whitelist-Validierung — verhindert Shell-Injection via Tippfehler wie
-  # "192.168.1.1; rm -rf ~" die ohne Whitelist lokal ausgeführt würden.
+  # I1: Whitelist-Validierung — verhindert Shell-Injection.
   [[ "$old_host" =~ ^[a-zA-Z0-9._-]+$ ]] \
     || err "Ungültiger Hostname/IP: '$old_host' (erlaubt: A-Z a-z 0-9 . _ -)"
   read -rp "SSH-User auf altem VPS [alex]: " old_user
@@ -1777,65 +1819,80 @@ action_migrate_unit() {
   fi
   ok "SSH-Zugang OK"
 
-  # ---- Supabase-Core-Überschreib-Schutz
-  # Vor dem core-Restore prüfen, ob auf dem NEUEN VPS bereits auth.users existieren.
-  # Wenn ja: Abbruch statt blindes Überschreiben (könnte fremde User zerstören).
-  #
-  # Zwei getrennte Checks:
-  #   1. Läuft db-assistent überhaupt? (Phase 1: neuer Name nach Per-App-DB-Pivot)
-  #   2. .env laden + COUNT abfragen.
-  # Trennung verhindert, dass ein .env-Fehler als "existing_users=0" maskiert wird
-  # und ein destruktiver Restore ohne Warnung durchläuft.
-  log "Supabase-Core-Konflikt-Schutz: auth.users auf neuem VPS prüfen (db-assistent)"
-  local existing_users=0 db_running=0
-  sudo -u "$APP_USER" -H bash <<'EOSU' 2>/dev/null && db_running=1 || db_running=0
-docker inspect --format='{{.State.Running}}' db-assistent 2>/dev/null | grep -q '^true$'
+  # ---- Überschreib-Schutz: auth.users pro gewählter DB prüfen
+  # Pro DB separat: läuft der Container? → COUNT abfragen.
+  # Trennung verhindert, dass ein .env-Fehler als "existing_users=0" maskiert wird.
+  _check_overwrite_guard() {
+    local db_unit="$1"   # db-assistent | db-rapt
+    local pw_var="$2"    # ASSISTENT_POSTGRES_PASSWORD | RAPT_POSTGRES_PASSWORD
+    local db_running=0
+    sudo -u "$APP_USER" -H DB_UNIT="$db_unit" bash <<'EOSU' 2>/dev/null && db_running=1 || db_running=0
+docker inspect --format='{{.State.Running}}' "$DB_UNIT" 2>/dev/null | grep -q '^true$'
 EOSU
-
-  if (( db_running == 1 )); then
-    existing_users="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+    if (( db_running == 0 )); then
+      echo "  ${db_unit} laeuft noch nicht auf neuem VPS — Ueberschreib-Schutz nicht noetig."
+      return 0
+    fi
+    log "Ueberschreib-Schutz: auth.users auf neuem VPS pruefen (${db_unit})"
+    local existing_users
+    existing_users="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" DB_UNIT="$db_unit" PW_VAR="$pw_var" bash <<'EOSU'
 set -euo pipefail
 cd "$APP_DIR"
-[[ -f .env ]] || { printf 'FEHLER: .env fehlt in %s — Migration nicht sicher fortsetzbar.\n' "$APP_DIR" >&2; exit 1; }
+[[ -f .env ]] || { printf 'FEHLER: .env fehlt in %s\n' "$APP_DIR" >&2; exit 1; }
 set -a; source .env; set +a
-# TODO Phase 4: ASSISTENT_POSTGRES_PASSWORD (ggf. auch RAPT-DB pruefen).
-[[ -n "${ASSISTENT_POSTGRES_PASSWORD:-}" ]] || { printf 'FEHLER: ASSISTENT_POSTGRES_PASSWORD nicht in .env gesetzt.\n' >&2; exit 1; }
-docker exec -e PGPASSWORD="$ASSISTENT_POSTGRES_PASSWORD" db-assistent \
+pw="${!PW_VAR:-}"
+[[ -n "$pw" ]] || { printf 'FEHLER: %s nicht in .env gesetzt.\n' "$PW_VAR" >&2; exit 1; }
+docker exec -e PGPASSWORD="$pw" "$DB_UNIT" \
   psql -tA -U supabase_admin -d postgres \
   -c "SELECT count(*) FROM auth.users;"
 EOSU
 )"
     existing_users="${existing_users//[[:space:]]/}"
     if [[ "$existing_users" =~ ^[0-9]+$ ]] && (( existing_users > 0 )); then
-      printf '\n\033[1;31m✖ KONFLIKT: Auf dem neuen VPS existieren bereits %s auth.users (db-assistent).\033[0m\n' "$existing_users"
-      printf '  Ein Whole-DB-Restore (--clean) würde diese überschreiben.\n'
-      printf '  Szenarien:\n'
-      printf '  a) Neuer VPS ist dediziert für diese Migration → Benutzer explizit löschen, dann erneut starten.\n'
-      printf '  b) Neuer VPS läuft bereits mit einer anderen App → Vorsicht: Restore würde diese App-Daten zerstören.\n\n'
-      read -rp "Migration trotzdem fortsetzen? Tippe 'force-core' zum Bestätigen oder Enter zum Abbrechen: " force_ans
+      printf '\n\033[1;31m✖ KONFLIKT: Auf dem neuen VPS existieren bereits %s auth.users (%s).\033[0m\n' \
+        "$existing_users" "$db_unit"
+      printf '  Ein Whole-DB-Restore (--clean) wuerde diese ueberschreiben.\n'
+      printf '  a) Neuer VPS ist dediziert fuer diese Migration → Benutzer loeschen, dann erneut starten.\n'
+      printf '  b) Bereits produktiver VPS → Vorsicht: Restore wuerde echte Nutzerdaten zerstoeren!\n\n'
+      local force_ans
+      read -rp "Migration trotzdem fortsetzen? Tippe 'force-core' zum Bestaetigen oder Enter zum Abbrechen: " force_ans
       if [[ "$force_ans" != "force-core" ]]; then
-        err "Migration abgebrochen (core-Überschreib-Schutz)."
+        err "Migration abgebrochen (Ueberschreib-Schutz ${db_unit})."
       fi
-      printf '  \033[1;33m⚠ WARNUNG: Fortfahren — bestehende auth.users werden durch Restore überschrieben.\033[0m\n'
+      printf '  \033[1;33m⚠ WARNUNG: Fortfahren — bestehende auth.users werden durch Restore ueberschrieben.\033[0m\n'
     fi
-  else
-    echo "  db-assistent läuft noch nicht auf neuem VPS — core-Restore unkritisch."
+  }
+
+  if (( do_assistent == 1 )); then
+    _check_overwrite_guard "db-assistent" "ASSISTENT_POSTGRES_PASSWORD"
+  fi
+  if (( do_rapt == 1 )); then
+    _check_overwrite_guard "db-rapt" "RAPT_POSTGRES_PASSWORD"
   fi
 
   # ---- Zusammenfassung + Bestätigung vor destruktivem Teil
-  printf '\n\033[1;34m▶ Migrations-Plan — bitte bestätigen\033[0m\n\n'
+  local unit_label=""
+  if (( do_assistent == 1 && do_rapt == 1 )); then
+    unit_label="db-assistent + db-rapt (beide)"
+  elif (( do_assistent == 1 )); then
+    unit_label="db-assistent"
+  else
+    unit_label="db-rapt"
+  fi
+
+  printf '\n\033[1;34m▶ Migrations-Plan — bitte bestaetigen\033[0m\n\n'
   printf '  Alter VPS (Quell-VPS):  %s@%s (Port %s)\n' "$old_user" "$old_host" "$old_port"
-  printf '  Umzug:   Supabase / gesamte DB (core + aibrewgenius + rapt)\n'
+  printf '  Umzug:   %s\n' "$unit_label"
   printf '  Schritte:\n'
-  printf '    (a) Backup auf altem VPS (--label pre-migration) + R2-Verifikation (1 Whole-DB-Dump)\n'
-  printf '    (b) Supabase-Stacks auf altem VPS stoppen (db-assistent + db-rapt + Frontends)\n'
-  printf '    (c) Supabase auf neuem VPS hochziehen\n'
-  printf '    (d) Whole-DB-Dump restoren (supabase/ → all) via --clean\n'
-  printf '    (e) supabase-Marker auf altem VPS entfernen (Backup wird No-op)\n'
-  printf '    (f) supabase-Marker auf neuem VPS sicherstellen\n\n'
-  printf '  ACHTUNG: Schritt (d) überschreibt vorhandene Daten auf dem neuen VPS.\n'
-  printf '  Rollback: Supabase auf altem VPS neu starten + Marker wiederherstellen.\n\n'
-  read -rp "Migration starten? Tippe 'migrate' zum Bestätigen: " migrate_ans
+  printf '    (a) Backup auf altem VPS (--label pre-migration) + R2-Verifikation\n'
+  printf '    (b) DB-Stack(s) auf altem VPS stoppen + Verifikation\n'
+  printf '    (c) Stacks auf neuem VPS hochziehen\n'
+  printf '    (d) Restore: restore.sh <unit> <dumpfile> --yes (pro Unit)\n'
+  printf '    (e) DB-Marker auf altem VPS entfernen\n'
+  printf '    (f) DB-Marker auf neuem VPS sicherstellen\n\n'
+  printf '  ACHTUNG: Schritt (d) ueberschreibt vorhandene Daten auf dem neuen VPS.\n'
+  printf '  Rollback: Stacks auf altem VPS neu starten + Marker wiederherstellen.\n\n'
+  read -rp "Migration starten? Tippe 'migrate' zum Bestaetigen: " migrate_ans
   [[ "$migrate_ans" == "migrate" ]] || { echo "  Abgebrochen."; return 0; }
 
   # ===========================================================================
@@ -1850,114 +1907,155 @@ EOSU
   ok "(a) Backup erstellt"
 
   # ===========================================================================
-  # SCHRITT (a) VERIFIKATION — alle drei pre-migration-Dumps in R2 prüfen
+  # SCHRITT (a) VERIFIKATION — pre-migration-Dumps pro Unit in R2 prüfen
   # ===========================================================================
-  log "(a) Verifikation: pre-migration-Dump in R2 suchen (supabase/)"
-  local verify_out
-  local supabase_dump_name
-  if ! verify_out="$(_verify_backup_in_r2 "$old_user" "$old_host" "$old_port")"; then
-    err "R2-Verifikation fehlgeschlagen: pre-migration-Dump nicht in R2 gefunden (supabase/).
-   Migration abgebrochen — alter Stand bleibt laufend.
-   Manuell prüfen: ssh ${old_user}@${old_host} 'rclone lsf R2:<bucket>/supabase/ | grep pre-migration'"
+  local check_unit="both"
+  if (( do_assistent == 1 && do_rapt == 0 )); then
+    check_unit="db-assistent"
+  elif (( do_assistent == 0 && do_rapt == 1 )); then
+    check_unit="db-rapt"
   fi
 
-  supabase_dump_name="$(printf '%s' "$verify_out" | head -1)"
+  log "(a) Verifikation: pre-migration-Dump(s) in R2 suchen (${check_unit})"
+  local verify_out assistent_dump_name rapt_dump_name
+  if ! verify_out="$(_verify_backup_in_r2 "$old_user" "$old_host" "$old_port" "$check_unit")"; then
+    err "R2-Verifikation fehlgeschlagen: pre-migration-Dump nicht in R2 gefunden (${check_unit}).
+   Migration abgebrochen — alter Stand bleibt laufend."
+  fi
+
+  # Zeilenweise auflesen: erste Zeile = assistent (wenn gewählt), zweite = rapt (wenn beide).
+  assistent_dump_name=""
+  rapt_dump_name=""
+  if (( do_assistent == 1 && do_rapt == 1 )); then
+    assistent_dump_name="$(printf '%s' "$verify_out" | sed -n '1p')"
+    rapt_dump_name="$(printf '%s'      "$verify_out" | sed -n '2p')"
+  elif (( do_assistent == 1 )); then
+    assistent_dump_name="$(printf '%s' "$verify_out" | sed -n '1p')"
+  else
+    rapt_dump_name="$(printf '%s' "$verify_out" | sed -n '1p')"
+  fi
 
   ok "(a) Verifikation OK"
-  printf '    supabase (Whole-DB): %s\n' "$supabase_dump_name"
+  (( do_assistent == 1 )) && printf '    db-assistent: %s\n' "$assistent_dump_name"
+  (( do_rapt == 1 ))      && printf '    db-rapt:      %s\n' "$rapt_dump_name"
 
   # ===========================================================================
-  # SCHRITT (b) — Supabase-Stack auf altem VPS stoppen
+  # SCHRITT (b) — DB-Stacks auf altem VPS stoppen
   # ===========================================================================
-  # Phase 1: Service-Namen auf neue Lean-Stack-Namen umgestellt (2026-05-25).
-  # db-assistent/kong-assistent/auth-assistent/rest-assistent + rapt-Entsprechungen.
-  # TODO Phase 4 (Backup/Restore): zwei separate Stop-Pfade für db-assistent + db-rapt.
-  log "(b) Supabase-Stacks (db-assistent + db-rapt + Frontends) auf altem VPS stoppen"
-  # Stoppen verhindert neue Writes nach dem pre-migration-Backup.
-  # Frontends werden ebenfalls gestoppt (zustandslos, kein Datenverlust).
-  # Robuster Ansatz: explizit alle bekannten Services benennen — verhindert
-  # versehentliches Stoppen von Services auf dem neuen VPS (falscher Host).
+  log "(b) DB-Stack(s) (${unit_label} + Frontends) auf altem VPS stoppen"
+  # Explizit alle bekannten Services benennen — verhindert versehentliches Stoppen
+  # auf dem neuen VPS (falscher Host). Frontends: zustandslos, kein Datenverlust.
+  local stop_svcs=""
+  if (( do_assistent == 1 )); then
+    stop_svcs="${stop_svcs} db-assistent kong-assistent auth-assistent rest-assistent web_assistent api_proxy_assistent"
+  fi
+  if (( do_rapt == 1 )); then
+    stop_svcs="${stop_svcs} db-rapt kong-rapt auth-rapt rest-rapt web_rapt api_proxy_rapt"
+  fi
+  local stop_svcs_trimmed="${stop_svcs# }"
   ssh -o BatchMode=yes -o ConnectTimeout=15 \
       -o StrictHostKeyChecking=accept-new \
       -p "$old_port" "${old_user}@${old_host}" \
-      'cd ~/webPage_infra && docker compose stop db-assistent kong-assistent auth-assistent rest-assistent db-rapt kong-rapt auth-rapt rest-rapt web_assistent web_rapt api_proxy_assistent api_proxy_rapt 2>/dev/null || true
-       docker compose stop 2>/dev/null || true' \
-    || err "Stop auf altem VPS fehlgeschlagen. Bitte manuell prüfen: ssh ${old_user}@${old_host} 'cd ~/webPage_infra && docker compose ps'"
+      "cd ~/webPage_infra && docker compose stop ${stop_svcs_trimmed} 2>/dev/null || true
+       docker compose stop 2>/dev/null || true" \
+    || err "Stop auf altem VPS fehlgeschlagen. Bitte manuell pruefen: ssh ${old_user}@${old_host} 'cd ~/webPage_infra && docker compose ps'"
 
-  # C1: Separater Verifikations-SSH-Call — NICHT auf Exit-Code von 'docker compose stop'
-  # verlassen (der ist immer 0, auch wenn db-assistent noch läuft oder gar nicht existiert).
-  # Erst wenn docker inspect bestätigt, dass db-assistent nicht mehr läuft (oder gar nicht
-  # existiert), ist der Stop sicher — sonst würde Schritt (d) auf eine noch schreibende DB
-  # restoren (pre-migration-Dump ungültig, Datenverlust-Risiko).
-  # Phase 1: db-assistent (neuer Name nach Per-App-DB-Pivot 2026-05-25).
-  log "(b) Verifikation: db-assistent auf altem VPS wirklich gestoppt?"
-  if ! ssh -o BatchMode=yes -o ConnectTimeout=15 \
-           -o StrictHostKeyChecking=accept-new \
-           -p "$old_port" "${old_user}@${old_host}" bash -s <<'REMOTE'
+  # Verifikation: DB-Container(s) wirklich gestoppt?
+  # Separater SSH-Call — docker compose stop Exit-Code ist immer 0, unabhaengig vom Ergebnis.
+  if (( do_assistent == 1 )); then
+    log "(b) Verifikation: db-assistent auf altem VPS wirklich gestoppt?"
+    if ! ssh -o BatchMode=yes -o ConnectTimeout=15 \
+             -o StrictHostKeyChecking=accept-new \
+             -p "$old_port" "${old_user}@${old_host}" bash -s <<'REMOTE'
 set -euo pipefail
-# Zwei erlaubte Zustände: Container existiert + Running=false  ODER  Container existiert nicht.
-# TODO Phase 4: Auch db-rapt prüfen.
 state="$(docker inspect --format='{{.State.Running}}' db-assistent 2>/dev/null || echo 'absent')"
-if [[ "$state" == "false" || "$state" == "absent" ]]; then
-  exit 0   # db-assistent gestoppt oder gar nicht vorhanden — Migration sicher
-fi
-# state == "true" → Container läuft noch
+if [[ "$state" == "false" || "$state" == "absent" ]]; then exit 0; fi
 printf 'db-assistent laeuft noch (State.Running=%s) — Stop war nicht vollstaendig.\n' "$state" >&2
 exit 1
 REMOTE
-  then
-    err "(b) ABORT: db-assistent auf altem VPS laeuft noch — Migration abgebrochen.
+    then
+      err "(b) ABORT: db-assistent auf altem VPS laeuft noch — Migration abgebrochen.
    Alter Stand bleibt unveraendert (kein Datenverlust).
    Manuell pruefen + ggf. stop wiederholen:
-     ssh ${old_user}@${old_host} 'cd ~/webPage_infra && docker compose stop db-assistent && docker inspect --format={{.State.Running}} db-assistent'"
+     ssh ${old_user}@${old_host} 'cd ~/webPage_infra && docker compose stop db-assistent'"
+    fi
+    ok "(b) db-assistent gestoppt + verifiziert"
   fi
-  ok "(b) Supabase-Stack auf altem VPS gestoppt + verifiziert"
+
+  if (( do_rapt == 1 )); then
+    log "(b) Verifikation: db-rapt auf altem VPS wirklich gestoppt?"
+    if ! ssh -o BatchMode=yes -o ConnectTimeout=15 \
+             -o StrictHostKeyChecking=accept-new \
+             -p "$old_port" "${old_user}@${old_host}" bash -s <<'REMOTE'
+set -euo pipefail
+state="$(docker inspect --format='{{.State.Running}}' db-rapt 2>/dev/null || echo 'absent')"
+if [[ "$state" == "false" || "$state" == "absent" ]]; then exit 0; fi
+printf 'db-rapt laeuft noch (State.Running=%s) — Stop war nicht vollstaendig.\n' "$state" >&2
+exit 1
+REMOTE
+    then
+      err "(b) ABORT: db-rapt auf altem VPS laeuft noch — Migration abgebrochen.
+   Alter Stand bleibt unveraendert (kein Datenverlust).
+   Manuell pruefen + ggf. stop wiederholen:
+     ssh ${old_user}@${old_host} 'cd ~/webPage_infra && docker compose stop db-rapt'"
+    fi
+    ok "(b) db-rapt gestoppt + verifiziert"
+  fi
+
   printf '  Rollback: ssh %s@%s "cd ~/webPage_infra && docker compose up -d"\n' \
     "$old_user" "$old_host"
 
   # ===========================================================================
-  # SCHRITT (c) — Supabase auf neuem VPS hochziehen
+  # SCHRITT (c) — Stacks auf neuem VPS hochziehen
   # ===========================================================================
-  # TODO Phase 4: web_rapt + kong-rapt ebenfalls hochziehen (zweite stateful Unit).
-  log "(c) Supabase-Stacks auf neuem VPS hochziehen (assistent + rapt)"
-  echo "  Services: web_assistent kong-assistent web_rapt kong-rapt (depends_on zieht DBs mit)"
+  log "(c) Stacks auf neuem VPS hochziehen (${unit_label})"
+  local start_svcs=""
+  if (( do_assistent == 1 )); then
+    start_svcs="${start_svcs} web_assistent kong-assistent"
+  fi
+  if (( do_rapt == 1 )); then
+    start_svcs="${start_svcs} web_rapt kong-rapt"
+  fi
+  local start_svcs_trimmed="${start_svcs# }"
+  echo "  Services: ${start_svcs_trimmed} (depends_on zieht DBs mit)"
   cf_ensure_tunnel_if_token
-  sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+  sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" SVCS="$start_svcs_trimmed" bash <<'EOSU'
 set -euo pipefail
 cd "$APP_DIR"
-docker compose pull web_assistent kong-assistent web_rapt kong-rapt
-docker compose --profile vps up -d web_assistent kong-assistent web_rapt kong-rapt cloudflared
+# shellcheck disable=SC2086
+docker compose pull $SVCS
+# shellcheck disable=SC2086
+docker compose --profile vps up -d $SVCS cloudflared
 EOSU
-  ok "(c) Supabase-Stacks auf neuem VPS gestartet"
-  # Marker auf neuem VPS sicherstellen (Schritt f wird nach Restore explizit gemacht,
-  # aber setzen wir ihn schon hier da db-assistent jetzt läuft)
-  _ensure_supabase_marker
+  ok "(c) Stacks auf neuem VPS gestartet"
+  # Marker früh setzen (idempotent; Schritt f stellt sie nach Restore nochmals sicher).
+  if (( do_assistent == 1 )); then _ensure_db_marker db-assistent; fi
+  if (( do_rapt == 1 ));      then _ensure_db_marker db-rapt; fi
 
   # ===========================================================================
-  # SCHRITT (d) — Whole-DB-Dump auf neuem VPS restoren
+  # SCHRITT (d) — Dumps auf neuem VPS restoren (pro Unit)
   # ===========================================================================
-  log "(d) Whole-DB-Dump restoren (supabase/ → restore.sh all)"
-  # Expliziter Dateiname aus der Verifikation — kein 'latest' (vermeidet Verwechslung
-  # mit einem neueren automatischen Dump nach dem pre-migration-Backup).
-  # Ein Whole-DB-Dump: kein Core-first-Reihenfolge nötig (alles in einem Snapshot).
-  printf '    supabase (Whole-DB): %s\n' "$supabase_dump_name"
-  echo "  Restore läuft mit --yes (Bestätigung wurde oben eingeholt)."
+  log "(d) Restore: R2-Dump(s) laden + restore.sh <unit> aufrufen"
+  echo "  Restores laufen mit --yes (Bestaetigung wurde oben eingeholt)."
 
-  sudo -u "$APP_USER" -H \
-    APP_DIR="$APP_DIR" \
-    SUPABASE_DUMP="${supabase_dump_name}" \
-    bash <<'EOSU'
+  _restore_one_unit() {
+    local db_unit="$1"   # db-assistent | db-rapt
+    local dump_name="$2" # Dateiname (z.B. db-assistent_20260525_030000_pre-migration.fc.gpg)
+    sudo -u "$APP_USER" -H \
+      APP_DIR="$APP_DIR" \
+      DB_UNIT="$db_unit" \
+      DUMP_NAME="$dump_name" \
+      bash <<'EOSU'
 set -euo pipefail
 cd "$APP_DIR"
 set -a; source .env; set +a
 
-# R2-Remote via RCLONE_CONFIG_R2_* aufbauen (gleiche Logik wie backup.sh).
-R2_BUCKET="${R2_BUCKET:?fehlt in .env (R2 für Migration)}"
+R2_BUCKET="${R2_BUCKET:?fehlt in .env}"
 R2_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID:?fehlt in .env}"
 R2_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY:?fehlt in .env}"
 _r2_ep="${R2_ENDPOINT:-}"
 if [[ -z "$_r2_ep" ]]; then
-  R2_ACCOUNT_ID="${R2_ACCOUNT_ID:?fehlt in .env (R2_ENDPOINT oder R2_ACCOUNT_ID nötig)}"
+  R2_ACCOUNT_ID="${R2_ACCOUNT_ID:?fehlt in .env (R2_ENDPOINT oder R2_ACCOUNT_ID noetig)}"
   _r2_ep="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 fi
 export RCLONE_CONFIG_R2_TYPE=s3
@@ -1968,102 +2066,130 @@ export RCLONE_CONFIG_R2_ENDPOINT="$_r2_ep"
 export RCLONE_CONFIG_R2_REGION=auto
 export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
 
-# Whole-DB-Dump lokal laden
-SUPABASE_LOCAL="backups/supabase/${SUPABASE_DUMP}"
-mkdir -p backups/supabase
-rclone copyto "R2:${R2_BUCKET}/supabase/${SUPABASE_DUMP}" "$SUPABASE_LOCAL" \
-  || { echo "rclone-Download supabase fehlgeschlagen" >&2; exit 1; }
-echo "  Whole-DB-Dump geladen: $SUPABASE_LOCAL"
+LOCAL_DIR="backups/${DB_UNIT}"
+LOCAL_FILE="${LOCAL_DIR}/${DUMP_NAME}"
+mkdir -p "$LOCAL_DIR"
+rclone copyto "R2:${R2_BUCKET}/${DB_UNIT}/${DUMP_NAME}" "$LOCAL_FILE" \
+  || { printf 'rclone-Download %s fehlgeschlagen\n' "$DB_UNIT" >&2; exit 1; }
+printf '  Dump geladen: %s\n' "$LOCAL_FILE"
 
-# Restore: ein Whole-DB pg_restore (kein Core-first nötig — Single-Snapshot).
-# --yes: Bestätigung wurde interaktiv im Menü bereits eingeholt.
-./scripts/restore.sh all "$SUPABASE_LOCAL" --yes
+./scripts/restore.sh "$DB_UNIT" "$LOCAL_FILE" --yes
 
-echo "  Lokale Dump-Datei aufräumen..."
-rm -f "$SUPABASE_LOCAL"
+printf '  Lokale Dump-Datei aufraemen...\n'
+rm -f "$LOCAL_FILE"
 EOSU
+  }
 
-  ok "(d) Whole-DB-Restore abgeschlossen"
+  if (( do_assistent == 1 )); then
+    printf '    db-assistent: %s\n' "$assistent_dump_name"
+    _restore_one_unit "db-assistent" "$assistent_dump_name"
+    ok "(d) db-assistent Restore abgeschlossen"
+  fi
+  if (( do_rapt == 1 )); then
+    printf '    db-rapt: %s\n' "$rapt_dump_name"
+    _restore_one_unit "db-rapt" "$rapt_dump_name"
+    ok "(d) db-rapt Restore abgeschlossen"
+  fi
 
   # ===========================================================================
-  # SCHRITT (e) — supabase-Marker auf altem VPS entfernen (Backup → No-op)
+  # SCHRITT (e) — DB-Marker auf altem VPS entfernen (Backup → No-op)
   # ===========================================================================
-  log "(e) supabase-Marker auf altem VPS entfernen"
-  # rm -f als alex (owner /etc/brewing/stateful-units.d/) → kein sudo nötig.
-  # Danach ist der nächtige Cron-Lauf auf dem alten VPS ein sauberer No-op (Exit 0).
+  log "(e) DB-Marker auf altem VPS entfernen (${unit_label})"
+  local rm_cmd=""
+  if (( do_assistent == 1 )); then
+    rm_cmd="${rm_cmd} rm -f /etc/brewing/stateful-units.d/db-assistent;"
+  fi
+  if (( do_rapt == 1 )); then
+    rm_cmd="${rm_cmd} rm -f /etc/brewing/stateful-units.d/db-rapt;"
+  fi
+  local rm_cmd_trimmed="${rm_cmd# }"
   ssh -o BatchMode=yes -o ConnectTimeout=15 \
       -o StrictHostKeyChecking=accept-new \
       -p "$old_port" "${old_user}@${old_host}" \
-      'rm -f /etc/brewing/stateful-units.d/supabase' \
-    || printf '  \033[1;33m⚠ Marker-Entfernen fehlgeschlagen — bitte manuell auf altem VPS: rm -f /etc/brewing/stateful-units.d/supabase\033[0m\n'
-  ok "(e) supabase-Marker auf altem VPS entfernt — Backup dort jetzt No-op"
+      "$rm_cmd_trimmed" \
+    || printf '  \033[1;33m⚠ Marker-Entfernen fehlgeschlagen — bitte manuell auf altem VPS: %s\033[0m\n' "$rm_cmd_trimmed"
+  ok "(e) DB-Marker auf altem VPS entfernt — Backup dort jetzt No-op fuer ${unit_label}"
 
   # ===========================================================================
-  # SCHRITT (f) — supabase-Marker auf neuem VPS sicherstellen
+  # SCHRITT (f) — DB-Marker auf neuem VPS sicherstellen
   # ===========================================================================
-  log "(f) supabase-Marker auf neuem VPS sicherstellen"
-  # Wurde schon in Schritt (c) gesetzt — idempotenter Check.
-  _ensure_supabase_marker
+  log "(f) DB-Marker auf neuem VPS sicherstellen (${unit_label})"
+  # Wurden schon in Schritt (c) gesetzt — idempotenter Check.
+  if (( do_assistent == 1 )); then _ensure_db_marker db-assistent; fi
+  if (( do_rapt == 1 ));      then _ensure_db_marker db-rapt; fi
 
   # ---------------------------------------------------------------- Cloudflare reconcilen
   cf_reconcile_if_token
 
   # ---------------------------------------------------------------- Post-Migrations-Hinweise
-  printf '\n\033[1;32m  ✓ Migration abgeschlossen — Supabase / DB läuft jetzt auf dem neuen VPS.\033[0m\n\n'
+  printf '\n\033[1;32m  ✓ Migration abgeschlossen — %s laueft jetzt auf dem neuen VPS.\033[0m\n\n' \
+    "$unit_label"
 
   printf '  Rollback-Info (falls Probleme auftreten):\n'
-  printf '    1. Supabase auf altem VPS neu starten:\n'
+  printf '    1. Stacks auf altem VPS neu starten:\n'
   printf '       ssh %s@%s "cd ~/webPage_infra && docker compose up -d"\n' "$old_user" "$old_host"
   printf '    2. Marker auf altem VPS wiederherstellen:\n'
-  printf '       ssh %s@%s "touch /etc/brewing/stateful-units.d/supabase"\n' "$old_user" "$old_host"
+  if (( do_assistent == 1 )); then
+    printf '       ssh %s@%s "touch /etc/brewing/stateful-units.d/db-assistent"\n' "$old_user" "$old_host"
+  fi
+  if (( do_rapt == 1 )); then
+    printf '       ssh %s@%s "touch /etc/brewing/stateful-units.d/db-rapt"\n' "$old_user" "$old_host"
+  fi
   printf '    3. Marker auf neuem VPS entfernen:\n'
-  printf '       rm -f /etc/brewing/stateful-units.d/supabase\n'
-  printf '    Der pre-migration-Dump liegt rotation-exempt in R2.\n\n'
+  if (( do_assistent == 1 )); then
+    printf '       rm -f /etc/brewing/stateful-units.d/db-assistent\n'
+  fi
+  if (( do_rapt == 1 )); then
+    printf '       rm -f /etc/brewing/stateful-units.d/db-rapt\n'
+  fi
+  printf '    Die pre-migration-Dumps liegen rotation-exempt in R2.\n\n'
 
-  printf '  Zustandslose Frontends verschieben (kein Backup/Restore nötig):\n'
+  printf '  Zustandslose Frontends verschieben (kein Backup/Restore noetig):\n'
   printf '    brew_assistent / rapt_dashboard / web_hauptseite:\n'
-  printf '    → Auf Ziel-VPS: Bootstrap-Menü → "Einheiten auswaehlen & starten" (Option 1)\n'
+  printf '    → Auf Ziel-VPS: Bootstrap-Menue → "Einheiten auswaehlen & starten" (Option 1)\n'
   printf '    → Auf altem VPS danach stoppen: docker compose stop web_assistent web_rapt web_hauptseite\n\n'
 
   printf '  Cloudflare-Routing:\n'
   printf '    Auf dem ALTEN VPS den Hostname aus scripts/cloudflare-routes.json entfernen\n'
-  printf '    und ./scripts/cloudflare-reconcile.sh ausführen — sonst konkurrierende\n'
-  printf '    Tunnel-Ingress-Einträge (beide Tunnel antworten auf denselben Hostname).\n\n'
+  printf '    und ./scripts/cloudflare-reconcile.sh ausfuehren — sonst konkurrierende\n'
+  printf '    Tunnel-Ingress-Eintraege (beide Tunnel antworten auf denselben Hostname).\n\n'
 
-  printf '  RAPT_DASHBOARD_URL (wenn RAPT auf separatem VPS):\n'
-  printf '    In der .env RAPT_DASHBOARD_URL auf die neue URL setzen\n'
-  printf '    (https://rapt.alexstuder.cloud o.ä.), dann .env.gpg neu verschlüsseln:\n'
-  printf '      ./scripts/encrypt-env.sh   (braucht GPG-Passphrase aus Bitwarden)\n'
-  printf '    Credential-Schritt: ALEXSTUDER_WEBPAGE_GPG_PASSWORD aus Bitwarden holen.\n\n'
+  if (( do_rapt == 1 )); then
+    printf '  RAPT_DASHBOARD_URL (wenn RAPT auf separatem VPS):\n'
+    printf '    In der .env RAPT_DASHBOARD_URL auf die neue URL setzen\n'
+    printf '    (https://rapt.alexstuder.cloud o.ae.), dann .env.gpg neu verschluesseln:\n'
+    printf '      ./scripts/encrypt-env.sh   (braucht GPG-Passphrase aus Bitwarden)\n'
+    printf '    Credential-Schritt: ALEXSTUDER_WEBPAGE_GPG_PASSWORD aus Bitwarden holen.\n\n'
 
-  # V-10: Wenn rapt-Proxy auf einem anderen VPS als die rapt-DB landet (DB wurde migriert),
-  # muss RAPT_PROXY_DATABASE_URL in der .env des Proxy-VPS angepasst werden.
-  # TODO Phase 3 Proxy-Split: api_proxy → api_proxy_rapt (rapt-Proxy trägt db-sync).
-  printf '  Cross-VPS-DB-Hinweis (V-10):\n'
-  printf '    Wenn api_proxy_rapt auf einem anderen VPS als db-rapt läuft:\n'
-  printf '    RAPT_PROXY_DATABASE_URL in .env auf den Cloudflare-TCP-Tunnel-Loopback setzen:\n'
-  printf '    RAPT_PROXY_DATABASE_URL=postgres://proxy_sync:<RAPT_PROXY_SYNC_PASSWORD>@host.docker.internal:15432/postgres?sslmode=disable\n'
-  printf '    (RAPT_PROXY_SYNC_PASSWORD ist eine dedizierte Var — nicht RAPT_POSTGRES_PASSWORD)\n'
-  printf '    Dann .env.gpg neu verschlüsseln (encrypt-env.sh, Credential-Schritt).\n\n'
+    printf '  Cross-VPS-DB-Hinweis (V-10) — nur db-rapt:\n'
+    printf '    Wenn api_proxy_rapt auf einem anderen VPS als db-rapt laeuft:\n'
+    printf '    RAPT_PROXY_DATABASE_URL in .env auf den Cloudflare-TCP-Tunnel-Loopback setzen:\n'
+    printf '    RAPT_PROXY_DATABASE_URL=postgres://proxy_sync:<RAPT_PROXY_SYNC_PASSWORD>@host.docker.internal:15432/postgres?sslmode=disable\n'
+    printf '    (RAPT_PROXY_SYNC_PASSWORD ist eine dedizierte Var — nicht RAPT_POSTGRES_PASSWORD)\n'
+    printf '    Dann .env.gpg neu verschluesseln (encrypt-env.sh, Credential-Schritt).\n\n'
+  fi
 }
 
 # ================================================================
 # AKTION: Erstdaten aus R2 wiederherstellen (latest)
 #
 # Disaster-Recovery- + Erst-Lauf-Pfad: frischer VPS zieht das juengste Backup
-# (latest) aus R2 und restored es: ein Whole-DB pg_restore aus supabase/
-# (kein Reihenfolge-Split, Single-Snapshot).
+# (latest) pro DB aus R2 und restored es unabhaengig:
+#   restore.sh db-assistent latest  (aibrewgenius + auth)
+#   restore.sh db-rapt latest       (rapt + auth + TimescaleDB-Hooks via Extension-Guard)
 #
 # Abgrenzung zur Migration (action_migrate_unit): die Migration verlangt einen
 # LAUFENDEN alten VPS via SSH (Umzug). DIESER Pfad braucht keinen alten VPS und
 # ist daher der einzige Weg, wenn der alte VPS tot/weg ist (Crash-Recovery) oder
 # es noch gar keinen gab (Erst-Lauf). Voraussetzung: Backup in R2 vorhanden.
 #
-# DESTRUKTIV: pg_restore --clean überschreibt vorhandene Objekte.
+# DESTRUKTIV: pg_restore --clean ueberschreibt vorhandene Objekte.
 # Sicherheits-Guards:
 #   1. Tippe-"restore"-Prompt (Nicht-TTY ohne --yes → Abbruch).
-#   2. auth.users-Check: wenn DB nicht leer → Warnung + "force-restore"-Bestaetigung.
-#   3. Leerer Bucket / kein *.fc.gpg in supabase/ → sauberer Skip (kein Abbruch).
+#   2. auth.users-Check pro DB: wenn nicht leer → Warnung + "force-restore".
+#   3. Leerer Bucket / kein *.fc.gpg in einem Ordner → sauberer Skip fuer diese DB,
+#      die andere wird trotzdem restoriert (unabhaengig).
+#   4. R2-Verbindungsfehler → Sentinel "R2_ERROR:" → return 1 (kein stiller Skip).
 # ================================================================
 action_restore_from_r2() {
 
@@ -2099,15 +2225,18 @@ EOSU
   fi
   ok "Vorbedingungen OK"
 
-  # ---- Supabase-Stacks hochziehen (idempotent) ----
-  # TODO Phase 4: Auch db-rapt + kong-rapt hochziehen; R2-Ordner fuer beide Stacks pruefen.
-  log "Supabase-Stacks sicherstellen (falls nicht laufend)"
-  local _sb_running=0
-  sudo -u "$APP_USER" bash <<'EOSU' && _sb_running=1 || _sb_running=0
+  # ---- Stacks hochziehen (idempotent) — db-assistent UND db-rapt ----
+  log "DB-Stacks sicherstellen (falls nicht laufend)"
+  local _assistent_running=0 _rapt_running=0
+  sudo -u "$APP_USER" bash <<'EOSU' && _assistent_running=1 || _assistent_running=0
 docker inspect --format='{{.State.Running}}' db-assistent 2>/dev/null | grep -q '^true$'
 EOSU
-  if (( _sb_running == 0 )); then
-    log "db-assistent laeuft noch nicht — Stacks hochziehen"
+  sudo -u "$APP_USER" bash <<'EOSU' && _rapt_running=1 || _rapt_running=0
+docker inspect --format='{{.State.Running}}' db-rapt 2>/dev/null | grep -q '^true$'
+EOSU
+
+  if (( _assistent_running == 0 || _rapt_running == 0 )); then
+    log "Nicht alle DB-Container laufen — Stacks hochziehen"
     cf_ensure_tunnel_if_token
     sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
 set -euo pipefail
@@ -2115,26 +2244,26 @@ cd "$APP_DIR"
 docker compose pull web_assistent kong-assistent web_rapt kong-rapt
 docker compose --profile vps up -d web_assistent kong-assistent web_rapt kong-rapt cloudflared
 EOSU
-    ok "Supabase-Stacks gestartet"
+    ok "Stacks gestartet"
   else
-    ok "db-assistent laeuft bereits"
+    ok "db-assistent und db-rapt laufen bereits"
   fi
 
-  # supabase-Marker setzen (idempotent)
-  _ensure_supabase_marker
+  # Marker frueh setzen (idempotent — nach Restore nochmals gesetzt).
+  _ensure_db_marker db-assistent
+  _ensure_db_marker db-rapt
 
-  # ---- Pruefen ob R2-Ordner supabase/ *.fc.gpg enthält (Empty-Bucket-Sicherheitsnetz) ----
-  # BLOCKER-Fix: rclone-Exit-Code explizit fangen; bei Fehler Sentinel "R2_ERROR:<folder>"
-  # ausgeben und exit 0 damit der Heredoc IMMER sauber endet. Aeusserer Aufrufer unterscheidet:
-  #   "R2_ERROR:" → R2-Verbindungsfehler (Creds/Netzwerk) → return 1 mit klarer Meldung.
-  #   Leer          → echter leerer Bucket → sauberer Skip (return 0).
-  #   "supabase"    → fehlende *.fc.gpg → sauberer Skip (return 0).
-  log "R2-Verfuegbarkeit pruefen (jüngste *.fc.gpg in supabase/)"
-  local _r2_check_out
-  _r2_check_out="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+  # ---- R2-Verfuegbarkeit pruefen: beide Ordner db-assistent/ + db-rapt/ ----
+  # Sentinel-Logik pro Ordner: R2_ERROR: → Verbindungsfehler → return 1 (kein stiller Skip).
+  # Leer = echter leerer Ordner → sauberer Skip fuer diese DB.
+  # Die jeweils andere DB wird trotzdem restoriert (unabhaengig).
+  _check_r2_folder() {
+    local folder="$1"   # db-assistent | db-rapt (Whitelist-gecheckt)
+    [[ "$folder" =~ ^[a-zA-Z0-9_-]+$ ]] \
+      || { printf '\033[1;31m✖ Interner Fehler: ungültiger Ordner: %s\033[0m\n' "$folder" >&2; return 2; }
+    sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" FOLDER="$folder" bash <<'EOSU'
 set -uo pipefail
 set -a; source "$APP_DIR/.env"; set +a
-# R2-Remote via Env-Vars (nie in argv)
 R2_EP="${R2_ENDPOINT:-}"
 if [[ -z "$R2_EP" ]]; then
   R2_EP="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
@@ -2147,65 +2276,77 @@ export RCLONE_CONFIG_R2_ENDPOINT="$R2_EP"
 export RCLONE_CONFIG_R2_REGION=auto
 export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
 
-# Lesson C2: rclone-Output in Variable fangen, Exit-Code separat pruefen.
-# Bei rclone-Fehler (Bad Creds, Netzwerk): Sentinel ausgeben, exit 0 (Heredoc bleibt sauber).
 _rclone_err_tmp="$(mktemp)"
 trap 'rm -f "$_rclone_err_tmp"' EXIT
-folder="supabase"
-lsf_out="$(rclone lsf "R2:${R2_BUCKET}/${folder}/" --include '*.fc.gpg' 2>"$_rclone_err_tmp")"
+lsf_out="$(rclone lsf "R2:${R2_BUCKET}/${FOLDER}/" --include '*.fc.gpg' 2>"$_rclone_err_tmp")"
 rclone_exit=$?
 if (( rclone_exit != 0 )); then
-  # Erster nicht-leerer stderr-Satz als kompakter Hinweis (max 120 Zeichen).
   _rclone_snippet="$(grep -v '^$' "$_rclone_err_tmp" 2>/dev/null | head -1 | cut -c1-120 || true)"
-  printf 'R2_ERROR:%s' "$folder"
+  printf 'R2_ERROR:%s' "$FOLDER"
   [[ -n "$_rclone_snippet" ]] && printf ':%s' "$_rclone_snippet"
   exit 0
 fi
 latest="$(printf '%s\n' "$lsf_out" | sort | tail -1 || true)"
 if [[ -z "$latest" ]]; then
-  printf '%s' "$folder"
+  printf 'EMPTY:%s' "$FOLDER"
 fi
 EOSU
-)"
+  }
 
-  # Sentinel-Auswertung: R2_ERROR → Creds/Netzwerk-Problem (kein stiller Skip)
-  # Format: R2_ERROR:<folder>[:<rclone-stderr-snippet>]
-  if [[ "$_r2_check_out" == R2_ERROR:* ]]; then
-    local _err_rest="${_r2_check_out#R2_ERROR:}"
-    local _err_folder="${_err_rest%%:*}"
-    local _err_snippet="${_err_rest#*:}"
-    # Wenn kein Snippet vorhanden (kein zweites ':'), snippet = leer setzen.
-    [[ "$_err_snippet" == "$_err_folder" ]] && _err_snippet=""
-    printf '\n\033[1;31m✖ R2-Verbindung fehlgeschlagen (Ordner: %s).\033[0m\n' "$_err_folder"
-    [[ -n "$_err_snippet" ]] && printf '  rclone: %s\n' "$_err_snippet"
-    printf '  Ursache: Bad Credentials, Netzwerkfehler oder falscher Endpoint.\n'
-    printf '  Massnahmen:\n'
-    printf '    1. R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_ACCOUNT_ID in .env pruefen.\n'
-    printf '    2. rclone lsf R2:<bucket>/ manuell testen.\n'
-    printf '    3. Dann erneut versuchen.\n\n'
-    return 1
+  log "R2-Verfuegbarkeit pruefen (db-assistent/ + db-rapt/)"
+  local _r2_assistent _r2_rapt
+  _r2_assistent="$(_check_r2_folder db-assistent)"
+  _r2_rapt="$(_check_r2_folder db-rapt)"
+
+  # Verbindungsfehler → sofortiger Abbruch (keine stille Kontinuierung).
+  _handle_r2_sentinel() {
+    local out="$1"
+    if [[ "$out" == R2_ERROR:* ]]; then
+      local _err_rest="${out#R2_ERROR:}"
+      local _err_folder="${_err_rest%%:*}"
+      local _err_snippet="${_err_rest#*:}"
+      [[ "$_err_snippet" == "$_err_folder" ]] && _err_snippet=""
+      printf '\n\033[1;31m✖ R2-Verbindung fehlgeschlagen (Ordner: %s).\033[0m\n' "$_err_folder"
+      [[ -n "$_err_snippet" ]] && printf '  rclone: %s\n' "$_err_snippet"
+      printf '  Ursache: Bad Credentials, Netzwerkfehler oder falscher Endpoint.\n'
+      printf '  1. R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_ACCOUNT_ID in .env pruefen.\n'
+      printf '  2. rclone lsf R2:<bucket>/ manuell testen.\n\n'
+      return 1
+    fi
+    return 0
+  }
+
+  if ! _handle_r2_sentinel "$_r2_assistent"; then return 1; fi
+  if ! _handle_r2_sentinel "$_r2_rapt"; then return 1; fi
+
+  # Leere Ordner: Skip-Meldung, aber weitere DB trotzdem restorieren.
+  local _do_assistent=1 _do_rapt=1
+  if [[ "$_r2_assistent" == EMPTY:* ]]; then
+    printf '\n\033[1;33m⚠ Kein *.fc.gpg in R2-Ordner db-assistent/ — db-assistent-Restore wird uebersprungen.\033[0m\n'
+    printf '  Tipp: ./scripts/backup.sh erstellt einen Dump, dann erneut versuchen.\n\n'
+    _do_assistent=0
   fi
-
-  if [[ -n "$_r2_check_out" ]]; then
-    printf '\n\033[1;33m⚠ Kein *.fc.gpg in R2-Ordner: %s\033[0m\n' "$_r2_check_out"
-    printf '  Sicherheitsnetz: kein Backup verfuegbar → Stack laeuft mit frischer DB weiter.\n'
-    printf '  Tipp: erst ein Backup erstellen (z.B. ./scripts/backup.sh), dann erneut versuchen.\n\n'
+  if [[ "$_r2_rapt" == EMPTY:* ]]; then
+    printf '\n\033[1;33m⚠ Kein *.fc.gpg in R2-Ordner db-rapt/ — db-rapt-Restore wird uebersprungen.\033[0m\n'
+    printf '  Tipp: ./scripts/backup.sh erstellt einen Dump, dann erneut versuchen.\n\n'
+    _do_rapt=0
+  fi
+  if (( _do_assistent == 0 && _do_rapt == 0 )); then
+    printf '  Beide Ordner leer — kein Restore moeglich. Stack laeuft mit frischer DB weiter.\n\n'
     return 0
   fi
-  ok "R2-Backup in supabase/ vorhanden (Whole-DB-Dump)"
+  ok "R2-Ordner verfuegbar (db-assistent: ${_do_assistent} / db-rapt: ${_do_rapt})"
 
-  # ---- Ueberschreib-Schutz: auth.users auf neuem VPS pruefen ----
-  # IMPORTANT 2-Fix: Heredoc ohne -e; psql-Fehler / leere Ausgabe → Sentinel "UNKNOWN",
-  # das der Aufrufer konservativ als "nicht leer" behandelt.
-  # TODO Phase 4: Auch db-rapt-Count pruefen (zwei stateful Units nach Per-App-DB-Pivot).
-  log "Ueberschreib-Schutz: auth.users-Count pruefen (db-assistent)"
-  local _existing_users
-  _existing_users="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+  # ---- Ueberschreib-Schutz: auth.users pro DB pruefen ----
+  # Pro DB: psql-Fehler / leere Ausgabe → Sentinel "UNKNOWN" → konservativ wie > 0 behandeln.
+  _count_auth_users() {
+    local db_unit="$1" pw_var="$2"
+    sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" DB_UNIT="$db_unit" PW_VAR="$pw_var" bash <<'EOSU'
 set -uo pipefail
 set -a; source "$APP_DIR/.env" || { printf 'UNKNOWN'; exit 0; }; set +a
-[[ -n "${ASSISTENT_POSTGRES_PASSWORD:-}" ]] \
-  || { printf 'UNKNOWN'; exit 0; }
-count="$(docker exec -e PGPASSWORD="$ASSISTENT_POSTGRES_PASSWORD" db-assistent \
+pw="${!PW_VAR:-}"
+[[ -n "$pw" ]] || { printf 'UNKNOWN'; exit 0; }
+count="$(docker exec -e PGPASSWORD="$pw" "$DB_UNIT" \
   psql -tA -U supabase_admin -d postgres \
   -c "SELECT count(*) FROM auth.users;" 2>/dev/null)"
 psql_exit=$?
@@ -2215,49 +2356,50 @@ if (( psql_exit != 0 )) || [[ -z "$count" ]]; then
 fi
 printf '%s' "${count//[[:space:]]/}"
 EOSU
-)"
-  _existing_users="${_existing_users//[[:space:]]/}"
+  }
 
-  # IMPORTANT 2-Fix: Konservative Auswertung:
-  #   Numerisch > 0  → Daten vorhanden (Warnung + force-restore-Prompt).
-  #   "UNKNOWN"      → DB-Status unbekannt (Fehler/psql-Timeout) → konservativ wie > 0 behandeln.
-  #   "0"            → frische leere DB → kein force-Prompt noetig.
+  local _assume_yes="${ASSUME_YES:-0}"
   local _force_needed=0
-  if [[ "$_existing_users" == "UNKNOWN" ]]; then
-    printf '\n\033[1;33m⚠ WARNUNG: auth.users-Count konnte nicht ermittelt werden (DB-Fehler oder POSTGRES_PASSWORD fehlt).\033[0m\n'
-    printf '  Konservative Annahme: DB koennte Daten enthalten — force-restore-Bestaetigung wird verlangt.\n\n'
-    _force_needed=1
-  elif [[ "$_existing_users" =~ ^[0-9]+$ ]] && (( _existing_users > 0 )); then
-    printf '\n\033[1;33m⚠ WARNUNG: Auf diesem VPS existieren bereits %s auth.users.\033[0m\n' \
-      "$_existing_users"
-    printf '  Ein Restore (--clean) wuerde diese vorhandenen Daten ueberschreiben.\n'
-    printf '  Szenarien:\n'
-    printf '    a) Frischer VPS — diese Benutzer sind nur die Initialdaten (gewollt).\n'
-    printf '    b) Bereits produktiver VPS — Restore wuerde echte Nutzerdaten zerstoeren!\n\n'
-    _force_needed=1
+
+  _overwrite_guard() {
+    local db_unit="$1" pw_var="$2"
+    local _users
+    _users="$(_count_auth_users "$db_unit" "$pw_var")"
+    _users="${_users//[[:space:]]/}"
+    log "Ueberschreib-Schutz: auth.users-Count pruefen (${db_unit})"
+    if [[ "$_users" == "UNKNOWN" ]]; then
+      printf '\n\033[1;33m⚠ WARNUNG: auth.users-Count fuer %s nicht ermittelbar.\033[0m\n' "$db_unit"
+      printf '  Konservative Annahme: DB koennte Daten enthalten — force-restore wird verlangt.\n\n'
+      if [[ "$_assume_yes" == "1" ]]; then
+        printf '\033[1;31m✖ UNKNOWN DB-State + ASSUME_YES=1 — automatisierter Restore verweigert (%s).\033[0m\n' "$db_unit" >&2
+        printf '  DB-Health zuerst klaeren (%s in .env + Container pruefen).\n' "$pw_var" >&2
+        return 1
+      fi
+      _force_needed=1
+    elif [[ "$_users" =~ ^[0-9]+$ ]] && (( _users > 0 )); then
+      printf '\n\033[1;33m⚠ WARNUNG: Auf diesem VPS existieren bereits %s auth.users (%s).\033[0m\n' \
+        "$_users" "$db_unit"
+      printf '  Ein Restore (--clean) wuerde diese vorhandenen Daten ueberschreiben.\n\n'
+      _force_needed=1
+    fi
+  }
+
+  if (( _do_assistent == 1 )); then
+    _overwrite_guard "db-assistent" "ASSISTENT_POSTGRES_PASSWORD" || return 1
+  fi
+  if (( _do_rapt == 1 )); then
+    _overwrite_guard "db-rapt" "RAPT_POSTGRES_PASSWORD" || return 1
   fi
 
   # ---- Sicherheits-Bestaetigung ----
   printf '\n\033[1;34m▶ Restore-Plan — bitte bestaetigen\033[0m\n\n'
-  printf '  Quelle:  juengstes Whole-DB-Backup aus R2 (supabase/, latest)\n'
-  printf '  Ziel:    Container db-assistent → DB postgres\n'
-  printf '  Aktion:  ein Whole-DB pg_restore (restore.sh all latest)\n'
-  printf '  ACHTUNG: --clean droppt vorhandene Objekte vor dem Neuanlegen.\n\n'
-
-  # IMPORTANT 1-Fix: ASSUME_YES ist implementiert (konsistent mit restore.sh --yes-Muster).
-  # Setzt force-restore UND restore-Bestaetigung im Nicht-TTY-Modus voraus.
-  # Nur in Kombination mit nicht-leerem / nicht-UNKNOWN users-Count tatsaechlich genutzt.
-  local _assume_yes="${ASSUME_YES:-0}"
-
-  # BLOCKER-Fix: UNKNOWN + ASSUME_YES=1 → harter Abbruch.
-  # UNKNOWN bedeutet DB-Zustand unklar (kein POSTGRES_PASSWORD, psql-Timeout, …) —
-  # kein automatisierter destruktiver Restore gegen unbekannten Zustand.
-  # Bei TTY + UNKNOWN bleibt der konservative force-restore-Prompt (s. u.).
-  if [[ "$_existing_users" == "UNKNOWN" && "$_assume_yes" == "1" ]]; then
-    printf '\033[1;31m✖ UNKNOWN DB-State + ASSUME_YES=1 — automatisierter destruktiver Restore verweigert.\033[0m\n' >&2
-    printf '  DB-Health zuerst klaeren (ASSISTENT_POSTGRES_PASSWORD in .env pruefen, db-assistent-Container pruefen).\n' >&2
-    return 1
+  if (( _do_assistent == 1 )); then
+    printf '  db-assistent: juengstes Backup aus R2 db-assistent/ (latest)\n'
   fi
+  if (( _do_rapt == 1 )); then
+    printf '  db-rapt:      juengstes Backup aus R2 db-rapt/ (latest)\n'
+  fi
+  printf '  ACHTUNG: --clean droppt vorhandene Objekte vor dem Neuanlegen.\n\n'
 
   if (( _force_needed == 1 )); then
     if [[ -t 0 ]]; then
@@ -2289,23 +2431,43 @@ EOSU
     return 0
   fi
 
-  # ---- Restore: Whole-DB aus supabase/ ----
-  # restore.sh all latest --yes: ein Whole-DB pg_restore, Bestaetigung bereits eingeholt.
-  log "Restore: Whole-DB aus R2 supabase/ (latest)"
-  sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+  # ---- Restore: pro DB unabhaengig ----
+  # restore.sh db-assistent latest --yes
+  #   → kein TimescaleDB in assistent-DB (Extension-Guard uebersprungen automatisch)
+  # restore.sh db-rapt latest --yes
+  #   → TimescaleDB-pre/post_restore-Hooks feuern automatisch via Extension-Guard
+  if (( _do_assistent == 1 )); then
+    log "Restore: db-assistent (latest aus R2 db-assistent/)"
+    sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
 set -euo pipefail
 cd "$APP_DIR"
-./scripts/restore.sh all latest --yes
+./scripts/restore.sh db-assistent latest --yes
 EOSU
+    ok "db-assistent Restore abgeschlossen"
+  fi
 
-  ok "Restore abgeschlossen"
+  if (( _do_rapt == 1 )); then
+    log "Restore: db-rapt (latest aus R2 db-rapt/ — TimescaleDB-Hooks via Extension-Guard)"
+    sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+set -euo pipefail
+cd "$APP_DIR"
+./scripts/restore.sh db-rapt latest --yes
+EOSU
+    ok "db-rapt Restore abgeschlossen"
+  fi
 
   # ---- Abschluss ----
-  _ensure_supabase_marker
+  if (( _do_assistent == 1 )); then _ensure_db_marker db-assistent; fi
+  if (( _do_rapt == 1 ));      then _ensure_db_marker db-rapt; fi
   cf_reconcile_if_token
 
-  printf '\n\033[1;32m  ✓ R2-Restore abgeschlossen — Supabase laeuft mit den Daten aus R2.\033[0m\n'
-  printf '  Smoke-Check: Login in der App + je eine Query auf aibrewgenius.* und rapt.*\n\n'
+  printf '\n\033[1;32m  ✓ R2-Restore abgeschlossen.\033[0m\n'
+  printf '  Smoke-Check: Login in der App + je eine Query auf aibrewgenius.* und rapt.*\n'
+  if (( _do_rapt == 1 )); then
+    printf '  db-rapt: rapt.brew_sessions, rapt.telemetry_controllers, rapt.telemetry_hydrometers pruefen\n'
+    printf '  (0-Count auf telemetry_* = Indikator fuer kaputte TimescaleDB-Chunk-Verknuepfung).\n'
+  fi
+  printf '\n'
 }
 
 # ================================================================
@@ -2387,16 +2549,18 @@ cat <<EOF
   ./scripts/cloudflare-reconcile.sh (idempotent).
 
   Backups      nightly 03:00 (cron, als ${APP_USER}, kein sudo) → R2, ein
-               verschluesselter Whole-DB-Dump (supabase/supabase_<TS>.fc.gpg).
+               GPG-verschluesselter Whole-DB-Dump pro App-DB:
+                 db-assistent_<TS>.fc.gpg → R2 db-assistent/
+                 db-rapt_<TS>.fc.gpg      → R2 db-rapt/
                Retention: neueste N=7 pro Ordner (lokal + R2), via BACKUP_KEEP.
                Manuell (als ${APP_USER}): ./scripts/backup.sh
   Backup-Log   tail -f /var/log/brewing-backup.log
-  Restore      ./scripts/restore.sh all       (Whole-DB, manuell, destruktiv)
-               ./scripts/restore.sh rapt      (selektiv Schema rapt, aus supabase/-Dump)
-               ./scripts/restore.sh aibrewgenius (selektiv Schema aibrewgenius)
+  Restore      ./scripts/restore.sh db-assistent  (aibrewgenius + auth, manuell, destruktiv)
+               ./scripts/restore.sh db-rapt       (rapt + auth + TimescaleDB-Hooks)
+               ./scripts/restore.sh all           (beide DBs nacheinander)
 
   Erstdaten    Menü-Option 3 "Erstdaten aus R2 wiederherstellen" — zieht den juengsten
-               Whole-DB-Dump (latest) aus R2 supabase/ und restored ihn (ein pg_restore).
+               Dump (latest) aus R2 db-assistent/ + db-rapt/ und restored pro DB.
                Nur auf frischem VPS: destruktiv, explizite Bestaetigung erforderlich.
                Voraussetzung: R2-Creds in .env + Backup in R2 vorhanden.
 

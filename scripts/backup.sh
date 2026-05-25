@@ -1,34 +1,42 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Brewing-Stack Postgres-Backup — Variante A (konsistenter Whole-DB-Dump, off-site)
+# Brewing-Stack Postgres-Backup — Variante A (konsistente Whole-DB-Dumps, off-site)
 #
 # Marker-gesteuert: welche Jobs laufen, leitet backup.sh aus den installierten
 # stateful Units unter $STATEFUL_UNITS_DIR (/etc/brewing/stateful-units.d/) ab.
 # Auf einem stateless-only VPS (kein Marker) → sauberer No-op, Exit 0.
 #
-# EIN pg_dump -Fc der gesamten DB als supabase_admin, direkt durch GPG gestreamt
-# (kein Klartext-Dump landet je auf Platte):
+# ZWEI unabhängige App-DBs, je ein konsistenter Whole-DB-pg_dump -Fc:
 #
-#   docker exec supabase-db pg_dump -Fc -U supabase_admin -d postgres
-#     │
-#     ▼  gpg --batch --symmetric --cipher-algo AES256 (gleiche Passphrase wie .env.gpg)
-#     ▼
-#   backups/supabase/supabase_<TS>[_<label>].fc.gpg   ──►  Upload R2 backup/supabase/
+#   Unit 'db-assistent':
+#     docker exec db-assistent pg_dump -Fc -U supabase_admin -d postgres
+#       | gpg --batch --symmetric AES256
+#       → backups/db-assistent/db-assistent_<TS>[_<label>].fc.gpg
+#       → R2 backup/db-assistent/
+#     Kein TimescaleDB (keine Hypertables in der assistent-DB).
 #
-#   Unit 'supabase' — ein Job:
-#   1. supabase  → pg_dump (ganzer DB-Dump, kein --exclude-schema / -n)
-#                  (auth + storage + public + _realtime + aibrewgenius + rapt + Rest)
+#   Unit 'db-rapt':
+#     docker exec db-rapt pg_dump -Fc -U supabase_admin -d postgres
+#       | gpg --batch --symmetric AES256
+#       → backups/db-rapt/db-rapt_<TS>[_<label>].fc.gpg
+#       → R2 backup/db-rapt/
+#     TimescaleDB: Hypertables (telemetry_*) — restore.sh erkennt Extension automatisch.
+#
+#   Unit 'mail':
+#     poste-data → tar | gpg → backups/mail/poste_<TS>.tar.gpg → R2 backup/mail/
 #
 # KONSISTENZ: Ein einzelner pg_dump -Fc erzeugt per Definition EINEN konsistenten
-# Transaktions-Snapshot der gesamten DB — kein Cross-Dump-FK-Inkonsistenz-Fenster.
-# Das frühere 3-fach-Dump-Modell (back-to-back, kein gemeinsamer Snapshot) ist damit
-# eliminiert. Selektiver Schema-Restore (aibrewgenius / rapt) bleibt erhalten via
-# pg_restore --schema=... aus demselben einen Dump (→ restore.sh).
+# Transaktions-Snapshot der jeweiligen DB — kein Cross-Dump-FK-Inkonsistenz-Fenster.
+#
+# PASSWORT-HANDLING: PGPASSWORD wird pro Job via 'docker exec -e PGPASSWORD=…'
+# in den Container gesetzt — nie in der Host-argv (nicht ps-sichtbar).
+# Passwort-Var wird nur für den aktiven Job geprüft: ein VPS mit nur db-assistent
+# schlägt nicht wegen fehlendem RAPT_POSTGRES_PASSWORD fehl.
 #
 # Manuell:        ./scripts/backup.sh
 # Pre-Migration:  ./scripts/backup.sh --label pre-migration   (rotation-exempt)
 # Nur lokal:      ./scripts/backup.sh --no-upload
-# Aus cron:       /home/alex/webPage_infra/scripts/backup.sh   (nightly ~03:00, als alex)
+# Aus cron:       /home/alex/webPage_infra/scripts/backup.sh  (nightly ~03:00, als alex)
 #
 # Passphrase: --passphrase-file /etc/brewing/gpg.pass (von bootstrap.sh, mode 600,
 #             owner alex) oder $GPG_PASS_FILE / $GPG_PASSPHRASE / interaktiv.
@@ -54,7 +62,6 @@ cd "$(dirname "$0")/.."
 REPO_DIR="$(pwd)"
 ENV_FILE="${REPO_DIR}/.env"
 BACKUP_DIR="${REPO_DIR}/backups"
-DB_CONTAINER="${DB_CONTAINER:-supabase-db}"
 PASS_FILE="${GPG_PASS_FILE:-/etc/brewing/gpg.pass}"
 # Retention: neueste N pro Ordner behalten (lokal + R2). Gelabelte Dumps exempt.
 BACKUP_KEEP="${BACKUP_KEEP:-7}"
@@ -78,8 +85,13 @@ Usage: $0 [--label <name>] [--no-upload]
 Welche Jobs laufen, wird aus den Markern in \$STATEFUL_UNITS_DIR
 (${STATEFUL_UNITS_DIR}) abgeleitet. Kein Marker → No-op, Exit 0.
 
-Unit 'supabase' erzeugt einen Whole-DB-Dump:
-  backups/supabase/supabase_<TS>.fc.gpg
+Bekannte Units:
+  db-assistent → pg_dump gegen Container db-assistent (ASSISTENT_POSTGRES_PASSWORD)
+                 backups/db-assistent/db-assistent_<TS>.fc.gpg → R2 backup/db-assistent/
+  db-rapt      → pg_dump gegen Container db-rapt (RAPT_POSTGRES_PASSWORD)
+                 backups/db-rapt/db-rapt_<TS>.fc.gpg → R2 backup/db-rapt/
+  mail         → tar|gpg des poste-data-Verzeichnisses
+                 backups/mail/poste_<TS>.tar.gpg → R2 backup/mail/
 EOF
   exit 1
 }
@@ -115,10 +127,13 @@ fi
 # type ist optional: pg (default, pg_dump) oder tar (Verzeichnis-Archiv).
 unit_jobs() {
   case "$1" in
-    supabase)
-      # Ein konsistenter Whole-DB-Dump: kein -n / --exclude-schema.
-      # Früher 3 separate Dumps (core/aibrewgenius/rapt) — jetzt ein einziger Snapshot.
-      printf '%s\n' "supabase supabase pg"
+    db-assistent)
+      # Whole-DB-Dump gegen Container db-assistent (assistent-App-DB, kein TimescaleDB).
+      printf '%s\n' "db-assistent db-assistent pg"
+      ;;
+    db-rapt)
+      # Whole-DB-Dump gegen Container db-rapt (rapt-App-DB, TimescaleDB/Hypertables).
+      printf '%s\n' "db-rapt db-rapt pg"
       ;;
     mail)
       # poste-data ist ein Verzeichnis (kein Postgres-DB) → tar | gpg statt pg_dump.
@@ -170,11 +185,15 @@ command -v docker >/dev/null 2>&1 || err "docker fehlt"
 command -v gpg    >/dev/null 2>&1 || err "gpg fehlt"
 [[ -f "$ENV_FILE" ]] || err "Keine .env — erst ./scripts/decrypt-env.sh"
 
-# supabase-db-Check: nur wenn supabase-Jobs aktiv (Marker gesetzt).
+# Container-Checks: pro aktiver DB-Unit den richtigen Container prüfen.
 # Fehlt der Container obwohl Marker da → echter Fehlerfall, Hard-Fail korrekt.
-if [[ -d "$STATEFUL_UNITS_DIR" ]] && [[ -f "${STATEFUL_UNITS_DIR}/supabase" ]]; then
-  docker inspect "$DB_CONTAINER" >/dev/null 2>&1 \
-    || err "Container '$DB_CONTAINER' läuft nicht — Stack starten (docker compose ... up -d)"
+if [[ -d "$STATEFUL_UNITS_DIR" ]] && [[ -f "${STATEFUL_UNITS_DIR}/db-assistent" ]]; then
+  docker inspect db-assistent >/dev/null 2>&1 \
+    || err "Container 'db-assistent' läuft nicht — Stack starten (docker compose ... up -d)"
+fi
+if [[ -d "$STATEFUL_UNITS_DIR" ]] && [[ -f "${STATEFUL_UNITS_DIR}/db-rapt" ]]; then
+  docker inspect db-rapt >/dev/null 2>&1 \
+    || err "Container 'db-rapt' läuft nicht — Stack starten (docker compose ... up -d)"
 fi
 
 # posteio-Check: nur wenn mail-Job aktiv (Marker gesetzt).
@@ -187,12 +206,40 @@ fi
 mkdir -p "$BACKUP_DIR"
 
 # .env nur in dieser Subshell laden (kein Leak nach außen) — brauchen
-# POSTGRES_PASSWORD + die R2_*-Variablen.
+# *_POSTGRES_PASSWORD-Variablen + die R2_*-Variablen.
 set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 set +a
-: "${POSTGRES_PASSWORD:?fehlt in .env}"
+
+# ---------------------------------------------------------------- Per-Job: Container + Passwort-Resolver
+# db_container_for <folder>: gibt den Container-Namen für einen pg-Job zurück.
+db_container_for() {
+  case "$1" in
+    db-assistent) printf 'db-assistent' ;;
+    db-rapt)      printf 'db-rapt' ;;
+    *)            err "db_container_for: unbekannter Ordner '$1'" ;;
+  esac
+}
+
+# db_password_for <folder>: gibt das PGPASSWORD (aus bereits gesourctem .env) zurück.
+# Fehlende Var wird hier explizit geprüft (A3: nur die für den aktiven Job nötige Var).
+db_password_for() {
+  case "$1" in
+    db-assistent)
+      [[ -n "${ASSISTENT_POSTGRES_PASSWORD:-}" ]] \
+        || err "ASSISTENT_POSTGRES_PASSWORD fehlt in .env — für Job 'db-assistent' erforderlich"
+      printf '%s' "$ASSISTENT_POSTGRES_PASSWORD"
+      ;;
+    db-rapt)
+      [[ -n "${RAPT_POSTGRES_PASSWORD:-}" ]] \
+        || err "RAPT_POSTGRES_PASSWORD fehlt in .env — für Job 'db-rapt' erforderlich"
+      printf '%s' "$RAPT_POSTGRES_PASSWORD"
+      ;;
+    *)
+      err "db_password_for: unbekannter Ordner '$1'" ;;
+  esac
+}
 
 # ---------------------------------------------------------------- Passphrase
 # Quelle: root-only Datei (cron) > $GPG_PASSPHRASE (Env) > interaktiver Prompt.
@@ -214,25 +261,10 @@ else
 fi
 [[ -s "$PASS_TMP" ]] || err "Passphrase ist leer"
 
-# ---------------------------------------------------------------- pg_dump-Argumente je Ordner
-# dump_args() wird von dump_one() aufgerufen und gibt die pg_dump-Schema-Argumente
-# für einen folder-Wert zurück (als Wort-Liste via echo).
-# Die FOLDERS/STEMS-Arrays werden marker-gesteuert oben befüllt; dump_args() ist
-# die Job-Definition (was gedumpt wird) und bleibt davon getrennt.
-#
-# supabase → kein -n / --exclude-schema → Whole-DB-Dump (alle Schemas in einer
-# konsistenten Transaktion). Frühere Einzel-Schema-Zweige entfernt.
-dump_args() {
-  case "$1" in
-    supabase) printf '' ;;   # Whole-DB: keine Schema-Einschränkung (leere Ausgabe = keine pg_dump-Flags)
-    *)        err "Unbekannter Backup-Ordner: $1" ;;
-  esac
-}
-
 TS="$(date +%Y%m%d_%H%M%S)"
 
 # ---------------------------------------------------------------- Dump → GPG
-# Ein Whole-DB-Dump pro supabase-Unit: ein konsistenter Transaktions-Snapshot.
+# Ein Whole-DB-Dump pro DB-Unit: ein konsistenter Transaktions-Snapshot.
 declare -a PRODUCED_FILES=()   # für Upload + Abschlussreport
 
 dump_one() {
@@ -243,17 +275,17 @@ dump_one() {
   [[ -n "$LABEL" ]] && base="${base}_${LABEL}"
   local out="${dir}/${base}.fc.gpg"
 
-  # pg_dump-Schema-Argumente aus dump_args(); bewusst gewortsplittet.
-  # Whole-DB-Dump (supabase) liefert leeren String → leeres Array, keine Argumente.
-  local _da pgargs=()
-  _da="$(dump_args "$folder")"
-  [[ -n "$_da" ]] && read -ra pgargs <<< "$_da"
+  # Container + Passwort per-Job bestimmen (A2: kein fixer globaler DB_CONTAINER).
+  local container pgpassword
+  container="$(db_container_for "$folder")"
+  pgpassword="$(db_password_for "$folder")"
 
   log "Dump '${folder}' → ${folder}/${out##*/}"
   # PGPASSWORD wird im Container gesetzt (-e), erscheint nicht in der Host-argv.
+  # Whole-DB-Dump: kein --schema / -n — alle Schemas in einem konsistenten Snapshot.
   # pipefail (oben) macht die Pipe rot, wenn pg_dump fehlschlägt.
-  if ! docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" "$DB_CONTAINER" \
-         pg_dump -Fc -U supabase_admin -d postgres "${pgargs[@]}" \
+  if ! docker exec -e PGPASSWORD="$pgpassword" "$container" \
+         pg_dump -Fc -U supabase_admin -d postgres \
        | gpg --batch --yes --symmetric --cipher-algo AES256 \
              --pinentry-mode loopback --passphrase-file "$PASS_TMP" \
              -o "$out"; then
@@ -403,8 +435,8 @@ upload_r2() {
 # bereits gelaufen ist (RCLONE_CONFIG_R2_* gesetzt). Liefert keinen harten
 # Fehler bei leerem/fehlendem Ordner; nur echte rclone-delete-Fehler brechen ab.
 #   $1 base   z.B. "R2:${R2_BUCKET}"  (oder ein Test-Prefix)
-#   $2 folder z.B. "_supabase_core"
-#   $3 stem   z.B. "core"   (filtert gelabelte Dumps wie das lokale Pendant)
+#   $2 folder z.B. "db-assistent"
+#   $3 stem   z.B. "db-assistent"  (filtert gelabelte Dumps wie das lokale Pendant)
 prune_r2_folder() {
   local base="$1" folder="$2" stem="$3" jtype="${4:-pg}"
   local path="${base}/${folder}/"
