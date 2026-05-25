@@ -77,6 +77,20 @@ The proxy runs against the live local stack (`webPage_infra` up; proxy is servic
 - **No `service_role` key**, ever. **No new npm dependencies** without explicit authorization. **No plaintext secret files.** **No framework migration** (stay on raw `http`).
 - **No commit/push unless explicitly asked. No `--no-verify`. No force-push.**
 
+# Review-Loop — erst fertig, wenn dein Reviewer `Review-Gate: PASS` meldet (VERBINDLICH)
+
+Implementieren + Selbsttest ist NICHT das Ende deiner Aufgabe. Jede Änderung muss einen Review durch **`proxy-reviewer`** bestehen, bevor sie als erledigt gilt. Du kannst den Reviewer nicht selbst starten (du hast kein `Agent`-Tool) — das übernimmt der Orchestrator. Deine Aufgabe ist, den Loop über eine saubere Übergabe zu treiben:
+
+1. Implementieren + selbst testen wie in diesem Agent definiert.
+2. **Zur Review übergeben:** beende deine Antwort mit der Handoff-Zeile aus dem Output-Format, damit der Orchestrator `proxy-reviewer` auf deine Änderungen ansetzt.
+3. **Wenn du mit Review-Befunden erneut aufgerufen wirst:** behebe JEDEN `Critical`- und `Important`-Befund. `Suggestions` sind optional — umsetzen oder explizit begründet ablehnen. Teste neu, was du angefasst hast (Auth-Probe 401/200 + Happy/Error-Pfad).
+4. **Erneut übergeben** zur Re-Review. Wiederhole 2–4, bis der Reviewer `Review-Gate: PASS` meldet (null Critical, null Important).
+5. Erst dann ist die Aufgabe erledigt.
+
+- Erkläre NIE „fertig", solange ein Critical oder Important offen ist.
+- Argumentiere einen Critical/Important nicht still weg. Hältst du einen Befund für sachlich falsch, schreib das explizit in die Handoff-Zeile und lass den Reviewer neu urteilen — überspring ihn nicht kommentarlos.
+- **Schleifen-Schutz:** Überlebt derselbe Critical/Important 3 Iterationen (nicht behebbar, oder echte Uneinigkeit mit dem Reviewer), brich den Loop ab und leg den offenen Befund dem User vor — dreh dich nicht endlos im Kreis.
+
 # Output when finished
 
 Reply with this exact structure — no preamble, no closing summary:
@@ -90,6 +104,7 @@ Auth-boundary impact: <none / which routes changed gating, expected status chang
 Cross-team handoff: <none / what dba-coder or cicd-coder must do>
 Credential steps needed from user: <none / the specific step(s)>
 Open / for proxy-reviewer: <anything to double-check, esp. auth gating, secret handling, SSRF, cost>
+Review-Handoff: REVIEW REQUIRED → proxy-reviewer  (Iteration <N>; Einwände gegen Befunde: <keine / welche>)
 ```
 
 Be concrete. If a credential step blocks completion, do everything else first, then surface exactly that one step.

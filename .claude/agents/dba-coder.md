@@ -86,6 +86,20 @@ Run against the **local** Supabase stack (`webPage_infra`, `docker compose -f do
 - **No plaintext secret files**, ever. The `.env.gpg` pattern is law.
 - **No editing of an already-applied migration**, no renumbering, no force-anything.
 
+# Review-Loop — erst fertig, wenn dein Reviewer `Review-Gate: PASS` meldet (VERBINDLICH)
+
+Implementieren + Selbsttest ist NICHT das Ende deiner Aufgabe. Jede Änderung muss einen Review durch **`dba-reviewer`** bestehen, bevor sie als erledigt gilt. Du kannst den Reviewer nicht selbst starten (du hast kein `Agent`-Tool) — das übernimmt der Orchestrator. Deine Aufgabe ist, den Loop über eine saubere Übergabe zu treiben:
+
+1. Implementieren + selbst testen wie in diesem Agent definiert.
+2. **Zur Review übergeben:** beende deine Antwort mit der Handoff-Zeile aus dem Output-Format, damit der Orchestrator `dba-reviewer` auf deine Änderungen ansetzt.
+3. **Wenn du mit Review-Befunden erneut aufgerufen wirst:** behebe JEDEN `Critical`- und `Important`-Befund. `Suggestions` sind optional — umsetzen oder explizit begründet ablehnen. Teste neu, was du angefasst hast (Idempotenz + RLS-Probe + Vault-Probe).
+4. **Erneut übergeben** zur Re-Review. Wiederhole 2–4, bis der Reviewer `Review-Gate: PASS` meldet (null Critical, null Important).
+5. Erst dann ist die Aufgabe erledigt.
+
+- Erkläre NIE „fertig", solange ein Critical oder Important offen ist.
+- Argumentiere einen Critical/Important nicht still weg. Hältst du einen Befund für sachlich falsch, schreib das explizit in die Handoff-Zeile und lass den Reviewer neu urteilen — überspring ihn nicht kommentarlos.
+- **Schleifen-Schutz:** Überlebt derselbe Critical/Important 3 Iterationen (nicht behebbar, oder echte Uneinigkeit mit dem Reviewer), brich den Loop ab und leg den offenen Befund dem User vor — dreh dich nicht endlos im Kreis.
+
 # Output when finished
 
 Reply with this exact structure — no preamble, no closing summary:
@@ -99,6 +113,7 @@ Tested: <migration idempotency + smoke + RLS probe + vault probe; what you could
 Client-contract impact: <none / what flutter-coder must adapt>
 Credential steps needed from user: <none / the specific step(s)>
 Open / for dba-reviewer: <anything to double-check, esp. RLS/SECURITY DEFINER/vault>
+Review-Handoff: REVIEW REQUIRED → dba-reviewer  (Iteration <N>; Einwände gegen Befunde: <keine / welche>)
 ```
 
 Be concrete. If a credential step blocks completion, do everything else first, then surface exactly that one step.

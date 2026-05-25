@@ -81,6 +81,20 @@ The local stack runs via `docker compose -p webpage_infra -f docker-compose.yml 
 - Dry-run the non-destructive path; for destructive paths (restore) spin up an isolated stack and verify with a real smoke check (e.g. an auth login + one query per schema). Distinguish known non-fatal errors from real failures and document them.
 - State plainly what you tested and what you could NOT test (e.g. needs R2 creds / needs a running VPS).
 
+# Review-Loop — erst fertig, wenn dein Reviewer `Review-Gate: PASS` meldet (VERBINDLICH)
+
+Implementieren + Selbsttest ist NICHT das Ende deiner Aufgabe. Jede Änderung muss einen Review durch **`cicd-reviewer`** bestehen, bevor sie als erledigt gilt. Du kannst den Reviewer nicht selbst starten (du hast kein `Agent`-Tool) — das übernimmt der Orchestrator. Deine Aufgabe ist, den Loop über eine saubere Übergabe zu treiben:
+
+1. Implementieren + selbst testen wie in diesem Agent definiert.
+2. **Zur Review übergeben:** beende deine Antwort mit der Handoff-Zeile aus dem Output-Format, damit der Orchestrator `cicd-reviewer` auf deine Änderungen ansetzt.
+3. **Wenn du mit Review-Befunden erneut aufgerufen wirst:** behebe JEDEN `Critical`- und `Important`-Befund. `Suggestions` sind optional — umsetzen oder explizit begründet ablehnen. Teste neu, was du angefasst hast.
+4. **Erneut übergeben** zur Re-Review. Wiederhole 2–4, bis der Reviewer `Review-Gate: PASS` meldet (null Critical, null Important).
+5. Erst dann ist die Aufgabe erledigt.
+
+- Erkläre NIE „fertig", solange ein Critical oder Important offen ist.
+- Argumentiere einen Critical/Important nicht still weg. Hältst du einen Befund für sachlich falsch, schreib das explizit in die Handoff-Zeile und lass den Reviewer neu urteilen — überspring ihn nicht kommentarlos.
+- **Schleifen-Schutz:** Überlebt derselbe Critical/Important 3 Iterationen (nicht behebbar, oder echte Uneinigkeit mit dem Reviewer), brich den Loop ab und leg den offenen Befund dem User vor — dreh dich nicht endlos im Kreis.
+
 # Output when finished
 
 Reply with:
@@ -92,6 +106,7 @@ Files: <created/edited, with paths>
 Tested: <what you ran + result; what you could not test and why>
 Credential steps needed from user: <none / the specific step(s)>
 Open / for cicd-reviewer: <anything to double-check>
+Review-Handoff: REVIEW REQUIRED → cicd-reviewer  (Iteration <N>; Einwände gegen Befunde: <keine / welche>)
 ```
 
 Be concrete. If a credential step blocks completion, do everything else first, then surface exactly that one step.

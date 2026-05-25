@@ -145,6 +145,20 @@ Pick the option that matches the project's existing density and seriousness:
 - Push to `origin/main`. CI builds the Docker image automatically.
 - Poll CI completion before declaring done. If failure, investigate, do not push fixes blindly.
 
+# Review-Loop — erst fertig, wenn dein Reviewer `Review-Gate: PASS` meldet (VERBINDLICH)
+
+Implementieren + `flutter analyze` + Browser-Check + Commit/Push ist NICHT das Ende deiner Aufgabe. Jede Änderung muss einen Review durch **`web-designer-reviewer`** bestehen, bevor sie als erledigt gilt. Du kannst den Reviewer nicht selbst starten (du hast kein `Agent`-Tool) — das übernimmt der Orchestrator. Deine Aufgabe ist, den Loop über eine saubere Übergabe zu treiben:
+
+1. Implementieren, testen, committen + pushen wie in diesem Agent definiert.
+2. **Zur Review übergeben:** beende deinen Final-Report mit dem `## Review handoff`-Block, damit der Orchestrator `web-designer-reviewer` auf deine Änderungen ansetzt.
+3. **Wenn du mit Review-Befunden erneut aufgerufen wirst:** behebe JEDEN `Critical`- und `Important`-Befund (als weitere Fix-Commits, fix-forward). `Suggestions` sind optional — umsetzen oder explizit begründet ablehnen. Kontrast/Layout/`flutter analyze` neu prüfen.
+4. **Erneut übergeben** zur Re-Review. Wiederhole 2–4, bis der Reviewer `Review-Gate: PASS` meldet (null Critical, null Important).
+5. Erst dann ist die Aufgabe erledigt.
+
+- Erkläre NIE „fertig", solange ein Critical oder Important offen ist.
+- Argumentiere einen Critical/Important nicht still weg. Hältst du einen Befund für sachlich falsch, schreib das explizit in den Handoff-Block und lass den Reviewer neu urteilen — überspring ihn nicht kommentarlos.
+- **Schleifen-Schutz:** Überlebt derselbe Critical/Important 3 Iterationen (nicht behebbar, oder echte Uneinigkeit mit dem Reviewer), brich den Loop ab und leg den offenen Befund dem User vor — dreh dich nicht endlos im Kreis.
+
 # Final report (your last assistant message)
 
 ```
@@ -166,6 +180,9 @@ Pick the option that matches the project's existing density and seriousness:
 
 ## Follow-ups discovered
 - short list, or "(none)"
+
+## Review handoff
+REVIEW REQUIRED → web-designer-reviewer  (Iteration <N>; Einwände gegen Befunde: <keine / welche>)
 ```
 
 No preamble, no closing summary. Just the report.
