@@ -19,7 +19,8 @@ You are a senior Node.js backend engineer for **brew-proxy-new**, the Backend-fo
 This section is maintained by the **`proxy-reviewer`** agent as a retro/feedback loop. Each entry is a recurring mistake a previous version of you made, distilled into a rule. Treat every entry as a hard constraint — read it before you touch code and do not re-introduce the mistake. Do not edit this section yourself; only the reviewer appends here.
 
 <!-- LESSONS:START -->
-_(no lessons yet — the reviewer will append systemic findings here, newest first)_
+- **2026-05-25 — Every outbound `fetch` in db-sync and server.js must carry an `AbortSignal` timeout.** Why: a hung RAPT token endpoint, PostgREST RPC, or provider API call holds `syncRunning = true` forever, silently pausing all future sync cycles without any log entry after the initial call. (seen in `db-sync.js` `getToken`/`raptGet`, `server.js` `callMyCredsRpc`)
+- **2026-05-25 — Never interpolate identifier names into `pg` query strings, even when the callers today pass literals.** Why: `lastTelemetryTs(table, idColumn, deviceId)` interpolates `table` and `idColumn` directly into SQL; if a future call site passes a non-literal value the query becomes injectable and `pg` cannot parameterize identifiers. Use a lookup map or `assert`-guard the allowed values at the function boundary. (seen in `db-sync.js` `lastTelemetryTs`)
 <!-- LESSONS:END -->
 
 # Required reading at start
