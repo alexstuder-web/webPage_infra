@@ -392,6 +392,54 @@ services:
     networks:
       - brewing_net
 
+  # ==========================================================================
+  # MAILSERVER  (Poste.io — All-in-one SMTP/IMAP/Webmail, versionsgepinnt)
+  # ==========================================================================
+  #
+  # Mail ist die bewusste Ausnahme zum Tunnel-Only-Prinzip (offene Inbound-Ports
+  # 25/465/587/143/993 + ungeproxytes A-Record). Freigabe erteilt 2026-05-25.
+  # Kein Watchtower-Label — versionsgepinnt analog Supabase/Portainer.
+  #
+  # Webmail/Admin-UI (Port 80 container-intern) wird NICHT als Host-Port
+  # gemappt, sondern über den Cloudflare-Tunnel exponiert:
+  #   webmail.${MAIL_DOMAIN} → http://posteio:80  (routes.json + reconcile)
+  # HTTPS=OFF: Poste.io liefert intern Plain-HTTP; Cloudflare terminiert TLS am Edge.
+  #
+  # Aktivierung: bootstrap.sh-Menü → "Mailserver (Poste.io)" auswählen.
+  # Marker: /etc/brewing/stateful-units.d/mail
+  # Backup: scripts/backup.sh (archive_one, tar | gpg → backups/mail/)
+  # DNS:    scripts/cloudflare-reconcile.sh (MX/A-unproxied/SPF/DMARC)
+  # Cert:   certbot DNS-01 → bootstrap._mail_provision_cert
+
+  posteio:
+    container_name: posteio
+    # Gepinnte Version — KEIN Watchtower-Label (versionsgepinnt wie Supabase/Portainer).
+    # analogic/poste.io 2.4 ist der aktuelle stabile Release-Zweig.
+    image: analogic/poste.io:2.4
+    restart: unless-stopped
+    hostname: ${MAIL_HOSTNAME:-mail.alexstuder.cloud}
+    ports:
+      - "25:25"     # SMTP  (eingehende Mail von anderen Servern, Inbound-only)
+      - "465:465"   # SMTPS (implizit TLS)
+      - "587:587"   # Submission (Clients mit STARTTLS)
+      - "143:143"   # IMAP
+      - "993:993"   # IMAPS
+      # Port 80/443 wird NICHT gemappt — Webmail läuft über Cloudflare-Tunnel:
+      # webmail.${MAIL_DOMAIN} → http://posteio:80 (routes.json, Item 9)
+    # no env_file by design — relay creds live in /data/admin/settings (patched by bootstrap)
+    environment:
+      TZ: Europe/Zurich
+      HTTPS: "OFF"
+      # SMTP_RELAY_*: werden via bootstrap._mail_configure_relay in Poste.io gesetzt.
+      # Nicht als compose-Env — Poste.io liest Relay-Creds aus seiner internen Config.
+    tmpfs:
+      - /var/lib/rspamd
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ./poste-data:/data
+    networks:
+      - brewing_net
+
   # cloudflared + watchtower laufen NUR auf dem VPS, nicht lokal in Dev.
   # → `profiles: [vps]` heißt: nur aktiv mit `docker compose --profile vps up -d`.
   # Bootstrap-Script + README setzen das automatisch.

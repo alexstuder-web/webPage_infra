@@ -549,6 +549,410 @@ EOSU
 }
 
 # ================================================================
+# MAIL-EINHEIT HELPERS
+# Marker, UFW, certbot-Cert, Relay-Konfiguration
+# ================================================================
+
+# ---------------------------------------------------------------- Mail-Marker idempotent setzen
+# Setzt /etc/brewing/stateful-units.d/mail (mode 644, owner alex), falls
+# posteio-Container jetzt läuft. Idempotent: vorhandener Marker → kein Fehler.
+_ensure_mail_marker() {
+  local units_dir="/etc/brewing/stateful-units.d"
+  local mail_marker="${units_dir}/mail"
+  install -d -m 755 -o "$APP_USER" -g "$APP_USER" "$units_dir" 2>/dev/null || true
+  if [[ -f "$mail_marker" ]]; then
+    ok "mail-Marker bereits vorhanden — ${mail_marker}"
+    return 0
+  fi
+  local _running=0
+  sudo -u "$APP_USER" bash <<'EOSU' 2>/dev/null && _running=1 || _running=0
+docker inspect --format='{{.State.Running}}' posteio 2>/dev/null | grep -q '^true$'
+EOSU
+  if (( _running == 1 )); then
+    install -m 644 -o "$APP_USER" -g "$APP_USER" /dev/null "$mail_marker"
+    ok "mail-Marker gesetzt → ${mail_marker}"
+  else
+    printf '  \033[1;33m⚠ posteio laeuft noch nicht — mail-Marker NICHT gesetzt (Unit kam nicht hoch?).\033[0m\n'
+  fi
+}
+
+# ---------------------------------------------------------------- UFW: Mail-Ports öffnen (idempotent, nur additiv)
+# Öffnet nur die 5 Inbound-Mail-Ports. Rührt SSH/andere Regeln NICHT an.
+# KEIN automatisches 'ufw enable' — FROZEN-Schutz (MULTIVPS_ARCHITEKTUR.md §2/§5).
+# Wenn UFW inaktiv ist: nur Log-Info; die Ports sind bei inaktivem UFW ohnehin offen.
+_mail_open_firewall_ports() {
+  log "UFW: Mail-Ports öffnen (25/465/587/143/993, idempotent)"
+  if ! command -v ufw >/dev/null 2>&1; then
+    echo "  ufw nicht gefunden — Ports bitte am Cloud-Provider-Firewall-Panel öffnen:"
+    echo "  25/tcp, 465/tcp, 587/tcp, 143/tcp, 993/tcp (alle Inbound)"
+    return 0
+  fi
+
+  local ufw_status
+  ufw_status="$(ufw status 2>/dev/null | head -1 || echo 'Status: unknown')"
+
+  if printf '%s' "$ufw_status" | grep -qi 'inactive'; then
+    echo "  UFW ist inaktiv — Mail-Ports sind bei inaktivem UFW ohnehin offen."
+    echo "  Wenn UFW später aktiviert wird, bitte folgende Ports manuell erlauben:"
+    echo "  ufw allow 25/tcp; ufw allow 465/tcp; ufw allow 587/tcp; ufw allow 143/tcp; ufw allow 993/tcp"
+    echo "  Danach: ufw allow ssh (SSH absichern, BEVOR ufw enable ausgeführt wird!)"
+    return 0
+  fi
+
+  # UFW ist aktiv: SSH-Schutz sicherstellen (Guard vor ufw allow Mail-Ports)
+  # Nur prüfen, nicht ändern — wir rühren SSH-Regeln nicht an.
+  if ! ufw status 2>/dev/null | grep -qE '22(/tcp)?\s+ALLOW'; then
+    printf '  \033[1;33m⚠ SSH-Port (22) ist in UFW nicht explizit erlaubt.\033[0m\n'
+    printf '  Bitte zuerst SSH absichern: ufw allow ssh (oder ufw allow 22/tcp)\n'
+    printf '  Mail-Ports werden trotzdem gesetzt — aber UFW-enable ohne SSH-Regel sperrt aus!\033[0m\n'
+  fi
+
+  local port
+  for port in 25 465 587 143 993; do
+    # Idempotent: ufw allow ist sicher bei bereits existierender Regel (kein Duplikat).
+    ufw allow "${port}/tcp" >/dev/null
+    ok "  UFW: ${port}/tcp ALLOW gesetzt"
+  done
+  ok "UFW Mail-Ports gesetzt (25/465/587/143/993 Inbound)"
+}
+
+# ---------------------------------------------------------------- certbot DNS-01 Cert für mail.<MAIL_DOMAIN>
+# Installiert certbot + python3-certbot-dns-cloudflare (nur im Mail-Pfad, idempotent).
+# Holt Cert via DNS-01 (CF-API-Token). Deployt ins Container-/data. Setzt Renew-Cron.
+# CF-Credentials-Datei: mktemp, chmod 600 VOR dem Schreiben (Lesson 2026-05-24).
+# Token NICHT in argv/log.
+_mail_provision_cert() {
+  local mail_domain mail_hostname mail_tls_email poste_admin_email cf_api_token
+  # Vars aus .env lesen (kein source/set -a, nur gezielte Werte)
+  mail_domain="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+grep -E '^MAIL_DOMAIN=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true
+EOSU
+)"
+  mail_hostname="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+grep -E '^MAIL_HOSTNAME=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true
+EOSU
+)"
+  mail_tls_email="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+grep -E '^MAIL_TLS_EMAIL=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true
+EOSU
+)"
+  poste_admin_email="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+grep -E '^POSTE_ADMIN_EMAIL=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true
+EOSU
+)"
+  cf_api_token="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+grep -E '^CLOUDFLARE_API_TOKEN=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true
+EOSU
+)"
+
+  # Defaults ableiten
+  mail_domain="${mail_domain:-alexstuder.cloud}"
+  mail_hostname="${mail_hostname:-mail.${mail_domain}}"
+  # TLS-E-Mail: MAIL_TLS_EMAIL → Fallback auf POSTE_ADMIN_EMAIL → Fallback auf admin@<domain>
+  if [[ -z "$mail_tls_email" ]]; then
+    mail_tls_email="${poste_admin_email:-admin@${mail_domain}}"
+  fi
+
+  if [[ -z "$cf_api_token" ]]; then
+    printf '  \033[1;33m⚠ CLOUDFLARE_API_TOKEN nicht gesetzt — certbot DNS-01 übersprungen.\033[0m\n'
+    printf '  TLS-Cert für %s muss manuell besorgt werden oder Token nachtragen.\033[0m\n' "$mail_hostname"
+    return 0
+  fi
+
+  log "certbot: Let's-Encrypt-Cert für ${mail_hostname} via DNS-01"
+
+  # certbot + Plugin installieren (idempotent, nur im Mail-Pfad)
+  if ! command -v certbot >/dev/null 2>&1; then
+    log "certbot installieren (apt, nur Mail-Pfad)"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y certbot python3-certbot-dns-cloudflare
+    ok "certbot installiert"
+  else
+    ok "certbot bereits vorhanden — übersprungen"
+  fi
+
+  # CF-Credentials-Datei: persistenter Pfad (wird vom Renew-Cron benötigt).
+  # chmod 600 VOR dem Schreiben (Lesson 2026-05-24).
+  # Kein Tempfile — der Cron-Job braucht die Datei dauerhaft.
+  # Niemals in argv/log ausgeben — nur Dateipfad ist sicher.
+  local cf_ini="/etc/brewing/cf-dns.ini"
+  # S-3 FIX: expliziter Existenzcheck statt install … || true (die || true würde
+  # falsche Ownership maskieren und ein folgendes touch bei unbeschreibbarem Pfad
+  # bricht unter set -euo pipefail ab).
+  [[ -d /etc/brewing ]] || install -d -m 700 -o root -g root /etc/brewing
+  # Mode 600 setzen BEVOR der Token hineingeschrieben wird.
+  touch "$cf_ini"
+  chmod 600 "$cf_ini"
+  chown root:root "$cf_ini"
+  # Token direkt schreiben (kein echo/set -x, kein Log des Inhalts).
+  printf 'dns_cloudflare_api_token = %s\n' "$cf_api_token" > "$cf_ini"
+  ok "CF-Credentials: ${cf_ini} (mode 600, owner root)"
+
+  # Cert bereits vorhanden und gültig? (idempotent)
+  local cert_path="/etc/letsencrypt/live/${mail_hostname}"
+  if [[ -f "${cert_path}/fullchain.pem" ]]; then
+    ok "Cert für ${mail_hostname} bereits vorhanden — Renew-Versuch (idempotent)"
+    certbot renew --cert-name "$mail_hostname" \
+      --dns-cloudflare --dns-cloudflare-credentials "$cf_ini" \
+      --non-interactive --quiet 2>/dev/null || true
+  else
+    log "certbot certonly (DNS-01) für ${mail_hostname}"
+    certbot certonly \
+      --dns-cloudflare \
+      --dns-cloudflare-credentials "$cf_ini" \
+      -d "$mail_hostname" \
+      --email "$mail_tls_email" \
+      --agree-tos \
+      --non-interactive \
+    || {
+      printf '  \033[1;33m⚠ certbot fehlgeschlagen — Cert nicht ausgestellt.\033[0m\n'
+      printf '  Häufige Ursachen: A-Record noch nicht propagiert, Token-Scope fehlt,\033[0m\n'
+      printf '  Rate-Limit (5 Fehlversuche/h). Manuell wiederholen:\033[0m\n'
+      printf '    certbot certonly --dns-cloudflare --dns-cloudflare-credentials %s \\\n' "$cf_ini"
+      printf '      -d %s --email %s --agree-tos --non-interactive\033[0m\n' \
+        "$mail_hostname" "$mail_tls_email"
+      return 0
+    }
+    ok "certbot: Cert für ${mail_hostname} ausgestellt"
+  fi
+
+  # Cert in Container deployen (Poste.io 2.x erwartet Cert unter /data/ssl/).
+  # Pfad-Konvention für analogic/poste.io 2.x:
+  #   /data/ssl/server-combined.crt = fullchain (Cert + Chain)
+  #   /data/ssl/server.key          = privater Schlüssel
+  log "Cert in posteio-Container deployen (/data/ssl/)"
+  if docker inspect --format='{{.State.Running}}' posteio 2>/dev/null | grep -q '^true$'; then
+    docker cp "${cert_path}/fullchain.pem" "posteio:/data/ssl/server-combined.crt" \
+      || { printf '  \033[1;33m⚠ docker cp fullchain fehlgeschlagen\033[0m\n'; }
+    docker cp "${cert_path}/privkey.pem"   "posteio:/data/ssl/server.key" \
+      || { printf '  \033[1;33m⚠ docker cp privkey fehlgeschlagen\033[0m\n'; }
+    docker restart posteio >/dev/null \
+      || { printf '  \033[1;33m⚠ docker restart posteio fehlgeschlagen\033[0m\n'; }
+    ok "Cert in posteio deployet + Container restartet"
+  else
+    printf '  \033[1;33m⚠ posteio läuft nicht — Cert-Deploy übersprungen.\033[0m\n'
+    printf '  Cert liegt in %s — nach Start von posteio deployen:\033[0m\n' "$cert_path"
+    printf '    docker cp %s/fullchain.pem posteio:/data/ssl/server-combined.crt\033[0m\n' "$cert_path"
+    printf '    docker cp %s/privkey.pem   posteio:/data/ssl/server.key\033[0m\n' "$cert_path"
+    printf '    docker restart posteio\033[0m\n'
+  fi
+
+  # Renew-Cron-Drop-in (wöchentlicher Versuch + Deploy-Hook, idempotent)
+  # Drop-in in /etc/cron.d/ analog dem Backup-Cron (Zeile ~308).
+  local renew_cron="/etc/cron.d/certbot-mail-renew"
+  # Deploy-Hook: Cert in Container kopieren + restart (als root, da docker cp root braucht).
+  # Das Cron-Script läuft als root (certbot + docker cp benötigt root-Rechte).
+  local deploy_hook_script="${APP_DIR}/scripts/_mail_cert_deploy.sh"
+
+  # I-2 FIX: Deploy-Hook-Script idempotent schreiben (nur überschreiben wenn Inhalt
+  # geändert hat, damit ein Re-Run keinen überflüssigen Restart verursacht).
+  # Dieses Script ist nicht sensitiv (keine Secrets) — kein spezieller Mode nötig.
+  local _hook_new
+  _hook_new="$(cat <<HOOKEOF
+#!/usr/bin/env bash
+# Mail-Cert-Deploy-Hook: nach certbot-Renew in posteio-Container kopieren.
+# Wird von certbot via --deploy-hook oder aus dem Renew-Cron aufgerufen.
+set -euo pipefail
+MAIL_HOSTNAME="${mail_hostname}"
+CERT_PATH="/etc/letsencrypt/live/\${MAIL_HOSTNAME}"
+if docker inspect --format='{{.State.Running}}' posteio 2>/dev/null | grep -q '^true\$'; then
+  docker cp "\${CERT_PATH}/fullchain.pem" "posteio:/data/ssl/server-combined.crt"
+  docker cp "\${CERT_PATH}/privkey.pem"   "posteio:/data/ssl/server.key"
+  docker restart posteio >/dev/null
+  echo "certbot-deploy-hook: Cert in posteio deployet + restart OK"
+else
+  echo "certbot-deploy-hook: posteio laeuft nicht — Skip" >&2
+fi
+HOOKEOF
+)"
+  local _hook_cur=""
+  [[ -f "$deploy_hook_script" ]] && _hook_cur="$(cat "$deploy_hook_script")"
+  if [[ "$_hook_new" != "$_hook_cur" ]]; then
+    printf '%s\n' "$_hook_new" > "$deploy_hook_script"
+    chmod 755 "$deploy_hook_script"
+    chown root:root "$deploy_hook_script"
+    ok "Deploy-Hook-Script geschrieben: ${deploy_hook_script}"
+  else
+    ok "Deploy-Hook-Script unverändert: ${deploy_hook_script}"
+  fi
+
+  # I-2 FIX: Pfade mit Leerzeichen im Cron-Command — als VAR=-Zuweisungen oberhalb
+  # der Schedule-Zeile emittieren und im Command als "$CF_INI"/"$HOOK" referenzieren.
+  # Dadurch sind Leerzeichen in Pfaden sicher (cron splittet VAR=... nicht).
+  cat > "$renew_cron" <<EOF
+# Certbot Mail-Renew — wöchentlich Sonntag 02:30. Von bootstrap.sh erzeugt (idempotent).
+# Erneuert das Let's-Encrypt-Cert für ${mail_hostname} (DNS-01 via Cloudflare-API).
+# Deploy-Hook kopiert Cert automatisch in den posteio-Container.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CF_INI=${cf_ini}
+HOOK=${deploy_hook_script}
+30 2 * * 0 root certbot renew --cert-name ${mail_hostname} --dns-cloudflare --dns-cloudflare-credentials "\$CF_INI" --non-interactive --deploy-hook "\$HOOK" --quiet >> /var/log/certbot-mail.log 2>&1
+EOF
+  chmod 644 "$renew_cron"
+  touch /var/log/certbot-mail.log
+  chmod 644 /var/log/certbot-mail.log
+  ok "Certbot-Renew-Cron: ${renew_cron} (wöchentlich Sonntag 02:30)"
+  # Hinweis: cf_ini (/etc/brewing/cf-dns.ini) ist persistiert (kein Tempfile) —
+  # der Renew-Cron braucht die Datei dauerhaft. Token ändert sich nicht.
+  # Bei Token-Rotation: neues .env → bootstrap erneut → cf_ini wird überschrieben.
+}
+
+# ---------------------------------------------------------------- Postausgang-Relay in Poste.io konfigurieren
+# Schreibt SMTP_RELAY_HOST/PORT/USERNAME/PASSWORD aus .env in Poste.ios Settings-Datei
+# (/data/admin/settings) via docker exec — nicht-interaktiv, reproduzierbar.
+# Secret (SMTP_RELAY_PASSWORD) wird NICHT in argv/log ausgegeben.
+# Fallback: falls Mechanismus nicht verfügbar → UI-Hinweis ausgeben, sauber fortfahren.
+_mail_configure_relay() {
+  log "Postausgang-Relay (Smarthost) in Poste.io konfigurieren"
+
+  # Relay-Vars aus .env lesen
+  # S-4 FIX: relay_pass wird erst nach dem Passwort-Tempfile-Lesen zugewiesen;
+  # es steht nicht mehr doppelt in dieser Deklarationszeile (latente Verwirrung).
+  # relay_pass wird weiter unten separat via 'relay_pass="$(cat ...)"' deklariert+befüllt.
+  local relay_host relay_port relay_user
+  relay_host="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+grep -E '^SMTP_RELAY_HOST=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true
+EOSU
+)"
+  relay_port="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+grep -E '^SMTP_RELAY_PORT=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true
+EOSU
+)"
+  relay_user="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+grep -E '^SMTP_RELAY_USERNAME=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true
+EOSU
+)"
+  # SMTP_RELAY_PASSWORD: sensitiv — nie echoen, nur über Datei transportieren.
+  local relay_pass_file
+  relay_pass_file="$(mktemp)"
+  CLEANUP_FILES+=("$relay_pass_file")
+  chmod 600 "$relay_pass_file"
+  sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" RELAY_PASS_OUT="$relay_pass_file" bash <<'EOSU'
+val="$(grep -E '^SMTP_RELAY_PASSWORD=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true)"
+printf '%s' "$val" > "$RELAY_PASS_OUT"
+EOSU
+  local relay_pass
+  relay_pass="$(cat "$relay_pass_file")"
+  rm -f "$relay_pass_file"
+  mapfile -t CLEANUP_FILES < <(printf '%s\n' "${CLEANUP_FILES[@]}" | grep -vxF "$relay_pass_file")
+
+  # Guard: wenn kein Relay-Host gesetzt → Skip (Relay optional)
+  if [[ -z "$relay_host" ]]; then
+    echo "  SMTP_RELAY_HOST nicht gesetzt — Smarthost-Konfiguration übersprungen."
+    echo "  Ohne Relay kein externer Postausgang (nur Empfang/intern)."
+    return 0
+  fi
+
+  relay_port="${relay_port:-587}"
+  ok "Relay: ${relay_host}:${relay_port} (User: ${relay_user:-<leer>})"
+
+  # Mechanismus: Poste.io 2.x schreibt Smarthost-Einstellungen in
+  # /data/admin/settings (JSON-Datei unter poste-data).
+  # Wir patchen diese Datei direkt via docker exec (jq im Container oder python3).
+  # Falls der Pfad/das Format sich ändert: Fallback auf UI-Hinweis.
+  local settings_path="/data/admin/settings"
+  local _patch_ok=0
+
+  # Prüfen ob posteio läuft
+  if ! docker inspect --format='{{.State.Running}}' posteio 2>/dev/null | grep -q '^true$'; then
+    printf '  \033[1;33m⚠ posteio läuft nicht — Relay-Konfiguration übersprungen.\033[0m\n'
+    printf '  Nach Start von posteio bootstrap erneut ausführen oder Relay manuell in der UI setzen.\n'
+    return 0
+  fi
+
+  # Prüfen ob Settings-Datei existiert
+  if docker exec posteio test -f "$settings_path" 2>/dev/null; then
+    # Settings-Datei patchen via python3 (im Container verfügbar in poste.io 2.x)
+    #
+    # I-1 FIX: Stop-Wort literal gequotet (<<'PYEOF') → kein Bash-Interpolation im
+    # Heredoc-Body. Alle Werte werden als Umgebungsvariablen via docker exec -e übergeben
+    # und in Python über os.environ[] gelesen. Keine Variable landet im Heredoc-Text.
+    #
+    # S-1 FIX: Container-Temp-Pfad via mktemp (statt $$), Unlink in finally-Block.
+    # Das Passwort wird per Stdin in den Container geschrieben (nicht als -e-Arg),
+    # damit es nicht in 'docker inspect' oder 'ps' sichtbar ist.
+    local relay_pass_container_tmp
+    relay_pass_container_tmp="$(docker exec posteio mktemp /tmp/.relay_pass_XXXXXX)"
+    # chmod 600 VOR dem Schreiben (Lesson 2026-05-24: write-then-chmod ist falsch).
+    docker exec posteio chmod 600 "$relay_pass_container_tmp"
+    # Passwort über printf | docker exec -i einschreiben (Stdin, nicht argv, nicht env).
+    printf '%s' "$relay_pass" \
+      | docker exec -i posteio bash -c "cat > '${relay_pass_container_tmp}'"
+
+    # Alle Werte außer dem Passwort sicher als Env-Vars übergeben.
+    # Das Passwort bleibt im Container-Tempfile — wird von Python via os.environ['RELAY_PASS_FILE']
+    # gelesen und in einem finally:-Block gelöscht.
+    # Heredoc-Stop-Wort gequotet → kein Bash-Interpolation.
+    docker exec \
+      -e RELAY_SETTINGS_PATH="$settings_path" \
+      -e RELAY_PASS_FILE="$relay_pass_container_tmp" \
+      -e RELAY_HOST="$relay_host" \
+      -e RELAY_PORT="$relay_port" \
+      -e RELAY_USER="$relay_user" \
+      posteio python3 - <<'PYEOF' 2>/dev/null && _patch_ok=1 || _patch_ok=0
+import json, os, sys
+
+settings_path = os.environ['RELAY_SETTINGS_PATH']
+relay_pass_file = os.environ['RELAY_PASS_FILE']
+relay_host = os.environ['RELAY_HOST']
+relay_port = int(os.environ['RELAY_PORT'])
+relay_user = os.environ['RELAY_USER']
+
+relay_pass = ''
+try:
+    with open(relay_pass_file, 'r') as f:
+        relay_pass = f.read().strip()
+finally:
+    try:
+        os.unlink(relay_pass_file)
+    except OSError:
+        pass
+
+try:
+    with open(settings_path, 'r') as f:
+        settings = json.load(f)
+except Exception:
+    settings = {}
+
+# Poste.io 2.x Smarthost-Keys (aus Community-Dokumentation verifiziert)
+settings['smarthost'] = relay_host
+settings['smarthostPort'] = relay_port
+settings['smarthostUsername'] = relay_user
+settings['smarthostPassword'] = relay_pass
+
+with open(settings_path, 'w') as f:
+    json.dump(settings, f, indent=2)
+
+print('Smarthost-Config geschrieben: {}:{} user={}'.format(relay_host, relay_port, relay_user))
+PYEOF
+
+    if (( _patch_ok == 1 )); then
+      # Container restarten damit Poste.io die neue Config lädt
+      docker restart posteio >/dev/null \
+        && ok "Smarthost-Config in Poste.io gesetzt (${relay_host}:${relay_port}) + Container restartet" \
+        || printf '  \033[1;33m⚠ docker restart nach Relay-Konfig fehlgeschlagen — manuell restarten.\033[0m\n'
+    else
+      # Cleanup des temp-Files im Container (falls python3 fehlschlug vor finally:-Block)
+      docker exec posteio rm -f "$relay_pass_container_tmp" 2>/dev/null || true
+    fi
+  fi
+
+  if (( _patch_ok == 0 )); then
+    # Fallback: UI-Hinweis ausgeben
+    printf '\n  \033[1;33m⚠ Automatische Smarthost-Konfiguration nicht möglich\033[0m\n'
+    printf '  (Settings-Datei %s nicht gefunden oder python3-Patch fehlgeschlagen).\033[0m\n' "$settings_path"
+    printf '  \033[1;34mBitte Relay manuell in der Poste.io-UI einrichten:\033[0m\n'
+    printf '    1. https://webmail.%s aufrufen (Admin-Login)\033[0m\n' "${MAIL_DOMAIN:-alexstuder.cloud}"
+    printf '    2. Administration → Smarthost / Relay\033[0m\n'
+    printf '    3. Host: %s\033[0m\n' "$relay_host"
+    printf '    4. Port: %s\033[0m\n' "$relay_port"
+    printf '    5. Username: %s  (Passwort aus .env: SMTP_RELAY_PASSWORD)\033[0m\n' "$relay_user"
+    printf '    6. TLS/STARTTLS aktivieren\033[0m\n'
+  fi
+}
+
+# ================================================================
 # MEHRFACHAUSWAHL-TUI (Pure Bash, keine neue apt-Dependency)
 # §4 BOOTSTRAP_MENU_V2_KONZEPT.md
 #
@@ -580,9 +984,10 @@ _TUI_LABELS=(
   "WebPageAlexStuder"
   "Watchtower (Auto-Update)"
   "Portainer (Container-Uebersicht)"
+  "Mailserver (Poste.io)"
 )
-# Default-Vorauswahl: Indices 0-based; 4=Watchtower, 5=Portainer
-_TUI_DEFAULTS=(0 0 0 0 1 1)
+# Default-Vorauswahl: Indices 0-based; 4=Watchtower, 5=Portainer, 6=Mail (nicht vorausgewaehlt)
+_TUI_DEFAULTS=(0 0 0 0 1 1 0)
 
 # ---------------------------------------------------------------- Portainer-Rollen-Erkennung
 # §5.3 — bestimmt hub|agent|skip; nutzt PORTAINER_ROLE aus .env (auto|hub|agent).
@@ -974,6 +1379,7 @@ action_select_and_start() {
   #   3 = WebPageAlexStuder        → web_hauptseite
   #   4 = Watchtower               → watchtower
   #   5 = Portainer                → portainer ODER portainer_edge_agent (Rolle-Logik)
+  #   6 = Mailserver (Poste.io)    → posteio
   #
   # cloudflared wird IMMER angehaengt (kein Eintrag im Menue).
 
@@ -982,6 +1388,7 @@ action_select_and_start() {
   # Merker: wurde supabase-kong explizit oder via Abhaengigkeit aufgenommen?
   local has_supabase=0
   local has_portainer=0
+  local has_mail=0
   local portainer_role=""
 
   # Eintrag 0: brew_assistent + Supabase
@@ -1036,6 +1443,15 @@ EOSU
     has_portainer=1
     # Portainer-Services werden NACH dem allgemeinen compose-up separat gestartet
     # (Hub vs. Agent erfordert unterschiedliche Logik)
+  fi
+
+  # Eintrag 6: Mailserver (Poste.io)
+  if (( selected[6] == 1 )); then
+    log "Mailserver (Poste.io) ausgewaehlt"
+    echo "  Mail ist die bewusste Ausnahme zum Tunnel-Only-Prinzip."
+    echo "  Services: posteio (Ports 25/465/587/143/993 + Webmail via Tunnel)"
+    svc_list="${svc_list} posteio"
+    has_mail=1
   fi
 
   # Keine Auswahl? Nur cloudflared starten wuerde keinen Sinn ergeben.
@@ -1103,6 +1519,31 @@ EOSU
         printf '  \033[1;33m⚠ Portainer-Start uebersprungen (Rolle unklar — siehe Meldung oben).\033[0m\n'
         ;;
     esac
+  fi
+
+  # ---- Mail-Start-Nacharbeiten (Marker, UFW, certbot, Relay) ----
+  if (( has_mail == 1 )); then
+    _ensure_mail_marker
+    _mail_open_firewall_ports
+    _mail_provision_cert
+    _mail_configure_relay
+    # Credential-Hinweis-Block (analog Portainer-Hub-Block)
+    printf '\n  \033[1;33m⚠ CREDENTIAL-SCHRITTE (Mailserver, einmalig):\033[0m\n'
+    local _md
+    _md="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+grep -E '^MAIL_DOMAIN=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true
+EOSU
+)"
+    _md="${_md:-alexstuder.cloud}"
+    printf '  1. Poste.io-Admin-Passwort beim ersten UI-Login setzen:\033[0m\n'
+    printf '     https://webmail.%s\033[0m\n' "$_md"
+    printf '  2. Brevo: alexstuder.cloud als Versand-Domain authentifizieren\033[0m\n'
+    printf '     (Brevos DKIM-CNAMEs ins Cloudflare-DNS — DKIM-Provider-Schritt).\033[0m\n'
+    printf '  3. (Optional) PTR/Reverse-DNS fuer die VPS-IP setzen:\033[0m\n'
+    printf '     mail.%s → beim VPS-Provider setzen (nice-to-have).\033[0m\n' "$_md"
+    printf '  4. (Optional) MAIL_DKIM_TXT in .env setzen + encrypt-env.sh,\033[0m\n'
+    printf '     falls der Auto-Auslese-Pfad den Poste.io-Eigen-DKIM nicht publiziert hat.\033[0m\n'
+    printf '  Hinweis: kein Port-25-Outbound noetig — Versand laeuft ueber Brevo (Port 587).\033[0m\n\n'
   fi
 
   # ---- Cloudflare Reconcile ----

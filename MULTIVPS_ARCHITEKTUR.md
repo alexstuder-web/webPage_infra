@@ -64,6 +64,17 @@ Diese Umstellung löst V-2-1 aus `BOOTSTRAP_MENU_V2_KONZEPT.md` §9.
 ### ufw / SSH-Hardening = FROZEN
 Bleiben **unangetastet**. Es wird KEIN Postgres-Port nach außen geöffnet. Der gesamte cross-VPS-Traffic geht durch den Tunnel.
 
+### Mail = dokumentierte Ausnahme zum Tunnel-Only-Prinzip (Freigabe 2026-05-25)
+Poste.io ist die **5. stateful Unit** — eigenständig, markergesteuert (`/etc/brewing/stateful-units.d/mail`), verschiebbar. Mail bricht zwingend das "keine offenen Ports"-Prinzip:
+- **Offene Inbound-Ports**: 25 (SMTP-Empfang), 465 (SMTPS), 587 (Submission), 143 (IMAP), 993 (IMAPS). UFW-Regeln werden via `bootstrap.sh _mail_open_firewall_ports` additiv gesetzt (kein `ufw enable`-Automatismus).
+- **Ungeproxytes A-Record** `mail.<MAIL_DOMAIN>` → VPS-IP (Cloudflare grey cloud, `proxied:false`). Die VPS-IP wird damit öffentlich — akzeptiertes Risiko (Freigabe erteilt).
+- **Postausgang via Relay** (Brevo, Port 587 ausgehend) — kein Direkt-Versand über Port 25 outbound. Provider-Freischaltung von Port 25 outbound entfällt.
+- **Webmail** über den Cloudflare-Tunnel (`webmail.<MAIL_DOMAIN>` → `http://posteio:80`), kein offener HTTP/HTTPS-Port.
+- **Echtes Let's-Encrypt-Cert** für `mail.<MAIL_DOMAIN>` via certbot DNS-01 (CF-API-Token).
+- **Backup**: `backup.sh` Unit `mail` → `tar | gpg` → `backups/mail/poste_<TS>.tar.gpg` → R2.
+- **DNS**: `cloudflare-reconcile.sh` Mail-Sektion (marker-gesteuert): MX / A-unproxied / SPF / DMARC / DKIM (nie hard-failend).
+SSH-Hardening und die übrige Tunnel-Only-Logik bleiben **UNVERÄNDERT**.
+
 ---
 
 ## 3. Konfigurierbare Verbindungs-URLs

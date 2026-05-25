@@ -85,6 +85,21 @@ _cf_get() {
   printf '%s' "$val"
 }
 
+# S-2 FIX: _cf_get_clean — wie _cf_get, aber strippt zusätzlich:
+#   - Trailing Whitespace (Leerzeichen / Tabs am Zeilenende)
+#   - Inline-Kommentare (erstes ' #' oder Tab+'#' bis Zeilenende)
+# Wird für alle Mail-Vars verwendet, da diese direkt in DNS-Record-Werte
+# (z.B. rua=mailto:${POSTE_ADMIN_EMAIL}) eingebettet werden.
+_cf_get_clean() {
+  local val
+  val="$(_cf_get "$1")"
+  # Inline-Kommentar entfernen: alles ab ' #' oder '\t#'
+  val="${val%%[[:space:]]#*}"
+  # Trailing Whitespace (Leerzeichen/Tabs) abschneiden
+  val="${val%"${val##*[! 	]}"}"
+  printf '%s' "$val"
+}
+
 CLOUDFLARE_API_TOKEN="$(_cf_get CLOUDFLARE_API_TOKEN)"
 CLOUDFLARE_ACCOUNT_ID="$(_cf_get CLOUDFLARE_ACCOUNT_ID)"
 CLOUDFLARE_ZONE_ID="$(_cf_get CLOUDFLARE_ZONE_ID)"
@@ -633,6 +648,232 @@ if (( IS_PORTAINER_HUB == 1 )); then
       fi
     fi
   fi
+fi
+
+# ============================================================================
+# Step 5: Mail-DNS reconcilen (MX / A-unproxied / SPF / DMARC / DKIM)
+#
+# Mail ist die bewusste Ausnahme zum Tunnel-Only-Prinzip (Freigabe 2026-05-25).
+# Diese Sektion wird NUR ausgeführt wenn /etc/brewing/stateful-units.d/mail
+# existiert (Marker) ODER der posteio-Container läuft.
+# Die bestehende CNAME/Tunnel/Orphan-Logik (Steps 0–4) bleibt UNVERÄNDERT.
+#
+# Kein Orphan-Cleanup für MX/A/TXT — Mail-Records bleiben additiv/idempotent-
+# update. (Der Orphan-Cleanup in Step 3 löscht nur CNAMEs auf den eigenen Tunnel
+# und tastet MX/A/TXT per Design nicht an.)
+# ============================================================================
+
+# Marker/Container-Gate: Mail-Sektion aktiv?
+_MAIL_ACTIVE=0
+MAIL_MARKER="/etc/brewing/stateful-units.d/mail"
+if [[ -f "$MAIL_MARKER" ]]; then
+  _MAIL_ACTIVE=1
+  ok "mail-Marker vorhanden (${MAIL_MARKER}) — Mail-DNS-Sektion aktiv"
+elif docker inspect --format='{{.State.Running}}' posteio 2>/dev/null | grep -q '^true$'; then
+  _MAIL_ACTIVE=1
+  ok "posteio-Container läuft — Mail-DNS-Sektion aktiv (kein Marker, aber Container läuft)"
+else
+  echo "  Mail-Marker nicht vorhanden (${MAIL_MARKER}) und posteio läuft nicht — Mail-DNS übersprungen"
+fi
+
+if (( _MAIL_ACTIVE == 1 )); then
+  log "Mail-DNS reconcilen (MX / A-unproxied / SPF / DMARC / DKIM)"
+
+  # ---- Mail-Variablen aus .env lesen (kein source, nur gezielte Werte) ----
+  # _cf_get_clean: strippt Trailing-Whitespace + Inline-Kommentare (S-2 FIX).
+  MAIL_DOMAIN="$(_cf_get_clean MAIL_DOMAIN)"
+  MAIL_HOSTNAME="$(_cf_get_clean MAIL_HOSTNAME)"
+  POSTE_ADMIN_EMAIL="$(_cf_get_clean POSTE_ADMIN_EMAIL)"
+  MAIL_VPS_IP="$(_cf_get_clean MAIL_VPS_IP)"
+  MAIL_SPF_INCLUDE="$(_cf_get_clean MAIL_SPF_INCLUDE)"
+  MAIL_DKIM_TXT="$(_cf_get_clean MAIL_DKIM_TXT)"
+
+  # Default-Werte (analog .env.example)
+  MAIL_DOMAIN="${MAIL_DOMAIN:-alexstuder.cloud}"
+  MAIL_HOSTNAME="${MAIL_HOSTNAME:-mail.${MAIL_DOMAIN}}"
+  POSTE_ADMIN_EMAIL="${POSTE_ADMIN_EMAIL:-admin@${MAIL_DOMAIN}}"
+
+  # Validierung: MAIL_DOMAIN darf keine Shell-Injection-Zeichen enthalten.
+  [[ "$MAIL_DOMAIN" =~ ^[a-zA-Z0-9._-]+$ ]] \
+    || { echo "  MAIL_DOMAIN '${MAIL_DOMAIN}' enthält ungültige Zeichen — Mail-DNS übersprungen"; _MAIL_ACTIVE=0; }
+fi
+
+if (( _MAIL_ACTIVE == 1 )); then
+
+  # ---- VPS-IP ermitteln (auto oder .env-Override) ----
+  if [[ -n "$MAIL_VPS_IP" ]]; then
+    ok "Mail-VPS-IP aus .env (MAIL_VPS_IP): ${MAIL_VPS_IP}"
+  else
+    # Automatische Ermittlung über ifconfig.co (robuster öffentlicher IP-Service).
+    # Timeout 10s; bei Fehler → Abbruch mit klarem Hinweis (kein stilles Weglassen).
+    MAIL_VPS_IP="$(curl -sS --max-time 10 https://ifconfig.co 2>/dev/null || true)"
+    MAIL_VPS_IP="${MAIL_VPS_IP//[[:space:]]/}"  # trailing newline entfernen
+    if [[ -z "$MAIL_VPS_IP" ]]; then
+      printf '  \033[1;33m⚠ VPS-IP konnte nicht automatisch ermittelt werden (ifconfig.co nicht erreichbar).\033[0m\n'
+      printf '  Mail-DNS (A-Record) wird übersprungen. MAIL_VPS_IP in .env setzen, dann erneut laufen.\n'
+      MAIL_VPS_IP=""
+    else
+      # Sanity-Check: IPv4-Format
+      if [[ ! "$MAIL_VPS_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        printf '  \033[1;33m⚠ Ermittelte IP "%s" sieht nicht nach IPv4 aus — A-Record übersprungen.\033[0m\n' \
+          "$MAIL_VPS_IP"
+        printf '  MAIL_VPS_IP in .env manuell setzen.\n'
+        MAIL_VPS_IP=""
+      else
+        ok "Mail-VPS-IP auto-ermittelt: ${MAIL_VPS_IP}"
+      fi
+    fi
+  fi
+
+  # ---- Hilfsfunktion: DNS-Record idempotent anlegen/aktualisieren ----
+  # cf_dns_ensure <type> <name> <content> <proxied> [priority]
+  # Gibt bei Fehler eine Warnung aus, bricht aber den Mail-Block NICHT ab
+  # (damit ein DKIM-Fehler nicht MX/A/SPF/DMARC blockiert).
+  _mail_dns_ensure() {
+    local rtype="$1" rname="$2" rcontent="$3" rproxied="$4" rpriority="${5:-}"
+
+    local body_fields
+    body_fields="$(jq -nc \
+      --arg t  "$rtype" \
+      --arg n  "$rname" \
+      --arg c  "$rcontent" \
+      --argjson p "$rproxied" \
+      '{type: $t, name: $n, content: $c, ttl: 1, proxied: $p}')"
+
+    # MX braucht priority
+    if [[ -n "$rpriority" ]]; then
+      body_fields="$(printf '%s' "$body_fields" \
+        | jq -c --argjson prio "$rpriority" '. + {priority: $prio}')"
+    fi
+
+    # Bestehende Records suchen
+    local existing count
+    existing="$(cf_call GET "/zones/${CLOUDFLARE_ZONE_ID}/dns_records?type=${rtype}&name=${rname}")" \
+      || { printf '  \033[1;33m⚠ GET %s/%s fehlgeschlagen — übersprungen\033[0m\n' "$rtype" "$rname"; return 0; }
+    count="$(printf '%s' "$existing" | jq '.result | length')"
+
+    if (( count == 0 )); then
+      cf_call POST "/zones/${CLOUDFLARE_ZONE_ID}/dns_records" "$body_fields" >/dev/null \
+        || { printf '  \033[1;33m⚠ POST %s/%s fehlgeschlagen — übersprungen\033[0m\n' "$rtype" "$rname"; return 0; }
+      ok "  + [${rtype}] ${rname}"
+    else
+      local rec_id rec_content rec_proxied rec_priority
+      rec_id="$(printf '%s' "$existing" | jq -r '.result[0].id')"
+      rec_content="$(printf '%s' "$existing" | jq -r '.result[0].content')"
+      rec_proxied="$(printf '%s' "$existing" | jq -r '.result[0].proxied // false')"
+      rec_priority="$(printf '%s' "$existing" | jq -r '.result[0].priority // ""')"
+
+      # Änderung nötig?
+      local needs_update=0
+      [[ "$rec_content" != "$rcontent" ]]    && needs_update=1
+      [[ "$rec_proxied" != "$rproxied" ]]    && needs_update=1
+      [[ -n "$rpriority" && "$rec_priority" != "$rpriority" ]] && needs_update=1
+
+      if (( needs_update == 0 )); then
+        echo "  = [${rtype}] ${rname} (unverändert)"
+      else
+        cf_call PUT "/zones/${CLOUDFLARE_ZONE_ID}/dns_records/${rec_id}" "$body_fields" >/dev/null \
+          || { printf '  \033[1;33m⚠ PUT %s/%s fehlgeschlagen — übersprungen\033[0m\n' "$rtype" "$rname"; return 0; }
+        ok "  ↻ [${rtype}] ${rname}  (war: ${rec_content}, proxied=${rec_proxied})"
+      fi
+    fi
+  }
+
+  # ---- A-Record: mail.${MAIL_DOMAIN} → VPS-IP, unproxied ----
+  if [[ -n "$MAIL_VPS_IP" ]]; then
+    log "Mail A-Record: ${MAIL_HOSTNAME} → ${MAIL_VPS_IP} (proxied=false)"
+    _mail_dns_ensure "A" "$MAIL_HOSTNAME" "$MAIL_VPS_IP" "false"
+  fi
+
+  # ---- MX-Record: ${MAIL_DOMAIN} → mail.${MAIL_DOMAIN}, Prio 10 ----
+  log "Mail MX-Record: ${MAIL_DOMAIN} → ${MAIL_HOSTNAME} (prio 10)"
+  _mail_dns_ensure "MX" "$MAIL_DOMAIN" "$MAIL_HOSTNAME" "false" "10"
+
+  # ---- TXT SPF: ${MAIL_DOMAIN} → v=spf1 mx [include:...] ~all ----
+  # (Script-Level — kein 'local' hier, kein Scope-Problem im Top-Level-Context)
+  _mail_spf_val=""
+  if [[ -n "$MAIL_SPF_INCLUDE" ]]; then
+    _mail_spf_val="v=spf1 mx include:${MAIL_SPF_INCLUDE} ~all"
+  else
+    _mail_spf_val="v=spf1 mx ~all"
+  fi
+  log "Mail SPF-Record: ${MAIL_DOMAIN} TXT \"${_mail_spf_val}\""
+  # SPF ist ein TXT-Record. Sonderlage: es kann bereits ein TXT mit anderem Inhalt
+  # existieren (z.B. Domain-Verifikation). _mail_dns_ensure GET filtert auf type=TXT,
+  # aber NICHT auf SPF-spezifischen Inhalt → bei Konflikt wird der erste Record
+  # aktualisiert. Das ist konsistent mit dem idempotenten Ansatz.
+  _mail_dns_ensure "TXT" "$MAIL_DOMAIN" "$_mail_spf_val" "false"
+
+  # ---- TXT DMARC: _dmarc.${MAIL_DOMAIN} ----
+  _mail_dmarc_val="v=DMARC1; p=none; rua=mailto:${POSTE_ADMIN_EMAIL}"
+  log "Mail DMARC-Record: _dmarc.${MAIL_DOMAIN} TXT \"${_mail_dmarc_val}\""
+  _mail_dns_ensure "TXT" "_dmarc.${MAIL_DOMAIN}" "$_mail_dmarc_val" "false"
+
+  # ---- DKIM (nie hard-failend) ----
+  # Zwei Mechanismen (beide optional, Fehler → nur Log-Hinweis):
+  #
+  # 1. MAIL_DKIM_TXT aus .env (Poste.io-Eigen-Key oder manuell eingetragen):
+  #    → publiziert als TXT dkim._domainkey.${MAIL_DOMAIN}
+  # 2. Poste.io-Eigen-Key aus Container auslesen (nice-to-have, defensiv):
+  #    → docker exec posteio cat /data/ssl/dkim/<domain>/dkim.pub (Pfad für poste.io 2.x)
+  #    → Falls leer/Fehler: kein Abbruch, nur Hinweis.
+  #
+  # Relay-DKIM (Brevo/SES) wird vom Relay-Anbieter selbst signiert; die zugehörigen
+  # CNAME/TXT-Records werden beim Brevo-Domain-Setup manuell eingetragen
+  # (CREDENTIAL-SCHRITT — Werte kennt nur der Anbieter).
+
+  log "DKIM (defensiv, nie abortend)"
+
+  _mail_dkim_val=""
+  _mail_dkim_source=""
+
+  # Quelle 1: MAIL_DKIM_TXT aus .env
+  if [[ -n "$MAIL_DKIM_TXT" ]]; then
+    _mail_dkim_val="$MAIL_DKIM_TXT"
+    _mail_dkim_source=".env (MAIL_DKIM_TXT)"
+  fi
+
+  # Quelle 2: Poste.io-Eigen-Key aus Container (nur wenn Quelle 1 leer)
+  # Poste.io 2.x speichert den DKIM-Key unter /data/ssl/dkim/<domain>/dkim.pub
+  # als PEM-formatierter öffentlicher RSA-Key.
+  if [[ -z "$_mail_dkim_val" ]]; then
+    _mail_dkim_raw=""
+    if docker inspect --format='{{.State.Running}}' posteio 2>/dev/null | grep -q '^true$'; then
+      # Versuche den Key auszulesen (Pfad für poste.io 2.x).
+      # Fehler (Container existiert, Datei fehlt noch) → leerer String, kein Abbruch.
+      _mail_dkim_raw="$(docker exec posteio \
+        cat "/data/ssl/dkim/${MAIL_DOMAIN}/dkim.pub" 2>/dev/null || true)"
+      if [[ -n "$_mail_dkim_raw" ]]; then
+        # PEM-Header/Footer und Newlines entfernen → base64-Blob für den TXT-Record.
+        _mail_dkim_b64="$(printf '%s' "$_mail_dkim_raw" \
+          | grep -v '^-----' \
+          | tr -d '\n[:space:]')"
+        if [[ -n "$_mail_dkim_b64" ]]; then
+          _mail_dkim_val="v=DKIM1; k=rsa; p=${_mail_dkim_b64}"
+          _mail_dkim_source="Container (posteio /data/ssl/dkim/${MAIL_DOMAIN}/dkim.pub)"
+        fi
+      fi
+    fi
+  fi
+
+  if [[ -n "$_mail_dkim_val" ]]; then
+    ok "DKIM-Key ermittelt (Quelle: ${_mail_dkim_source})"
+    log "DKIM-Record: dkim._domainkey.${MAIL_DOMAIN} TXT"
+    # DKIM-Record darf den restlichen Reconcile NIE abbrechen.
+    _mail_dns_ensure "TXT" "dkim._domainkey.${MAIL_DOMAIN}" "$_mail_dkim_val" "false" || true
+  else
+    printf '  \033[1;33m⚠ DKIM-Key nicht verfügbar (MAIL_DKIM_TXT in .env leer,\033[0m\n'
+    printf '  \033[1;33m  Poste.io-Key noch nicht generiert oder Pfad abweichend).\033[0m\n'
+    printf '  DKIM-Record wird NICHT angelegt — kein Abbruch.\n'
+    printf '  Optionen:\n'
+    printf '    a) Relay-DKIM (Brevo): DKIM-CNAMEs beim Brevo-Domain-Setup einrichten\n'
+    printf '       (CREDENTIAL-SCHRITT — Werte vom Anbieter vorgegeben).\n'
+    printf '    b) Poste.io-Eigen-DKIM: nach erstem posteio-Start den Key in .env setzen:\n'
+    printf '       MAIL_DKIM_TXT=<v=DKIM1; k=rsa; p=<base64>>  dann encrypt-env.sh\n'
+    printf '       Alternativ: einmalig im Cloudflare-Dashboard eintragen.\n'
+  fi
+
+  ok "Mail-DNS reconcile abgeschlossen (${MAIL_DOMAIN})"
 fi
 
 # ============================================================================

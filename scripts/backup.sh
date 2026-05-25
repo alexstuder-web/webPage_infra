@@ -120,14 +120,20 @@ fi
 # Erweiterbarkeit: neue Unit X → (a) Marker /etc/brewing/stateful-units.d/X beim
 # Install setzen + (b) neuer Zweig in unit_jobs() hinzufügen. Kein Kern-Flow-Umbau.
 
-# unit_jobs <unit>: gibt "folder stem" Paare aus (je eine Zeile).
+# unit_jobs <unit>: gibt "folder stem [type]" Tripel aus (je eine Zeile).
+# type ist optional: pg (default, pg_dump) oder tar (Verzeichnis-Archiv).
 unit_jobs() {
   case "$1" in
     supabase)
       printf '%s\n' \
-        "_supabase_core core" \
-        "brew_assistent aibrewgenius" \
-        "rapt_dashboard rapt"
+        "_supabase_core core pg" \
+        "brew_assistent aibrewgenius pg" \
+        "rapt_dashboard rapt pg"
+      ;;
+    mail)
+      # poste-data ist ein Verzeichnis (kein Postgres-DB) → tar | gpg statt pg_dump.
+      # Ordner: mail, Stem: poste. Dateiname: poste_<TS>.tar.gpg
+      printf '%s\n' "mail poste tar"
       ;;
     # Erweiterungspunkt: weitere Units hier als neuer case-Zweig eintragen.
     *)
@@ -139,6 +145,7 @@ unit_jobs() {
 # Effektive Job-Liste aus vorhandenen Markern aufbauen.
 declare -a FOLDERS=()
 declare -a STEMS=()
+declare -a JOB_TYPES=()   # pg = pg_dump, tar = Verzeichnis-Archiv
 
 if [[ -d "$STATEFUL_UNITS_DIR" ]]; then
   shopt -s nullglob
@@ -152,9 +159,10 @@ if [[ -d "$STATEFUL_UNITS_DIR" ]]; then
       log "WARNUNG: unbekannte Unit '$_unit' in ${STATEFUL_UNITS_DIR} — übersprungen"
       continue
     fi
-    while IFS=' ' read -r _folder _stem; do
+    while IFS=' ' read -r _folder _stem _jtype; do
       FOLDERS+=("$_folder")
       STEMS+=("$_stem")
+      JOB_TYPES+=("${_jtype:-pg}")   # default pg für Rückwärtskompatibilität
     done < <(unit_jobs "$_unit")
   done
   shopt -u nullglob
@@ -177,6 +185,13 @@ command -v gpg    >/dev/null 2>&1 || err "gpg fehlt"
 if [[ -d "$STATEFUL_UNITS_DIR" ]] && [[ -f "${STATEFUL_UNITS_DIR}/supabase" ]]; then
   docker inspect "$DB_CONTAINER" >/dev/null 2>&1 \
     || err "Container '$DB_CONTAINER' läuft nicht — Stack starten (docker compose ... up -d)"
+fi
+
+# posteio-Check: nur wenn mail-Job aktiv (Marker gesetzt).
+MAIL_CONTAINER="${MAIL_CONTAINER:-posteio}"
+if [[ -d "$STATEFUL_UNITS_DIR" ]] && [[ -f "${STATEFUL_UNITS_DIR}/mail" ]]; then
+  docker inspect "$MAIL_CONTAINER" >/dev/null 2>&1 \
+    || err "Container '$MAIL_CONTAINER' läuft nicht — Stack starten (docker compose up -d posteio)"
 fi
 
 mkdir -p "$BACKUP_DIR"
@@ -257,8 +272,45 @@ dump_one() {
   PRODUCED_FILES+=("$out")
 }
 
+# ---------------------------------------------------------------- Verzeichnis-Archiv → GPG
+# archive_one: wie dump_one, aber statt pg_dump wird ein tar-Archiv des
+# poste-data-Verzeichnisses durch gpg gestreamt. Kein Klartext-Tar auf Platte.
+# Konvention: <stem>_<TS>.tar.gpg (statt .fc.gpg → Rotation-Regex angepasst).
+archive_one() {
+  local folder="$1" stem="$2"
+  local dir="${BACKUP_DIR}/${folder}"
+  mkdir -p "$dir"
+  local base="${stem}_${TS}"
+  [[ -n "$LABEL" ]] && base="${base}_${LABEL}"
+  local out="${dir}/${base}.tar.gpg"
+
+  # N-4 VERIFY: REPO_DIR ist oben via 'cd "$(dirname "$0")/.." && REPO_DIR="$(pwd)"'
+  # definiert (Zeile ~61) — zeigt auf das Verzeichnis des compose-Files, in dem
+  # ./poste-data liegt. Quellverzeichnis ist damit korrekt $REPO_DIR/poste-data.
+  local src_dir="${REPO_DIR}/poste-data"
+  [[ -d "$src_dir" ]] \
+    || err "archive_one '${folder}': Quellverzeichnis '${src_dir}' nicht gefunden — posteio jemals gestartet?"
+
+  log "Archiv '${folder}' → ${folder}/${out##*/}"
+  # tar -C <parent> -cf - <dirname>: relative Namen im Archiv (portabel).
+  # pipefail lässt die Pipe rot werden wenn tar fehlschlägt.
+  if ! tar -C "$REPO_DIR" -cf - "poste-data" \
+       | gpg --batch --yes --symmetric --cipher-algo AES256 \
+             --pinentry-mode loopback --passphrase-file "$PASS_TMP" \
+             -o "$out"; then
+    rm -f "$out"
+    err "Archiv '${folder}' fehlgeschlagen (tar | gpg) — unvollständige Datei entfernt"
+  fi
+  [[ -s "$out" ]] || { rm -f "$out"; err "Archiv '${folder}' ist leer — abgebrochen"; }
+  ok "${folder}: $(basename "$out") ($(du -h "$out" | cut -f1))"
+  PRODUCED_FILES+=("$out")
+}
+
 for i in "${!FOLDERS[@]}"; do
-  dump_one "${FOLDERS[$i]}" "${STEMS[$i]}"
+  case "${JOB_TYPES[$i]:-pg}" in
+    tar) archive_one "${FOLDERS[$i]}" "${STEMS[$i]}" ;;
+    *)   dump_one    "${FOLDERS[$i]}" "${STEMS[$i]}" ;;
+  esac
 done
 
 # ---------------------------------------------------------------- Rotation (lokal, PRO ORDNER)
@@ -266,17 +318,29 @@ done
 # den Rest löschen. N = $BACKUP_KEEP (default 7). Gelabelte Dumps (--label)
 # bleiben rotation-exempt. Dateiname sortiert == chronologisch (TS im Namen).
 rotate_folder() {
-  local folder="$1" stem="$2"
+  local folder="$1" stem="$2" jtype="${3:-pg}"
   local dir="${BACKUP_DIR}/${folder}"
   [[ -d "$dir" ]] || return 0
 
+  # Datei-Extension und Regex hängen vom Job-Typ ab:
+  #   pg  → .fc.gpg  (pg_dump custom format)
+  #   tar → .tar.gpg (Verzeichnis-Archiv)
+  local ext regex
+  if [[ "$jtype" == "tar" ]]; then
+    ext=".tar.gpg"
+    regex="^${stem}_[0-9]{8}_[0-9]{6}$"
+  else
+    ext=".fc.gpg"
+    regex="^${stem}_[0-9]{8}_[0-9]{6}$"
+  fi
+
   local -a files=()
   shopt -s nullglob
-  for f in "$dir/${stem}_"[0-9]*_[0-9]*.fc.gpg; do
+  for f in "$dir/${stem}_"[0-9]*_[0-9]*"${ext}"; do
     # Nur automatische Dumps (<stem>_YYYYMMDD_HHMMSS) — gelabelte (mit weiterem
     # _<wort> nach HHMMSS) ausschließen.
-    local base; base="$(basename "$f" .fc.gpg)"
-    [[ "$base" =~ ^${stem}_[0-9]{8}_[0-9]{6}$ ]] && files+=("$f")
+    local base; base="$(basename "$f" "${ext}")"
+    [[ "$base" =~ $regex ]] && files+=("$f")
   done
   shopt -u nullglob
 
@@ -302,7 +366,7 @@ rotate_folder() {
 
 log "Lokale Rotation pro Ordner (neueste N=${BACKUP_KEEP} behalten)"
 for i in "${!FOLDERS[@]}"; do
-  rotate_folder "${FOLDERS[$i]}" "${STEMS[$i]}"
+  rotate_folder "${FOLDERS[$i]}" "${STEMS[$i]}" "${JOB_TYPES[$i]:-pg}"
 done
 ok "Lokale Rotation fertig"
 
@@ -349,15 +413,27 @@ upload_r2() {
 #   $2 folder z.B. "_supabase_core"
 #   $3 stem   z.B. "core"   (filtert gelabelte Dumps wie das lokale Pendant)
 prune_r2_folder() {
-  local base="$1" folder="$2" stem="$3"
+  local base="$1" folder="$2" stem="$3" jtype="${4:-pg}"
   local path="${base}/${folder}/"
 
+  # Datei-Extension und Regex hängen vom Job-Typ ab.
+  local ext rclone_include regex
+  if [[ "$jtype" == "tar" ]]; then
+    ext=".tar.gpg"
+    rclone_include="*.tar.gpg"
+    regex="^${stem}_[0-9]{8}_[0-9]{6}\.tar\.gpg$"
+  else
+    ext=".fc.gpg"
+    rclone_include="*.fc.gpg"
+    regex="^${stem}_[0-9]{8}_[0-9]{6}\.fc\.gpg$"
+  fi
+
   # rclone lsf: nur Dateinamen, eine Ebene. Auf automatische Dumps filtern
-  # (<stem>_YYYYMMDD_HHMMSS.fc.gpg) → gelabelte bleiben exempt.
+  # (<stem>_YYYYMMDD_HHMMSS.<ext>) → gelabelte bleiben exempt.
   local -a names=()
   while IFS= read -r n; do
-    [[ "$n" =~ ^${stem}_[0-9]{8}_[0-9]{6}\.fc\.gpg$ ]] && names+=("$n")
-  done < <(rclone lsf "$path" --include '*.fc.gpg' 2>/dev/null | sort -r)
+    [[ "$n" =~ $regex ]] && names+=("$n")
+  done < <(rclone lsf "$path" --include "$rclone_include" 2>/dev/null | sort -r)
 
   (( ${#names[@]} == 0 )) && { echo "  ${folder}: R2 leer/keine Auto-Dumps"; return 0; }
 
@@ -380,7 +456,7 @@ prune_r2() {
   log "R2-Rotation pro Ordner (neueste N=${BACKUP_KEEP} behalten)"
   local i
   for i in "${!FOLDERS[@]}"; do
-    prune_r2_folder "R2:${R2_BUCKET}" "${FOLDERS[$i]}" "${STEMS[$i]}"
+    prune_r2_folder "R2:${R2_BUCKET}" "${FOLDERS[$i]}" "${STEMS[$i]}" "${JOB_TYPES[$i]:-pg}"
   done
   ok "R2-Rotation fertig"
 }
@@ -396,4 +472,4 @@ else
   echo "  --no-upload gesetzt — Off-site-Upload + R2-Rotation übersprungen."
 fi
 
-log "✓ Backup abgeschlossen (${#STEMS[@]} Dumps: ${STEMS[*]})"
+log "✓ Backup abgeschlossen (${#STEMS[@]} Jobs: ${STEMS[*]})"

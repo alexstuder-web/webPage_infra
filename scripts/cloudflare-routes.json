@@ -19,6 +19,8 @@
       "_comment": "NUR HUB-VPS. Portainer UI (Port 9000). Hinter Cloudflare Access schützen (Credential-Schritt). Reconcile beansprucht diesen Eintrag nur wenn PORTAINER_ROLE=hub in .env gesetzt ist." },
     { "hostname": "edge.alexstuder.cloud",         "service": "http://portainer:8000",
       "_portainer_hub": true,
-      "_comment": "NUR HUB-VPS. Portainer Edge-Endpoint (Port 8000). OEFFENTLICH — Absicherung via Edge-Key/UUID-Handshake. Spoke-VPS pollen AUSGEHEND gegen diese URL. Kein Cloudflare Access davor. Reconcile beansprucht nur bei PORTAINER_ROLE=hub." }
+      "_comment": "NUR HUB-VPS. Portainer Edge-Endpoint (Port 8000). OEFFENTLICH — Absicherung via Edge-Key/UUID-Handshake. Spoke-VPS pollen AUSGEHEND gegen diese URL. Kein Cloudflare Access davor. Reconcile beansprucht nur bei PORTAINER_ROLE=hub." },
+    { "hostname": "webmail.alexstuder.cloud",      "service": "http://posteio:80",
+      "_comment": "Poste.io Webmail/Admin-UI. Normaler HTTP-Tunnel-Ingress (proxied CNAME wie alle anderen Routen). Poste.io liefert intern Plain-HTTP (HTTPS=OFF); TLS-Terminierung am Cloudflare-Edge. Kein CF Access davor — Poste.io hat seinen eigenen Login. Mail-DNS (MX/A-unproxied/SPF/DMARC) wird NICHT hier gehandhabt: die werden als eigene nicht-proxied Records in cloudflare-reconcile.sh (Mail-Sektion, marker-gesteuert) angelegt." }
   ]
 }

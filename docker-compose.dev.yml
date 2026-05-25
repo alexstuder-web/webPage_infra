@@ -45,3 +45,16 @@ services:
   supabase-studio:
     ports:
       - "54323:3000"
+
+  # posteio: kein Dev-Override nötig — Mail wird lokal nicht gestartet.
+  # posteio hat kein 'profiles:' in der base-compose und würde bei einem
+  # ungewollten 'docker compose up' (ohne expliziten Service-Namen) mit starten.
+  # Schutz: posteio nur via 'docker compose up -d posteio' explizit starten.
+  # Dev-Start verhindert außerdem die Port-Belegung (25/465/587/143/993 lokal).
+  # Soll posteio trotzdem lokal getestet werden, muss es explizit aufgerufen werden:
+  #   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d posteio
+  #
+  # pull_policy: missing verhindert, dass ein 'compose up' ohne Service-Filter
+  # das posteio-Image bei fehlendem lokalem Image automatisch pullt.
+  posteio:
+    pull_policy: missing
