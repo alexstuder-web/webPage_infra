@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
 # ============================================================================
-# apply-db-migrations.sh — Brewing-Stack DB-Migrationen anwenden
+# apply-db-migrations.sh — Dev-/Regenerations-Tool: historische Migrations-Kette
 #
-# Wendet die SQL-Migrationen in der korrekten Reihenfolge auf supabase-db an:
+# ZWECK (nach Baseline-Squash):
+#   Dieses Script spielt die 14 historischen Migrations-Dateien der Reihe nach
+#   durch und erzeugt so den Schema-Baseline neu — nützlich um den Baseline zu
+#   verifizieren oder Migrations-History nachzuvollziehen.
 #
-#   Reihenfolge (hartverdrahtet, Abhängigkeiten beachten!):
+#   Für FRISCHE Prod-Deploys → apply-baseline.sh verwenden:
+#     ./scripts/apply-baseline.sh
+#   Das wendet den konsolidierten Baseline (db_scripts/baseline_schema.sql)
+#   in einem einzigen Apply an — schneller, getestet, keine Abhängigkeit auf
+#   die App-Repos auf dem Ziel-Server.
+#
+#   Dieses Script bleibt als Regenerations- und Dev-Tool erhalten; die
+#   Migrations-Files in den App-Repos sind die historische Quelle der Wahrheit.
+#
+# Migrationsreihenfolge (hartverdrahtet, Abhängigkeiten beachten!):
 #     1. aibrewgenius/full/001_init_schema.sql      (frisches Schema)
 #     2. aibrewgenius/migrations/002_auth.sql       (Multi-User + RLS)
 #     3. aibrewgenius/migrations/003_vault.sql      (API-Keys via Vault)
@@ -26,7 +38,8 @@
 # WICHTIG: aibrewgenius-Migrationen MÜSSEN vor rapt laufen.
 #   Grund: rapt/004_rapt_user_vault.sql setzt einen auth.users-Lookup per
 #   email='alex@alexstuder.ch' voraus — dieser User wird erst durch
-#   aibrewgenius/002_auth.sql angelegt.
+#   aibrewgenius/002_auth.sql angelegt. Im konsolidierten Baseline ist diese
+#   Reihenfolge bereits korrekt eingebaut.
 #
 # IDEMPOTENZ-HINWEIS:
 #   001_init_schema.sql beginnt mit DROP SCHEMA IF EXISTS aibrewgenius CASCADE —

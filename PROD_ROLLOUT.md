@@ -10,27 +10,26 @@ setzt voraus, dass `bootstrap.sh` bereits gelaufen ist und `supabase-db` läuft.
 
 ---
 
-## Migrations-Liste (vollständig, geordnet)
+## Schema-Baseline (Szenario A: frische DB)
 
-Die Reihenfolge ist nicht verhandelbar. `rapt/004` setzt einen `auth.users`-Lookup
-voraus, der erst durch `aibrewgenius/002` existiert.
+Für frische Deploys gibt es eine konsolidierte Baseline-Datei:
 
-| # | Datei | Pfad |
-|---|-------|------|
-| 1 | `001_init_schema.sql` | `brew_assistent-new/db_scripts/full/` |
-| 2 | `002_auth.sql` | `brew_assistent-new/db_scripts/migrations/` |
-| 3 | `003_vault.sql` | `brew_assistent-new/db_scripts/migrations/` |
-| 4 | `004_proxy_role.sql` | `brew_assistent-new/db_scripts/migrations/` |
-| 5 | `005_fix_proxy_role_grants.sql` | `brew_assistent-new/db_scripts/migrations/` |
-| 6 | `006_retire_aibrewgenius_rapt.sql` | `brew_assistent-new/db_scripts/migrations/` |
-| 7 | `007_harden_brewfather_search_path.sql` | `brew_assistent-new/db_scripts/migrations/` |
-| 8 | `008_drop_aibrewgenius_rapt_columns.sql` | `brew_assistent-new/db_scripts/migrations/` |
-| 9 | `009_drop_aibrewgenius_rapt_shims.sql` | `brew_assistent-new/db_scripts/migrations/` |
-| 10 | `001_init_rapt_schema.sql` | `RAPT_Brewing_Dashboard-new/db_scripts/` |
-| 11 | `002_user_profiles.sql` | `RAPT_Brewing_Dashboard-new/db_scripts/` |
-| 12 | `003_device_activity_view.sql` | `RAPT_Brewing_Dashboard-new/db_scripts/` |
-| 13 | `004_rapt_user_vault.sql` | `RAPT_Brewing_Dashboard-new/db_scripts/` |
-| 14 | `005_rapt_telemetry_owner.sql` | `RAPT_Brewing_Dashboard-new/db_scripts/` |
+```
+webPage_infra/db_scripts/baseline_schema.sql
+```
+
+Diese eine Datei reproduziert den getesteten End-Zustand aller 14 historischen
+Migrationen (aibrewgenius 001–009 + rapt 001–005) auf einer frischen
+`supabase/postgres:15.8.1.060`-Instanz. Die korrekte Cross-Schema-Reihenfolge
+(aibrewgenius vor rapt) ist im Baseline bereits eingebaut.
+
+Die Migrations-Files in den App-Repos bleiben als historische Dokumentation erhalten
+und können via `apply-db-migrations.sh` zum Nachvollziehen der Änderungshistorie oder
+zur Neuerzeugung des Baseline verwendet werden. Für den Prod-Deploy werden sie nicht
+mehr benötigt.
+
+**Nach dem Launch:** Neue Schema-Änderungen laufen als neue Migrations-Dateien auf dem
+Baseline — der Baseline selbst wird nicht mehr editiert.
 
 ---
 
@@ -46,16 +45,20 @@ Folgende Punkte müssen erfüllt sein, bevor Schritt 1 beginnt:
 - [ ] `zz-set-role-passwords.sh` automatisch gelaufen beim ersten DB-Start
   (setzt `supabase_admin`-, `proxy_sync`- und weitere Passwörter aus `.env`)
 
-**App-Repos verfügbar machen** — eine von zwei Varianten wählen:
+**Baseline-Datei verfügbar machen** — eine von zwei Varianten wählen:
 
-**Variante 1 — App-Repos auf dem VPS klonen** (empfohlen für Erstssetup):
+Die Baseline-Datei `db_scripts/baseline_schema.sql` liegt im `webPage_infra`-Repo
+und ist damit bei einem Repo-Klon automatisch vorhanden. App-Repos müssen für den
+Baseline-Apply nicht mehr geklont werden.
+
+**Variante 1 — Apply direkt auf dem VPS** (empfohlen):
 ```bash
-cd ~
-git clone https://github.com/alexstuder-web/brew_assistent-new.git
-git clone https://github.com/alexstuder-web/RAPT_Brewing_Dashboard-new.git
+# webPage_infra ist bereits geklont (Bootstrap-Schritt)
+cd ~/webPage_infra
+./scripts/apply-baseline.sh
 ```
 
-**Variante 2 — Apply vom Dev-Rechner via DB-TCP-Tunnel** (keine Repo-Klone auf VPS nötig):
+**Variante 2 — Apply vom Dev-Rechner via DB-TCP-Tunnel** (VPS-Zugriff nicht nötig):
 ```bash
 # DB-TCP-Tunnel starten (siehe docker-compose.tunnel-tcp.yml)
 # Dann auf dem Dev-Rechner:
@@ -67,9 +70,7 @@ export PGDATABASE=postgres
 # Alternative: PGPASSFILE=~/.pgpass (PostgreSQL-Passwort-Datei, chmod 600).
 read -rs -p "supabase_admin Passwort: " PGPASSWORD; echo
 export PGPASSWORD
-export EXTERNAL_PSQL=1
-cd ~/webPage_infra
-./scripts/apply-db-migrations.sh --yes
+EXTERNAL_PSQL=1 ./scripts/apply-baseline.sh --yes
 unset PGPASSWORD
 ```
 
@@ -77,15 +78,16 @@ unset PGPASSWORD
 
 ## Schritt 0 — Dry-Run (Pflicht vor jedem Apply)
 
-Vor dem eigentlichen Apply immer erst die Dateiliste prüfen:
+Vor dem eigentlichen Apply immer erst den Plan prüfen:
 
 ```bash
 cd ~/webPage_infra
-./scripts/apply-db-migrations.sh --dry-run
+./scripts/apply-baseline.sh --dry-run
 ```
 
-Erwartete Ausgabe: 14 Migrations-Dateien mit korrekten Pfaden und Zeilenzahlen.
-Wenn Dateien fehlen: App-Repos klonen (Variante 1) oder Pfade mit `-a` / `-r` setzen.
+Erwartete Ausgabe: Baseline-Datei gefunden mit Pfad und Zeilenzahl, Ziel-Container
+und Warnung zu DROP SCHEMA. Wenn die Datei fehlt: `webPage_infra`-Repo aktuell ziehen
+(`git pull`).
 
 ---
 
@@ -111,12 +113,22 @@ ls -lh ~/webPage_infra/backups/supabase/ | grep pre-migration
 
 ---
 
-## Schritt 2 — Migrationen anwenden
+## Schritt 2 — DB-Init via Baseline (Szenario A: frische DB)
+
+*Szenario B (Daten vorhanden): Schritt 2 überspringen — Baseline nicht auf einer
+bereits migrierten DB anwenden. Stattdessen neue Migrations-Dateien manuell via
+`docker exec ... psql` anwenden.*
+
+**Hintergrund:** Auf einer frischen Prod-DB gibt es keine Bestandsdaten, die durch
+Migrations-Wiedergabe geschützt werden müssten. Der konsolidierte Baseline ist der
+direkte, getestete End-Zustand — er ist schneller, einfacher, und erfordert keine
+App-Repo-Klone auf dem Ziel-Server. Die einzelnen Migrations-Files in den App-Repos
+bleiben als historische Dokumentation erhalten; `apply-db-migrations.sh` ist ihr
+Regenerations-Tool.
 
 **Vor dem Apply:** brew-proxy stoppen, falls er läuft.
-`rapt/005_rapt_telemetry_owner.sql` setzt `lock_timeout='5s'` und nimmt einen
-Table-Lock auf `telemetry_*`. Eine aktive brew-proxy-Verbindung kann diesen Lock
-halten und den Apply abbrechen. Sicherer Ablauf:
+Der Baseline enthält einen Table-Lock auf `telemetry_*` (rapt-Teil). Eine aktive
+brew-proxy-Verbindung kann diesen Lock halten und den Apply abbrechen.
 
 ```bash
 docker stop brew-proxy 2>/dev/null || true
@@ -124,15 +136,15 @@ docker stop brew-proxy 2>/dev/null || true
 
 ```bash
 cd ~/webPage_infra
-./scripts/apply-db-migrations.sh
+./scripts/apply-baseline.sh
 ```
 
 Das Script:
-- prüft alle 14 SQL-Dateien vor dem Start (kein partieller Apply bei fehlenden Dateien)
-- fragt interaktiv nach Bestätigung (TTY), da 001_init_schema.sql destruktiv ist;
-  bei Nicht-TTY (Pipe/CI) ist `--yes` zwingend erforderlich, sonst Abbruch
-- wendet jede Datei mit `ON_ERROR_STOP=1` an — Abbruch bei erstem Fehler
-- loggt jede Datei mit klarem Start/Ende
+- prüft `db_scripts/baseline_schema.sql` und den Ziel-Container vor dem Start
+- fragt interaktiv nach Bestätigung (TTY), da der Baseline DROP SCHEMA ... CASCADE
+  enthält; bei Nicht-TTY (Pipe/CI) ist `--yes` zwingend erforderlich, sonst Abbruch
+- wendet die Datei mit `ON_ERROR_STOP=1` an — Abbruch bei erstem Fehler
+- schreibt kein Passwort in argv oder Logs (PGPASSWORD via `-e` an docker exec)
 
 **Nach dem Apply:** brew-proxy wieder starten:
 
@@ -140,26 +152,13 @@ Das Script:
 docker start brew-proxy
 ```
 
-**Alternative Pfade** (falls App-Repos nicht in `../` liegen):
-```bash
-./scripts/apply-db-migrations.sh \
-  -a /pfad/zu/brew_assistent-new/db_scripts \
-  -r /pfad/zu/RAPT_Brewing_Dashboard-new/db_scripts
-```
-
-**Wenn eine Migration fehlschlägt:**
+**Wenn der Apply fehlschlägt:**
 1. Fehlerausgabe lesen — psql gibt die SQL-Zeile und den Postgres-Fehler aus
-2. Wenn die Fehler-Migration eine Transaktion enthält (BEGIN/COMMIT): alles vor
-   dem Fehler wurde zurückgerollt — die Migration kann nach dem Fix wiederholt werden
-3. Wenn keine Transaktion: partiellen Zustand prüfen und ggf. manuell aufräumen
-4. Szenario B: bei unklarem Zustand Backup (Schritt 1) einspielen (`restore.sh all`)
-
-**Hinweis Datenmigrations-Schritte bei frischer DB:**
-- `002_auth.sql` legt den Bootstrap-User `alex@alexstuder.ch` an (UUID) und
-  migriert die `'self_hosted_profile'`-Row. Auf einer frischen DB gibt es keine
-  Bestandsdaten → der Migration-Schritt läuft als No-op durch.
-- `rapt/005_rapt_telemetry_owner.sql` enthält eine Datenmigration
-  (`owner IS NULL → Alex-UUID`). Auf einer frischen DB existieren keine Rows → No-op.
+2. Der Baseline läuft in einer expliziten Transaktion (BEGIN/COMMIT am Anfang/Ende):
+   bei Fehler wird alles zurückgerollt — die DB bleibt sauber, nach dem Fix einfach
+   nochmals starten
+3. Bei unklarem Zustand: Volume löschen, supabase-db neu starten (frische Init),
+   dann erneut anwenden
 
 ---
 
@@ -317,35 +316,33 @@ printf "ALTER ROLE proxy_sync PASSWORD :'pw';\n" \
 unset _pg_pw _sync_pw
 ```
 
-### Migrations-Abbruch bei rapt/005 (lock_timeout)
+### Baseline-Abbruch wegen Lock-Timeout (rapt-Teil)
 
-`rapt/005_rapt_telemetry_owner.sql` setzt `lock_timeout='5s'` für Prod. Bei
-laufenden Verbindungen (brew-proxy aktiv) kann der Lock-Timeout ausgelöst werden.
-Lösung: brew-proxy vor dem Apply stoppen, danach neu starten.
+Der rapt-Teil des Baseline setzt `lock_timeout='5s'` und nimmt einen Table-Lock auf
+`telemetry_*`. Bei laufenden Verbindungen (brew-proxy aktiv) kann der Timeout
+ausgelöst werden. Lösung: brew-proxy vor dem Apply stoppen, danach neu starten.
 
 ```bash
 docker stop brew-proxy
-./scripts/apply-db-migrations.sh -r /pfad/zu/RAPT_Brewing_Dashboard-new/db_scripts
-# (nur rapt-Migrations wenn aibrewgenius bereits angewendet)
+./scripts/apply-baseline.sh --yes
 docker start brew-proxy
 ```
 
-Für einen teilweisen Apply (nur die verbleibenden Dateien) muss das Script manuell
-adaptiert werden — ein automatischer "ab-Datei"-Parameter existiert noch nicht (siehe
-unten: Bekannte Lücken).
+Da der gesamte Baseline in einer Transaktion läuft, ist der Zustand nach einem
+Abbruch sauber zurückgerollt — nach dem Stopp von brew-proxy einfach erneut starten.
 
 ---
 
 ## Bekannte Lücken / Künftige Verbesserungen
 
 - **Kein Versions-Tracking:** Es gibt keine Tabelle (à la Flyway `flyway_schema_history`),
-  die festhält, welche Migrationen bereits angewendet wurden. Auf einer teilweise
-  migrierten DB muss manuell geprüft werden, welche Dateien noch fehlen. Künftig:
-  eine `schema_migrations`-Tabelle einführen und `apply-db-migrations.sh` um einen
+  die festhält, welche Migrationen bereits angewendet wurden. Neue Migrations-Dateien
+  nach dem Launch müssen manuell via `docker exec ... psql` angewendet werden. Künftig:
+  eine `schema_migrations`-Tabelle einführen und ein Apply-Script um einen
   Skip-already-applied-Mechanismus erweitern.
-- **Kein "ab-Datei"-Parameter:** `apply-db-migrations.sh` beginnt immer bei Datei 1
-  (001_init_schema, destruktiv). Für einen teil-Apply müssen die Dateien manuell
-  via `docker exec ... psql < <file>` angewendet werden.
-- **001_init_schema ist destruktiv:** `DROP SCHEMA IF EXISTS aibrewgenius CASCADE`
-  macht Datenverlust auf re-run. Langfristig sollte 001 in idempotente Teilschritte
-  aufgeteilt werden.
+- **Kein "ab-Datei"-Parameter in apply-db-migrations.sh:** Das Regenerations-Tool
+  beginnt immer bei Datei 1 (destruktiv). Für einen teil-Apply müssen die Dateien
+  manuell via `docker exec ... psql < <file>` angewendet werden.
+- **Baseline ist destruktiv bei Re-Run:** `apply-baseline.sh` ist für frische DBs
+  gedacht. Auf einer DB mit Daten führt ein Re-Run zu Datenverlust (DROP SCHEMA CASCADE).
+  Das Script erzwingt daher eine explizite Bestätigung und warnt deutlich.
