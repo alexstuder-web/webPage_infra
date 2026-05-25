@@ -1,36 +1,29 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Brewing-Stack Postgres-Backup — Variante A (pro App getrennt, off-site)
+# Brewing-Stack Postgres-Backup — Variante A (konsistenter Whole-DB-Dump, off-site)
 #
 # Marker-gesteuert: welche Jobs laufen, leitet backup.sh aus den installierten
 # stateful Units unter $STATEFUL_UNITS_DIR (/etc/brewing/stateful-units.d/) ab.
 # Auf einem stateless-only VPS (kein Marker) → sauberer No-op, Exit 0.
 #
-# Drei getrennte pg_dump -Fc als supabase_admin, jeder einzeln direkt durch GPG
-# gestreamt (kein Klartext-Dump landet je auf Platte):
+# EIN pg_dump -Fc der gesamten DB als supabase_admin, direkt durch GPG gestreamt
+# (kein Klartext-Dump landet je auf Platte):
 #
-#   docker exec supabase-db pg_dump -Fc -U supabase_admin -d postgres ...
+#   docker exec supabase-db pg_dump -Fc -U supabase_admin -d postgres
 #     │
 #     ▼  gpg --batch --symmetric --cipher-algo AES256 (gleiche Passphrase wie .env.gpg)
 #     ▼
-#   backups/<folder>/<name>_<TS>[_<label>].fc.gpg   ──►  Upload R2 backup/<folder>/
+#   backups/supabase/supabase_<TS>[_<label>].fc.gpg   ──►  Upload R2 backup/supabase/
 #
-#   Unit 'supabase' — drei Jobs:
-#   1. _supabase_core  → pg_dump --exclude-schema=aibrewgenius --exclude-schema=rapt
-#                        (auth + storage + public + _realtime + Rest)
-#   2. brew_assistent  → pg_dump -n aibrewgenius
-#   3. rapt_dashboard  → pg_dump -n rapt
+#   Unit 'supabase' — ein Job:
+#   1. supabase  → pg_dump (ganzer DB-Dump, kein --exclude-schema / -n)
+#                  (auth + storage + public + _realtime + aibrewgenius + rapt + Rest)
 #
-# Beide App-Schemas referenzieren das gemeinsame auth.users → core MUSS zuerst
-# zurückgespielt werden (siehe restore.sh).
-#
-# KONSISTENZ-HINWEIS (bewusste Entscheidung): Die drei Dumps laufen back-to-back,
-# OHNE geteilten Snapshot (kein pg_export_snapshot/--snapshot). Daraus ergibt sich
-# ein winziges Inkonsistenz-Fenster (Sekunden) zwischen den Dumps: ein in dieser
-# Zeit neu angelegter auth.users-Row könnte im core-Dump fehlen, aber von einem
-# später gedumpten App-Row referenziert werden. Der nightly-Lauf um 03:00 trifft
-# praktisch keine Schreiblast; ein Restore mit --no-owner lässt eine evtl. fehlende
-# FK-Referenz höchstens als nicht-fatalen Fehler stehen. Dokumentiert in README.
+# KONSISTENZ: Ein einzelner pg_dump -Fc erzeugt per Definition EINEN konsistenten
+# Transaktions-Snapshot der gesamten DB — kein Cross-Dump-FK-Inkonsistenz-Fenster.
+# Das frühere 3-fach-Dump-Modell (back-to-back, kein gemeinsamer Snapshot) ist damit
+# eliminiert. Selektiver Schema-Restore (aibrewgenius / rapt) bleibt erhalten via
+# pg_restore --schema=... aus demselben einen Dump (→ restore.sh).
 #
 # Manuell:        ./scripts/backup.sh
 # Pre-Migration:  ./scripts/backup.sh --label pre-migration   (rotation-exempt)
@@ -85,10 +78,8 @@ Usage: $0 [--label <name>] [--no-upload]
 Welche Jobs laufen, wird aus den Markern in \$STATEFUL_UNITS_DIR
 (${STATEFUL_UNITS_DIR}) abgeleitet. Kein Marker → No-op, Exit 0.
 
-Unit 'supabase' erzeugt drei Dumps:
-  backups/_supabase_core/core_<TS>.fc.gpg
-  backups/brew_assistent/aibrewgenius_<TS>.fc.gpg
-  backups/rapt_dashboard/rapt_<TS>.fc.gpg
+Unit 'supabase' erzeugt einen Whole-DB-Dump:
+  backups/supabase/supabase_<TS>.fc.gpg
 EOF
   exit 1
 }
@@ -125,10 +116,9 @@ fi
 unit_jobs() {
   case "$1" in
     supabase)
-      printf '%s\n' \
-        "_supabase_core core pg" \
-        "brew_assistent aibrewgenius pg" \
-        "rapt_dashboard rapt pg"
+      # Ein konsistenter Whole-DB-Dump: kein -n / --exclude-schema.
+      # Früher 3 separate Dumps (core/aibrewgenius/rapt) — jetzt ein einziger Snapshot.
+      printf '%s\n' "supabase supabase pg"
       ;;
     mail)
       # poste-data ist ein Verzeichnis (kein Postgres-DB) → tar | gpg statt pg_dump.
@@ -229,19 +219,20 @@ fi
 # für einen folder-Wert zurück (als Wort-Liste via echo).
 # Die FOLDERS/STEMS-Arrays werden marker-gesteuert oben befüllt; dump_args() ist
 # die Job-Definition (was gedumpt wird) und bleibt davon getrennt.
+#
+# supabase → kein -n / --exclude-schema → Whole-DB-Dump (alle Schemas in einer
+# konsistenten Transaktion). Frühere Einzel-Schema-Zweige entfernt.
 dump_args() {
   case "$1" in
-    _supabase_core) echo "--exclude-schema=aibrewgenius --exclude-schema=rapt" ;;
-    brew_assistent) echo "-n aibrewgenius" ;;
-    rapt_dashboard) echo "-n rapt" ;;
-    *)              err "Unbekannter Backup-Ordner: $1" ;;
+    supabase) printf '' ;;   # Whole-DB: keine Schema-Einschränkung (leere Ausgabe = keine pg_dump-Flags)
+    *)        err "Unbekannter Backup-Ordner: $1" ;;
   esac
 }
 
 TS="$(date +%Y%m%d_%H%M%S)"
 
-# ---------------------------------------------------------------- Dump → GPG (3×)
-# back-to-back, kein geteilter Snapshot (Konsistenz-Hinweis im Header/README).
+# ---------------------------------------------------------------- Dump → GPG
+# Ein Whole-DB-Dump pro supabase-Unit: ein konsistenter Transaktions-Snapshot.
 declare -a PRODUCED_FILES=()   # für Upload + Abschlussreport
 
 dump_one() {
@@ -252,9 +243,11 @@ dump_one() {
   [[ -n "$LABEL" ]] && base="${base}_${LABEL}"
   local out="${dir}/${base}.fc.gpg"
 
-  # pg_dump-Schema-Argumente sind statisch/aus dump_args → bewusst gewortsplittet.
-  local -a pgargs
-  read -ra pgargs <<< "$(dump_args "$folder")"
+  # pg_dump-Schema-Argumente aus dump_args(); bewusst gewortsplittet.
+  # Whole-DB-Dump (supabase) liefert leeren String → leeres Array, keine Argumente.
+  local _da pgargs=()
+  _da="$(dump_args "$folder")"
+  [[ -n "$_da" ]] && read -ra pgargs <<< "$_da"
 
   log "Dump '${folder}' → ${folder}/${out##*/}"
   # PGPASSWORD wird im Container gesetzt (-e), erscheint nicht in der Host-argv.

@@ -3,6 +3,7 @@
 > **Status:** Implementiert + lokal getestet (Variante A; keep-N=7 lokal+R2; cron als `alex`).
 > `scripts/backup.sh` / `restore.sh` / `bootstrap.sh` fertig; Round-Trip, Retention und
 > echter R2-Upload gegen Wegwerf-Stack verifiziert. Multi-VPS Phase 1 + Phase 2 committed.
+> **Phase 4:** 3-fach-Split auf einen konsistenten Whole-DB-Dump (supabase/) umgestellt.
 > **Noch offen:** Smoke-Test auf echtem zweiten VPS; echter 2-VPS-Migrations-Round-Trip noch
 > nicht live durchgeführt.
 
@@ -26,11 +27,11 @@ Supabase-Postgres in diesem Repo. Alles andere ist stateless.
 
 **Wichtig:** Beide Apps teilen sich **eine** Postgres-DB, und `auth` (User-Logins) ist
 **gemeinsam** — `aibrewgenius.*` und `rapt.*` referenzieren beide `auth.users`
-(RLS via `auth.uid()`). Deshalb gibt es neben den App-Schemas einen geteilten
-`_supabase_core`-Anteil (auth, storage, public, \_realtime, …).
+(RLS via `auth.uid()`) und `vault.secrets`. Deshalb wird die gesamte DB in einem
+konsistenten Whole-DB-Dump gesichert (kein Schema-Split mehr, kein FK-Inkonsistenz-Risiko).
 
 `supabase-storage-data` Volume ist aktuell ungenutzt (keine Upload-Calls in den Apps) —
-wird vorsorglich im `_supabase_core`-Anteil mitberücksichtigt (cron-Stand).
+ist im Whole-DB-Dump implizit enthalten (Supabase-`storage`-Schema).
 
 ---
 
@@ -38,24 +39,23 @@ wird vorsorglich im `_supabase_core`-Anteil mitberücksichtigt (cron-Stand).
 
 | Punkt | Entscheidung |
 |---|---|
-| Dump-Granularität | **Variante A — pro App getrennt.** Je ein `pg_dump -Fc` pro App-Schema + ein `_supabase_core`-Dump (alles außer den App-Schemas). |
-| Konsistenz | Die 3 Dumps laufen **back-to-back** (kein gemeinsamer Snapshot). Das winzige Cross-Dump-Inkonsistenz-Fenster ist akzeptiert + dokumentiert (→ L2). |
+| Dump-Granularität | **Variante A — Whole-DB.** Ein einziger `pg_dump -Fc` der gesamten DB (Phase 4: von 3-fach-Split auf Single-Snapshot umgestellt). |
+| Konsistenz | Ein `pg_dump -Fc` erzeugt **einen konsistenten Transaktions-Snapshot** — kein Cross-Dump-FK-Inkonsistenz-Fenster mehr (→ L2). |
 | Format / Verschlüsselung | `pg_dump -Fc` → GPG **symmetrisch** AES-256, **gleiche Passphrase wie `.env.gpg`**. |
 | Trigger | **cron**, nightly ~03:00, unbeaufsichtigt. Passphrase aus `/etc/brewing/gpg.pass` (mode 600, owner `alex`). |
-| Off-site | **Cloudflare R2**, Bucket **`backup`**, ein Ordner pro App/Service. |
+| Off-site | **Cloudflare R2**, Bucket **`backup`**, Ordner `supabase/`. |
 | R2-Token | Aktuell: **account-weiter R2-Token** in Gebrauch (`.env`-Vars: `R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY`). Ein dedizierter, auf Bucket `backup` gescopter Token (Object Read & Write) ist **optional und empfohlen** — kein Blocker. Token-Setup: Cloudflare Dashboard → R2 → „Manage R2 API Tokens". |
-| Lokale Ablage | `webPage_infra/backups/` (gitignored), gespiegelte Ordnerstruktur. |
-| Restore | **immer manuell**, nicht Teil von bootstrap. Reihenfolge: `_supabase_core` zuerst, dann App-Schemas. |
+| Lokale Ablage | `webPage_infra/backups/supabase/` (gitignored). |
+| Restore | **immer manuell**, nicht Teil von bootstrap. `restore.sh all` = Whole-DB. Selektiv via `restore.sh aibrewgenius|rapt` (aus demselben Dump, mit `--schema=`). |
 
 ### Bucket-Layout
 ```
 backup/                         (R2-Bucket)
-├── _supabase_core/             auth + storage + public + _realtime + Rest
-│   └── core_<TS>.fc.gpg
-├── brew_assistent/             Schema aibrewgenius
-│   └── aibrewgenius_<TS>.fc.gpg
-├── rapt_dashboard/             Schema rapt
-│   └── rapt_<TS>.fc.gpg
+├── supabase/                   Whole-DB-Dump (alle Schemas: auth + aibrewgenius + rapt + Rest)
+│   └── supabase_<TS>[_<label>].fc.gpg
+├── _supabase_core/             (historisch — nicht mehr beschrieben, kein Cleanup)
+├── brew_assistent/             (historisch — nicht mehr beschrieben, kein Cleanup)
+├── rapt_dashboard/             (historisch — nicht mehr beschrieben, kein Cleanup)
 └── <future_unit>/ …            erweiterbar pro neuem stateful Service
 ```
 
@@ -71,8 +71,8 @@ pro stateful Unit). Ist kein Marker vorhanden, beendet sich `backup.sh` mit Exit
 irgendeinen Container zu berühren — **sauberer No-op**.
 
 Heute gibt es genau eine stateful Unit: `supabase`. Ihr Marker-Dateiname ist
-`/etc/brewing/stateful-units.d/supabase`; er erzeugt die drei Dumps für core +
-aibrewgenius + rapt. Künftige stateful Units (z.B. ein selbst-gehosteter Mailserver)
+`/etc/brewing/stateful-units.d/supabase`; er erzeugt **einen** Whole-DB-Dump
+(`supabase/supabase_<TS>.fc.gpg`). Künftige stateful Units (z.B. ein selbst-gehosteter Mailserver)
 erhalten einen eigenen Marker und einen neuen Zweig in der `unit_jobs()`-Funktion in
 `backup.sh`.
 
@@ -92,24 +92,18 @@ fürs Backup. Will man die DB von einem anderen VPS aus sichern, geht das nur pe
 den DB-VPS (genau das macht der Migrations-Flow — → [Abschnitt 6](#6-restore-szenario-2-migration--vps-umzug-bootstrapsh---menu-option-2)).
 
 ```
-Drei Dumps back-to-back auf dem DB-VPS (Sekundenabstand):
-   ├─ docker exec supabase-db pg_dump -Fc -U supabase_admin -d postgres
-   │     --exclude-schema=aibrewgenius --exclude-schema=rapt
-   │     | gpg --batch --symmetric AES256 --passphrase-file /etc/brewing/gpg.pass
-   │     → backups/_supabase_core/core_<TS>.fc.gpg              → R2 _supabase_core/
-   │
-   ├─ docker exec supabase-db pg_dump -Fc -U supabase_admin -d postgres
-   │     -n aibrewgenius
-   │     | gpg ...
-   │     → backups/brew_assistent/aibrewgenius_<TS>.fc.gpg      → R2 brew_assistent/
-   │
+Ein konsistenter Whole-DB-Dump auf dem DB-VPS:
    └─ docker exec supabase-db pg_dump -Fc -U supabase_admin -d postgres
-         -n rapt
-         | gpg ...
-         → backups/rapt_dashboard/rapt_<TS>.fc.gpg              → R2 rapt_dashboard/
+         (kein --exclude-schema / -n → alle Schemas: auth + aibrewgenius + rapt + Rest)
+         | gpg --batch --symmetric AES256 --passphrase-file /etc/brewing/gpg.pass
+         → backups/supabase/supabase_<TS>.fc.gpg              → R2 supabase/
 ```
 
-- **Kein Klartext auf Platte:** jeder Dump streamt direkt durch `gpg -o <out>` — die
+Ein einziger `pg_dump -Fc` = **ein konsistenter Transaktions-Snapshot** der ganzen DB.
+Das frühere 3-fach-Dump-Modell (back-to-back, kein gemeinsamer Snapshot) und das damit
+verbundene Cross-Dump-FK-Inkonsistenz-Risiko sind damit eliminiert (→ L2).
+
+- **Kein Klartext auf Platte:** der Dump streamt direkt durch `gpg -o <out>` — die
   `.fc.gpg`-Datei ist das Endprodukt; ein Klartext-Dump landet nie auf Disk.
 - `PGPASSWORD` wird als `-e`-Env an `docker exec` übergeben (nicht in der Host-argv).
 - GPG-Passphrase via `--passphrase-file /etc/brewing/gpg.pass` (mode 600, owner `alex`).
@@ -124,9 +118,6 @@ Drei Dumps back-to-back auf dem DB-VPS (Sekundenabstand):
 - **R2-Upload + Prune** via `rclone`; Creds als `RCLONE_CONFIG_R2_*`-Env-Vars (nie in
   argv). Nach Upload prunet `backup.sh` den R2-Ordner selbst auf die neuesten N.
   Falls `R2_ACCESS_KEY_ID` nicht gesetzt ist, wird der Upload übersprungen (nur lokal).
-- **Konsistenz:** die 3 Läufe sind keine atomare Cross-Schema-Momentaufnahme; das
-  Sekunden-Fenster ist akzeptiert (Hobby-Stack, nightly 03:00, praktisch keine Schreiblast).
-  → Bekannte Limitierung [L2](#l2--kein-write-freeze-während-des-nightly-backups).
 
 ---
 
@@ -149,15 +140,18 @@ Der erste R2-Backup-Stand wurde am 2026-05-25 vom lokalen Dev-Stack (Volume
 Produktiv-Testdaten) erzeugt. Methode: normales `backup.sh` ohne `--label` — kein
 dediziertes Seed-Label, damit `latest`-Logik ihn findet.
 
-Verwendete Dateinamen (als Referenz):
+Ursprüngliche Dateinamen (historisch, 3-fach-Split, vor Phase 4):
 - `_supabase_core/core_20260525_074013.fc.gpg` (4.5 MB)
 - `brew_assistent/aibrewgenius_20260525_074013.fc.gpg` (416 KB)
 - `rapt_dashboard/rapt_20260525_074013.fc.gpg` (12 KB)
 
-Dieser Stand ist der Ausgangspunkt für Erst-Bootstraps neuer VPS via Menü-Option 3
+Ab Phase 4 erzeugt `backup.sh` nur noch einen Whole-DB-Dump:
+- `supabase/supabase_<TS>.fc.gpg`
+
+Der erste Phase-4-Lauf ist der neue Ausgangspunkt für Erst-Bootstraps neuer VPS via Menü-Option 3
 (→ [§5a](#5a-restore-szenario-1a-erstlauf-auf-frischem-vps-bootstrap-menu-option-3)).
-Künftige nightly Backups ersetzen diesen Stand (Retention N=7, rotation-exempt nur bei
-`--label`).
+Die drei historischen Ordner bleiben in R2 (nicht gelöscht) — historischer Anker.
+Künftige nightly Backups landen in `supabase/` (Retention N=7, rotation-exempt nur bei `--label`).
 
 ---
 
@@ -170,7 +164,7 @@ also kein Migrations-Umzug möglich). Die Migration (Option 2) braucht einen LAU
 und hilft in beiden Fällen nicht — dafür ist genau dieser Pfad da.
 
 **Voraussetzung:** R2-Creds in `.env` gesetzt + mindestens ein Backup in R2 vorhanden
-(alle drei Ordner: `_supabase_core`, `brew_assistent`, `rapt_dashboard`).
+(Ordner `supabase/`, Whole-DB-Dump).
 
 ### Ablauf
 
@@ -198,13 +192,12 @@ und hilft in beiden Fällen nicht — dafür ist genau dieser Pfad da.
    - Vorbedingungen prüfen (`.env`, docker, rclone, gpg, R2-Vars).
    - Supabase hochziehen falls nicht laufend (idempotent).
    - Supabase-Marker setzen (idempotent via `_ensure_supabase_marker`).
-   - R2-Verfügbarkeit prüfen: jüngste `*.fc.gpg` je Ordner. Fehlt eine → sauberer
-     Skip mit Hinweis, kein Abbruch des Bootstraps.
+   - R2-Verfügbarkeit prüfen: jüngste `*.fc.gpg` in `supabase/`. Kein Dump vorhanden →
+     sauberer Skip mit Hinweis, kein Abbruch des Bootstraps.
    - Überschreib-Schutz: `SELECT count(*) FROM auth.users` — wenn > 0: Warnung +
      explizite Bestätigung `force-restore` erforderlich. Im Nicht-TTY-Modus: Abbruch.
    - Tippe-`restore`-Prompt (TTY-Pflicht).
-   - `./scripts/restore.sh all latest --yes` — zwingende Reihenfolge:
-     `core` → `brew_assistent` → `rapt_dashboard`.
+   - `./scripts/restore.sh all latest --yes` — ein Whole-DB pg_restore aus `supabase/`.
    - Tabellen-Counts nach Restore: `auth.users`, `aibrewgenius.recipes`, `rapt.brew_sessions`.
    - `cf_reconcile_if_token` (Cloudflare-Routing).
 
@@ -214,7 +207,7 @@ und hilft in beiden Fällen nicht — dafür ist genau dieser Pfad da.
 
 | Guard | Verhalten |
 |---|---|
-| Leerer Bucket / fehlendes `*.fc.gpg` in ≥1 Ordner | Sauberer Skip + Hinweis, Exit 0. Stack läuft mit frischer DB weiter. |
+| Leerer Bucket / kein `*.fc.gpg` in `supabase/` | Sauberer Skip + Hinweis, Exit 0. Stack läuft mit frischer DB weiter. |
 | `auth.users > 0` auf Ziel-VPS | Warnung + `force-restore`-Eingabe nötig. |
 | Kein TTY | Abbruch (kein Blind-Restore). |
 | R2-Vars fehlen in `.env` | Klarer Hinweis + Return 0 (kein Stacktrace). |
@@ -262,14 +255,15 @@ ist der bevorzugte Weg.
    Nach erfolgreichem Start setzt `bootstrap.sh` den `supabase`-Marker idempotent
    (`/etc/brewing/stateful-units.d/supabase`) — ab sofort sind nächtliche Backups aktiv.
 
-3. **Restore ausführen — Reihenfolge ist zwingend (`core` zuerst):**
+3. **Restore ausführen:**
    ```
    cd ~/webPage_infra
    ./scripts/restore.sh all
    ```
-   `all` restauriert in der fixen Reihenfolge: `core` → `brew_assistent` → `rapt_dashboard`.
-   `core` muss zuerst kommen, weil beide App-Schemas via FK auf `auth.users` referenzieren.
-   `latest` (Default) zieht je den jüngsten `.fc.gpg` aus dem passenden R2-Ordner.
+   `all` führt einen einzigen Whole-DB-`pg_restore` aus dem `supabase/`-Dump durch.
+   `latest` (Default) zieht den jüngsten `.fc.gpg` aus R2 `supabase/`.
+   Keine fixe Core-first-Reihenfolge mehr nötig — der Single-Snapshot enthält alles
+   konsistent in einer Transaktion.
 
 4. **Cloudflare-Routing wiederherstellen:**
    ```
@@ -326,9 +320,9 @@ Die Funktion führt folgende Schritte durch:
 ssh <alter VPS>  →  cd ~/webPage_infra && ./scripts/backup.sh --label pre-migration
 ```
 
-Erstellt auf dem alten VPS alle drei Dumps mit Label `pre-migration` (rotation-exempt)
-und lädt sie nach R2. Danach prüft `bootstrap.sh` per SSH + rclone, ob **alle drei**
-gelabelten Dumps in R2 vorhanden sind (`_verify_backup_in_r2`). Bei Fehler: Abbruch,
+Erstellt auf dem alten VPS **einen** Whole-DB-Dump mit Label `pre-migration` (rotation-exempt)
+und lädt ihn nach R2 `supabase/`. Danach prüft `bootstrap.sh` per SSH + rclone, ob der
+gelabelte Dump in R2 `supabase/` vorhanden ist (`_verify_backup_in_r2`). Bei Fehler: Abbruch,
 alter Stand bleibt laufend.
 
 #### (b) Supabase-Stack auf altem VPS stoppen + Verifikation
@@ -361,20 +355,19 @@ bevor Schritt (c) gestartet wird. Volumes und Daten auf dem alten VPS bleiben in
 `cf_ensure_tunnel_if_token` läuft vorher (Tunnel-Ensure pro VPS).
 Nach erfolgreichem Start: `supabase`-Marker auf neuem VPS idempotent setzen.
 
-#### (d) Alle drei pre-migration-Dumps aus R2 laden + Restore
+#### (d) Whole-DB-Dump aus R2 laden + Restore
 
-Die aus Schritt (a) verifizierten Dump-Dateinamen (explizit — nicht `latest`) werden
+Der aus Schritt (a) verifizierte Dump-Dateiname (explizit — nicht `latest`) wird
 heruntergeladen und eingespielt:
 
 ```
-./scripts/restore.sh core         <core_<TS>_pre-migration.fc.gpg>         --yes
-./scripts/restore.sh brew_assistent <aibrewgenius_<TS>_pre-migration.fc.gpg> --yes
-./scripts/restore.sh rapt_dashboard <rapt_<TS>_pre-migration.fc.gpg>        --yes
+./scripts/restore.sh all <supabase_<TS>_pre-migration.fc.gpg> --yes
 ```
 
-`core` zuerst (auth.users), dann App-Schemas. `--yes` überspringt die interaktive
-Bestätigung (wurde im Menü-Schritt „migrate" bereits eingeholt). Nach dem Restore werden
-die lokalen Kopien der Dump-Dateien gelöscht.
+Ein einziger Whole-DB-`pg_restore` — keine Core-first-Reihenfolge nötig, da ein
+konsistenter Single-Snapshot. `--yes` überspringt die interaktive Bestätigung
+(wurde im Menü-Schritt „migrate" bereits eingeholt). Nach dem Restore wird die lokale
+Kopie der Dump-Datei gelöscht.
 
 #### (e) supabase-Marker auf altem VPS entfernen
 
@@ -487,29 +480,42 @@ falls vorhanden.
 
 **Aufruf:**
 ```
-restore.sh <core|brew_assistent|rapt_dashboard|all> [datei|latest] [--yes]
+restore.sh <all|aibrewgenius|rapt> [datei|latest] [--yes]
 ```
-- `latest` (Default): zieht den jüngsten `.fc.gpg` aus dem passenden R2-Ordner.
-- `<pfad>`: lokale `.fc.gpg`-Datei (z.B. ein explizit heruntergeladener pre-migration-Dump).
+- `all` (empfohlen): ein Whole-DB-`pg_restore` aus dem `supabase/`-Dump (kein `--schema`).
+- `aibrewgenius`/`rapt`: selektiver Restore via `--schema=<name>` aus demselben Dump.
+  Alle Ziele lesen aus demselben R2-Ordner `supabase/`.
+- `latest` (Default): zieht den jüngsten `.fc.gpg` aus R2 `supabase/`.
+- `<pfad>`: lokale `.fc.gpg`-Datei (funktioniert mit allen Zielen).
 - `--yes`: überspringt die interaktive Bestätigung (für Automatisierung / Migrations-Flow).
 
-**Reihenfolge bei `all` ist zwingend:**
-```
-1. core               → _supabase_core  (auth muss zuerst da sein)
-2. brew_assistent     → aibrewgenius
-3. rapt_dashboard     → rapt
-```
+**`all` — Whole-DB-Restore (empfohlen für Disaster Recovery und Migration):**
 
-**pg_restore-Flags:** `--clean --if-exists --no-owner -U supabase_admin -d postgres`.
+Ein einziger `pg_restore` ohne `--schema`, stellt alle Schemas konsistent wieder her.
+Keine Core-first-Reihenfolge mehr nötig — der Single-Snapshot enthält alles.
+
+**Selektiver Schema-Restore (`aibrewgenius`/`rapt`):**
+
+`pg_restore --schema=<name>` aus dem `supabase/`-Dump — spielt nur das genannte Schema
+zurück. Nützlich für gezielte Einzel-Schema-Rollbacks (z.B. unerwünschte Migration in
+`aibrewgenius.*` rückgängig machen), wenn `core` unverändert bleibt.
+
+> **⚠️ WARNUNG:** `aibrewgenius.*` und `rapt.*` FK'en auf `auth.users` UND `vault.secrets`.
+> Ein selektiver Restore eines älteren Stands gegen einen **abweichenden** aktuellen core
+> kann FK-Verletzungen erzeugen (referenzierte Zeile existiert nicht mehr).
+> **Für Disaster Recovery und VPS-Umzug immer `all` (Whole-DB) verwenden.**
+> Selektiv nur für Rollbacks, bei denen core unverändert zum Dump-Zeitpunkt bleibt.
+
+**pg_restore-Flags:** `--clean --if-exists --no-owner [-–schema=<name>] -U supabase_admin -d postgres`.
 Läuft **ohne** `-e`/`--exit-on-error`: Supabase emittiert bekannte nicht-fatale Fehler
 (supabase_realtime-Publication, `extensions`-Schema, `pgsodium`/Vault, vom Image bereits
 angelegte Roles). Erfolg wird über Tabellen-Counts/Smoke-Check bewertet, nicht über den
 Exit-Code.
 
 **Nach dem Restore:** `restore.sh` gibt Tabellen-Counts aus:
-- `auth.users` (core)
-- `aibrewgenius.recipes` (brew_assistent)
-- `rapt.brew_sessions` (rapt_dashboard)
+- `all`: `auth.users`, `aibrewgenius.recipes`, `rapt.brew_sessions`
+- `aibrewgenius`: `aibrewgenius.recipes`
+- `rapt`: `rapt.brew_sessions`
 
 ---
 
@@ -557,23 +563,22 @@ heute nur per SSH auf den DB-VPS (genau das macht der Migrations-Flow in Schritt
 Es gibt **kein** „Backup über den db-tcp-Tunnel" (der TCP-Tunnel ist für `proxy_sync` /
 `api_proxy`, nicht für Backup).
 
-### L2 — Kein Write-Freeze während des nightly Backups
+### L2 — Konsistenz-Fenster: durch Single-Snapshot eliminiert
 
-Die drei Dumps laufen back-to-back ohne gemeinsamen Snapshot/Quiesce. Das
-Sekunden-Inkonsistenz-Fenster ist akzeptiert (Hobby-Stack, nightly 03:00, praktisch
-keine Schreiblast).
+Ab Phase 4 erzeugt `backup.sh` einen einzigen `pg_dump -Fc` ohne Schema-Split. Ein
+einzelner `pg_dump -Fc` läuft in **einer serialisierbaren Snapshot-Transaktion** — das
+frühere Cross-Dump-FK-Inkonsistenz-Risiko (drei Dumps back-to-back, kein gemeinsamer
+Snapshot) ist damit **eliminiert**. Es gibt kein Inkonsistenz-Fenster zwischen Schemas mehr.
 
-**Bei einer Migration** ist das Bild anders: `backup.sh --label pre-migration` läuft in
-Schritt (a), während `supabase-db` noch läuft. Direkt danach (Schritt b) stoppt der
-Migrations-Flow den **kompletten Supabase-Stack** und verifiziert per separatem
-SSH-Call, dass `supabase-db` tatsächlich nicht mehr läuft — ein harter Abbruch erfolgt,
-wenn der Container noch oben ist. Erst nach dieser Verifikation beginnt Schritt (c).
+**Kein Write-Freeze nötig:** `pg_dump` serialisiert intern über die Snapshot-Transaktion,
+nicht über ein externes Quiesce. Der nightly-Lauf (03:00, praktisch keine Schreiblast)
+ist damit vollständig konsistent.
 
-Das bedeutet: das pre-migration-Backup selbst hat kein Write-Freeze, aber der Stop
-passiert **vor** dem Restore (nicht danach) und wird **hard verifiziert**. Das verbleibende
-Risiko ist das winzige Inkonsistenz-Fenster *innerhalb* des Backups selbst (drei
-Dumps back-to-back, Sekunden) — identisch mit dem nightly-Risiko und als akzeptiert
-dokumentiert.
+**Bei einer Migration** läuft `backup.sh --label pre-migration` in Schritt (a) noch
+während `supabase-db` aktiv ist, dann stoppt Schritt (b) den **kompletten Supabase-Stack**
+mit hartem SSH-Verifikations-Call (kein Proceed wenn Container noch oben). Der
+pre-migration-Dump ist ein konsistenter Snapshot — kein Risiko mehr durch parallele
+Writes zwischen mehreren Dumps.
 
 ### L4 — Restore-Test nicht automatisiert
 
@@ -586,10 +591,15 @@ durchzuführen. Es gibt kein Self-Test-Script. Das Verifikations-Runbook:
    Schema, `pgsodium`/Vault-Objekte, vom Image vorher angelegte Rollen. Diese sind normal
    und kein Anzeichen eines fehlgeschlagenen Restores.
 
-### Sicherheits-Hinweis: `rapt_api_key` Plaintext im Dump
+### Sicherheits-Hinweis: Secrets im Dump
 
-`rapt.user_profiles.rapt_api_key` liegt im `rapt`-Schema heute im Klartext.
-Der `rapt`-Dump enthält diesen Wert damit als Klartext (nur GPG-äußerlich verschlüsselt
-im `.fc.gpg`). Dies ist ein **bekanntes, separat zu behandelndes Sicherheitsrisiko**
-(Vault-Migration des `rapt`-Schemas) und ist **nicht** Teil dieses Doc-Updates oder des
-Backup/Restore-Scope.
+RAPT- und Brewfather-Keys liegen seit Phase 1 (Vault-Migration) **verschlüsselt** in
+`vault.secrets` — nicht mehr als Klartext in `rapt.user_profiles.rapt_api_key`.
+Der Whole-DB-Dump (`supabase/`) enthält die `vault.secrets`-Einträge nur in dieser
+verschlüsselten Form (pgsodium-Verschlüsselung), zusätzlich GPG-umhüllt im `.fc.gpg`.
+**Kein Klartext-Key im Dump.**
+
+> **Hinweis:** Falls Phase 1 (Vault-Migration) zum Backup-Zeitpunkt noch nicht live ist,
+> enthält der Dump `rapt_api_key` noch im Klartext (nur GPG-äußerlich verschlüsselt).
+> In diesem Fall gelten die üblichen Sicherheitsmaßnahmen: Passphrase sicher halten,
+> Dump-Datei nur auf vertrauenswürdigen Systemen entschlüsseln.

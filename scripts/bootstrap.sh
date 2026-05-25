@@ -1563,9 +1563,8 @@ _check_ssh_access() {
 
 # ---------------------------------------------------------------- R2-Setup für Verifikation
 # Setzt RCLONE_CONFIG_R2_* aus .env (gleiche Logik wie backup.sh/restore.sh).
-# Prüft alle drei pre-migration-Dumps der supabase-Unit in R2:
-#   core (_supabase_core), brew_assistent, rapt_dashboard.
-# Gibt drei Dateinamen (je eine Zeile) zurück oder schlägt fehl.
+# Prüft den pre-migration-Dump der supabase-Unit in R2 (Ordner: supabase/).
+# Gibt einen Dateinamen zurück oder schlägt fehl.
 # Fehler-Diskriminierung: SSH-/Netzwerk-Fehler → return 2 (sofortiger Abbruch);
 # Backup nicht gefunden → return 1 (Aufrufer meldet).
 _verify_backup_in_r2() {
@@ -1574,7 +1573,7 @@ _verify_backup_in_r2() {
 
   local ssh_opts=(-o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new)
 
-  # Hilfsfunktion: sucht in einem R2-Ordner nach dem jüngsten pre-migration-Dump.
+  # Hilfsfunktion: sucht im R2-Ordner nach dem jüngsten pre-migration-Dump.
   # Gibt Dateinamen oder leeren String aus. Fehler → return 2.
   # $1=folder (whitelist-geprüft: nur [a-zA-Z0-9_-])
   #
@@ -1617,28 +1616,17 @@ REMOTE
     printf '%s' "$_out"
   }
 
-  local core_file assistent_file rapt_file
-  core_file="$(_r2_find_premig "_supabase_core")" || return 2
-  assistent_file="$(_r2_find_premig "brew_assistent")" || return 2
-  rapt_file="$(_r2_find_premig "rapt_dashboard")" || return 2
+  # Einziger Dump-Ordner: supabase/ (Whole-DB-Dump seit Phase 4).
+  local supabase_file
+  supabase_file="$(_r2_find_premig "supabase")" || return 2
 
-  local missing=0
-  if [[ -z "$core_file" ]]; then
-    printf '\033[1;31m✖ core-Dump mit Label "pre-migration" nicht in R2 gefunden (R2:<bucket>/_supabase_core/).\033[0m\n' >&2
-    missing=1
+  if [[ -z "$supabase_file" ]]; then
+    printf '\033[1;31m✖ Whole-DB-Dump mit Label "pre-migration" nicht in R2 gefunden (R2:<bucket>/supabase/).\033[0m\n' >&2
+    return 1
   fi
-  if [[ -z "$assistent_file" ]]; then
-    printf '\033[1;31m✖ brew_assistent-Dump mit Label "pre-migration" nicht in R2 gefunden (R2:<bucket>/brew_assistent/).\033[0m\n' >&2
-    missing=1
-  fi
-  if [[ -z "$rapt_file" ]]; then
-    printf '\033[1;31m✖ rapt_dashboard-Dump mit Label "pre-migration" nicht in R2 gefunden (R2:<bucket>/rapt_dashboard/).\033[0m\n' >&2
-    missing=1
-  fi
-  (( missing == 0 )) || return 1
 
-  # Gibt drei Dateinamen aus (eine Zeile pro Datei: core, brew_assistent, rapt_dashboard)
-  printf '%s\n%s\n%s\n' "$core_file" "$assistent_file" "$rapt_file"
+  # Gibt einen Dateinamen zurück (supabase/_pre-migration-Dump)
+  printf '%s\n' "$supabase_file"
 }
 
 # ---------------------------------------------------------------- Migrations-Aktion
@@ -1722,7 +1710,7 @@ EOSU
     existing_users="${existing_users//[[:space:]]/}"
     if [[ "$existing_users" =~ ^[0-9]+$ ]] && (( existing_users > 0 )); then
       printf '\n\033[1;31m✖ KONFLIKT: Auf dem neuen VPS existieren bereits %s auth.users.\033[0m\n' "$existing_users"
-      printf '  Ein core-Restore (--clean) würde diese überschreiben.\n'
+      printf '  Ein Whole-DB-Restore (--clean) würde diese überschreiben.\n'
       printf '  Szenarien:\n'
       printf '  a) Neuer VPS ist dediziert für diese Migration → Benutzer explizit löschen, dann erneut starten.\n'
       printf '  b) Neuer VPS läuft bereits mit einer anderen App → Vorsicht: Restore würde diese App-Daten zerstören.\n\n'
@@ -1741,10 +1729,10 @@ EOSU
   printf '  Alter VPS (Quell-VPS):  %s@%s (Port %s)\n' "$old_user" "$old_host" "$old_port"
   printf '  Umzug:   Supabase / gesamte DB (core + aibrewgenius + rapt)\n'
   printf '  Schritte:\n'
-  printf '    (a) Backup auf altem VPS (--label pre-migration) + R2-Verifikation aller 3 Dumps\n'
+  printf '    (a) Backup auf altem VPS (--label pre-migration) + R2-Verifikation (1 Whole-DB-Dump)\n'
   printf '    (b) Supabase-Stack auf altem VPS stoppen (supabase-db + Frontend)\n'
   printf '    (c) Supabase auf neuem VPS hochziehen\n'
-  printf '    (d) Alle 3 Dumps restoren (core → brew_assistent → rapt_dashboard) via --clean\n'
+  printf '    (d) Whole-DB-Dump restoren (supabase/ → all) via --clean\n'
   printf '    (e) supabase-Marker auf altem VPS entfernen (Backup wird No-op)\n'
   printf '    (f) supabase-Marker auf neuem VPS sicherstellen\n\n'
   printf '  ACHTUNG: Schritt (d) überschreibt vorhandene Daten auf dem neuen VPS.\n'
@@ -1766,23 +1754,19 @@ EOSU
   # ===========================================================================
   # SCHRITT (a) VERIFIKATION — alle drei pre-migration-Dumps in R2 prüfen
   # ===========================================================================
-  log "(a) Verifikation: alle drei pre-migration-Dumps in R2 suchen"
+  log "(a) Verifikation: pre-migration-Dump in R2 suchen (supabase/)"
   local verify_out
-  local core_dump_name assistent_dump_name rapt_dump_name
+  local supabase_dump_name
   if ! verify_out="$(_verify_backup_in_r2 "$old_user" "$old_host" "$old_port")"; then
-    err "R2-Verifikation fehlgeschlagen: nicht alle pre-migration-Dumps in R2 gefunden.
+    err "R2-Verifikation fehlgeschlagen: pre-migration-Dump nicht in R2 gefunden (supabase/).
    Migration abgebrochen — alter Stand bleibt laufend.
-   Manuell prüfen: ssh ${old_user}@${old_host} 'rclone lsf R2:<bucket>/_supabase_core/ | grep pre-migration'"
+   Manuell prüfen: ssh ${old_user}@${old_host} 'rclone lsf R2:<bucket>/supabase/ | grep pre-migration'"
   fi
 
-  core_dump_name="$(printf '%s' "$verify_out" | sed -n '1p')"
-  assistent_dump_name="$(printf '%s' "$verify_out" | sed -n '2p')"
-  rapt_dump_name="$(printf '%s' "$verify_out" | sed -n '3p')"
+  supabase_dump_name="$(printf '%s' "$verify_out" | head -1)"
 
   ok "(a) Verifikation OK"
-  printf '    core:          %s\n' "$core_dump_name"
-  printf '    brew_assistent: %s\n' "$assistent_dump_name"
-  printf '    rapt_dashboard: %s\n' "$rapt_dump_name"
+  printf '    supabase (Whole-DB): %s\n' "$supabase_dump_name"
 
   # ===========================================================================
   # SCHRITT (b) — Supabase-Stack auf altem VPS stoppen
@@ -1847,22 +1831,18 @@ EOSU
   _ensure_supabase_marker
 
   # ===========================================================================
-  # SCHRITT (d) — Alle drei Dumps auf neuem VPS restoren
+  # SCHRITT (d) — Whole-DB-Dump auf neuem VPS restoren
   # ===========================================================================
-  log "(d) Alle drei Dumps restoren (core → brew_assistent → rapt_dashboard)"
-  # Explizite Dateinamen aus der Verifikation — kein 'latest' (vermeidet Verwechslung
+  log "(d) Whole-DB-Dump restoren (supabase/ → restore.sh all)"
+  # Expliziter Dateiname aus der Verifikation — kein 'latest' (vermeidet Verwechslung
   # mit einem neueren automatischen Dump nach dem pre-migration-Backup).
-  # Reihenfolge zwingend: core zuerst (auth.users muss existieren), dann App-Schemen.
-  printf '    core:          %s\n' "$core_dump_name"
-  printf '    brew_assistent: %s\n' "$assistent_dump_name"
-  printf '    rapt_dashboard: %s\n' "$rapt_dump_name"
+  # Ein Whole-DB-Dump: kein Core-first-Reihenfolge nötig (alles in einem Snapshot).
+  printf '    supabase (Whole-DB): %s\n' "$supabase_dump_name"
   echo "  Restore läuft mit --yes (Bestätigung wurde oben eingeholt)."
 
   sudo -u "$APP_USER" -H \
     APP_DIR="$APP_DIR" \
-    CORE_DUMP="${core_dump_name}" \
-    ASSISTENT_DUMP="${assistent_dump_name}" \
-    RAPT_DUMP="${rapt_dump_name}" \
+    SUPABASE_DUMP="${supabase_dump_name}" \
     bash <<'EOSU'
 set -euo pipefail
 cd "$APP_DIR"
@@ -1885,39 +1865,22 @@ export RCLONE_CONFIG_R2_ENDPOINT="$_r2_ep"
 export RCLONE_CONFIG_R2_REGION=auto
 export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
 
-# Core-Dump lokal laden
-CORE_LOCAL="backups/_supabase_core/${CORE_DUMP}"
-mkdir -p backups/_supabase_core
-rclone copyto "R2:${R2_BUCKET}/_supabase_core/${CORE_DUMP}" "$CORE_LOCAL" \
-  || { echo "rclone-Download core fehlgeschlagen" >&2; exit 1; }
-echo "  Core-Dump geladen: $CORE_LOCAL"
+# Whole-DB-Dump lokal laden
+SUPABASE_LOCAL="backups/supabase/${SUPABASE_DUMP}"
+mkdir -p backups/supabase
+rclone copyto "R2:${R2_BUCKET}/supabase/${SUPABASE_DUMP}" "$SUPABASE_LOCAL" \
+  || { echo "rclone-Download supabase fehlgeschlagen" >&2; exit 1; }
+echo "  Whole-DB-Dump geladen: $SUPABASE_LOCAL"
 
-# brew_assistent-Dump lokal laden
-ASSISTENT_LOCAL="backups/brew_assistent/${ASSISTENT_DUMP}"
-mkdir -p backups/brew_assistent
-rclone copyto "R2:${R2_BUCKET}/brew_assistent/${ASSISTENT_DUMP}" "$ASSISTENT_LOCAL" \
-  || { echo "rclone-Download brew_assistent fehlgeschlagen" >&2; exit 1; }
-echo "  brew_assistent-Dump geladen: $ASSISTENT_LOCAL"
-
-# rapt_dashboard-Dump lokal laden
-RAPT_LOCAL="backups/rapt_dashboard/${RAPT_DUMP}"
-mkdir -p backups/rapt_dashboard
-rclone copyto "R2:${R2_BUCKET}/rapt_dashboard/${RAPT_DUMP}" "$RAPT_LOCAL" \
-  || { echo "rclone-Download rapt_dashboard fehlgeschlagen" >&2; exit 1; }
-echo "  rapt_dashboard-Dump geladen: $RAPT_LOCAL"
-
-# Restore: zwingende Reihenfolge core → brew_assistent → rapt_dashboard
-# (gleiche Reihenfolge wie restore.sh all — auth.users muss zuerst existieren).
+# Restore: ein Whole-DB pg_restore (kein Core-first nötig — Single-Snapshot).
 # --yes: Bestätigung wurde interaktiv im Menü bereits eingeholt.
-./scripts/restore.sh core "$CORE_LOCAL" --yes
-./scripts/restore.sh brew_assistent "$ASSISTENT_LOCAL" --yes
-./scripts/restore.sh rapt_dashboard "$RAPT_LOCAL" --yes
+./scripts/restore.sh all "$SUPABASE_LOCAL" --yes
 
-echo "  Lokale Dump-Dateien aufräumen..."
-rm -f "$CORE_LOCAL" "$ASSISTENT_LOCAL" "$RAPT_LOCAL"
+echo "  Lokale Dump-Datei aufräumen..."
+rm -f "$SUPABASE_LOCAL"
 EOSU
 
-  ok "(d) Restore aller drei Dumps abgeschlossen"
+  ok "(d) Whole-DB-Restore abgeschlossen"
 
   # ===========================================================================
   # SCHRITT (e) — supabase-Marker auf altem VPS entfernen (Backup → No-op)
@@ -1984,8 +1947,8 @@ EOSU
 # AKTION: Erstdaten aus R2 wiederherstellen (latest)
 #
 # Disaster-Recovery- + Erst-Lauf-Pfad: frischer VPS zieht das juengste Backup
-# (latest) aus R2 und restored es in zwingender Reihenfolge:
-# core → brew_assistent → rapt_dashboard.
+# (latest) aus R2 und restored es: ein Whole-DB pg_restore aus supabase/
+# (kein Reihenfolge-Split, Single-Snapshot).
 #
 # Abgrenzung zur Migration (action_migrate_unit): die Migration verlangt einen
 # LAUFENDEN alten VPS via SSH (Umzug). DIESER Pfad braucht keinen alten VPS und
@@ -1996,7 +1959,7 @@ EOSU
 # Sicherheits-Guards:
 #   1. Tippe-"restore"-Prompt (Nicht-TTY ohne --yes → Abbruch).
 #   2. auth.users-Check: wenn DB nicht leer → Warnung + "force-restore"-Bestaetigung.
-#   3. Leerer Bucket / kein *.fc.gpg in >=1 Ordner → sauberer Skip (kein Abbruch).
+#   3. Leerer Bucket / kein *.fc.gpg in supabase/ → sauberer Skip (kein Abbruch).
 # ================================================================
 action_restore_from_r2() {
 
@@ -2055,13 +2018,13 @@ EOSU
   # supabase-Marker setzen (idempotent)
   _ensure_supabase_marker
 
-  # ---- Pruefen ob R2-Ordner *.fc.gpg enthalten (Empty-Bucket-Sicherheitsnetz) ----
+  # ---- Pruefen ob R2-Ordner supabase/ *.fc.gpg enthält (Empty-Bucket-Sicherheitsnetz) ----
   # BLOCKER-Fix: rclone-Exit-Code explizit fangen; bei Fehler Sentinel "R2_ERROR:<folder>"
   # ausgeben und exit 0 damit der Heredoc IMMER sauber endet. Aeusserer Aufrufer unterscheidet:
   #   "R2_ERROR:" → R2-Verbindungsfehler (Creds/Netzwerk) → return 1 mit klarer Meldung.
   #   Leer          → echter leerer Bucket → sauberer Skip (return 0).
-  #   Foldernamen   → fehlende *.fc.gpg → sauberer Skip (return 0).
-  log "R2-Verfuegbarkeit pruefen (jüngste *.fc.gpg je Ordner)"
+  #   "supabase"    → fehlende *.fc.gpg → sauberer Skip (return 0).
+  log "R2-Verfuegbarkeit pruefen (jüngste *.fc.gpg in supabase/)"
   local _r2_check_out
   _r2_check_out="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
 set -uo pipefail
@@ -2079,29 +2042,24 @@ export RCLONE_CONFIG_R2_ENDPOINT="$R2_EP"
 export RCLONE_CONFIG_R2_REGION=auto
 export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
 
-missing=""
-# SUGGESTION 1: rclone-stderr in Tempfile fangen, Snippet in Sentinel einbetten.
-# Tempfile via mktemp + trap, damit kein Datei-Leak beim exit 0 nach R2_ERROR.
+# Lesson C2: rclone-Output in Variable fangen, Exit-Code separat pruefen.
+# Bei rclone-Fehler (Bad Creds, Netzwerk): Sentinel ausgeben, exit 0 (Heredoc bleibt sauber).
 _rclone_err_tmp="$(mktemp)"
 trap 'rm -f "$_rclone_err_tmp"' EXIT
-for folder in _supabase_core brew_assistent rapt_dashboard; do
-  # Lesson C2: rclone-Output in Variable fangen, Exit-Code separat pruefen.
-  # Bei rclone-Fehler (Bad Creds, Netzwerk): Sentinel ausgeben, exit 0 (Heredoc bleibt sauber).
-  lsf_out="$(rclone lsf "R2:${R2_BUCKET}/${folder}/" --include '*.fc.gpg' 2>"$_rclone_err_tmp")"
-  rclone_exit=$?
-  if (( rclone_exit != 0 )); then
-    # Erster nicht-leerer stderr-Satz als kompakter Hinweis (max 120 Zeichen).
-    _rclone_snippet="$(grep -v '^$' "$_rclone_err_tmp" 2>/dev/null | head -1 | cut -c1-120 || true)"
-    printf 'R2_ERROR:%s' "$folder"
-    [[ -n "$_rclone_snippet" ]] && printf ':%s' "$_rclone_snippet"
-    exit 0
-  fi
-  latest="$(printf '%s\n' "$lsf_out" | sort | tail -1 || true)"
-  if [[ -z "$latest" ]]; then
-    missing="${missing} ${folder}"
-  fi
-done
-printf '%s' "${missing# }"
+folder="supabase"
+lsf_out="$(rclone lsf "R2:${R2_BUCKET}/${folder}/" --include '*.fc.gpg' 2>"$_rclone_err_tmp")"
+rclone_exit=$?
+if (( rclone_exit != 0 )); then
+  # Erster nicht-leerer stderr-Satz als kompakter Hinweis (max 120 Zeichen).
+  _rclone_snippet="$(grep -v '^$' "$_rclone_err_tmp" 2>/dev/null | head -1 | cut -c1-120 || true)"
+  printf 'R2_ERROR:%s' "$folder"
+  [[ -n "$_rclone_snippet" ]] && printf ':%s' "$_rclone_snippet"
+  exit 0
+fi
+latest="$(printf '%s\n' "$lsf_out" | sort | tail -1 || true)"
+if [[ -z "$latest" ]]; then
+  printf '%s' "$folder"
+fi
 EOSU
 )"
 
@@ -2129,7 +2087,7 @@ EOSU
     printf '  Tipp: erst ein Backup erstellen (z.B. ./scripts/backup.sh), dann erneut versuchen.\n\n'
     return 0
   fi
-  ok "R2-Backup in allen drei Ordnern vorhanden"
+  ok "R2-Backup in supabase/ vorhanden (Whole-DB-Dump)"
 
   # ---- Ueberschreib-Schutz: auth.users auf neuem VPS pruefen ----
   # IMPORTANT 2-Fix: Heredoc ohne -e; psql-Fehler / leere Ausgabe → Sentinel "UNKNOWN",
@@ -2175,9 +2133,9 @@ EOSU
 
   # ---- Sicherheits-Bestaetigung ----
   printf '\n\033[1;34m▶ Restore-Plan — bitte bestaetigen\033[0m\n\n'
-  printf '  Quelle:  juengstes Backup je Ordner aus R2 (latest)\n'
+  printf '  Quelle:  juengstes Whole-DB-Backup aus R2 (supabase/, latest)\n'
   printf '  Ziel:    Container supabase-db → DB postgres\n'
-  printf '  Schritte: core → brew_assistent → rapt_dashboard\n'
+  printf '  Aktion:  ein Whole-DB pg_restore (restore.sh all latest)\n'
   printf '  ACHTUNG: --clean droppt vorhandene Objekte vor dem Neuanlegen.\n\n'
 
   # IMPORTANT 1-Fix: ASSUME_YES ist implementiert (konsistent mit restore.sh --yes-Muster).
@@ -2225,9 +2183,9 @@ EOSU
     return 0
   fi
 
-  # ---- Restore: core → brew_assistent → rapt_dashboard ----
-  # restore.sh all latest --yes: zwingende Reihenfolge, Bestaetigung bereits eingeholt.
-  log "Restore: core → brew_assistent → rapt_dashboard (latest aus R2)"
+  # ---- Restore: Whole-DB aus supabase/ ----
+  # restore.sh all latest --yes: ein Whole-DB pg_restore, Bestaetigung bereits eingeholt.
+  log "Restore: Whole-DB aus R2 supabase/ (latest)"
   sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
 set -euo pipefail
 cd "$APP_DIR"
@@ -2321,15 +2279,17 @@ cat <<EOF
   Cloudflare-Hostnames/DNS: scripts/cloudflare-routes.json editieren →
   ./scripts/cloudflare-reconcile.sh (idempotent).
 
-  Backups      nightly 03:00 (cron, als ${APP_USER}, kein sudo) → R2, je drei
-               verschluesselte Dumps (_supabase_core / brew_assistent / rapt_dashboard).
+  Backups      nightly 03:00 (cron, als ${APP_USER}, kein sudo) → R2, ein
+               verschluesselter Whole-DB-Dump (supabase/supabase_<TS>.fc.gpg).
                Retention: neueste N=7 pro Ordner (lokal + R2), via BACKUP_KEEP.
                Manuell (als ${APP_USER}): ./scripts/backup.sh
   Backup-Log   tail -f /var/log/brewing-backup.log
-  Restore      ./scripts/restore.sh all       (core → apps, manuell, destruktiv)
+  Restore      ./scripts/restore.sh all       (Whole-DB, manuell, destruktiv)
+               ./scripts/restore.sh rapt      (selektiv Schema rapt, aus supabase/-Dump)
+               ./scripts/restore.sh aibrewgenius (selektiv Schema aibrewgenius)
 
-  Erstdaten    Menü-Option 3 "Erstdaten aus R2 wiederherstellen" — zieht das juengste
-               Backup (latest) aus R2 und restored es (core → brew_assistent → rapt).
+  Erstdaten    Menü-Option 3 "Erstdaten aus R2 wiederherstellen" — zieht den juengsten
+               Whole-DB-Dump (latest) aus R2 supabase/ und restored ihn (ein pg_restore).
                Nur auf frischem VPS: destruktiv, explizite Bestaetigung erforderlich.
                Voraussetzung: R2-Creds in .env + Backup in R2 vorhanden.
 
