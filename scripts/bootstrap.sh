@@ -1540,17 +1540,283 @@ EOSU
 }
 
 # ================================================================
-# HAUPT-MENÜ (V2)
+# AKTION: Erstdaten aus R2 wiederherstellen (latest)
+#
+# Disaster-Recovery- + Erst-Lauf-Pfad: frischer VPS zieht das juengste Backup
+# (latest) aus R2 und restored es in zwingender Reihenfolge:
+# core → brew_assistent → rapt_dashboard.
+#
+# Abgrenzung zur Migration (action_migrate_unit): die Migration verlangt einen
+# LAUFENDEN alten VPS via SSH (Umzug). DIESER Pfad braucht keinen alten VPS und
+# ist daher der einzige Weg, wenn der alte VPS tot/weg ist (Crash-Recovery) oder
+# es noch gar keinen gab (Erst-Lauf). Voraussetzung: Backup in R2 vorhanden.
+#
+# DESTRUKTIV: pg_restore --clean überschreibt vorhandene Objekte.
+# Sicherheits-Guards:
+#   1. Tippe-"restore"-Prompt (Nicht-TTY ohne --yes → Abbruch).
+#   2. auth.users-Check: wenn DB nicht leer → Warnung + "force-restore"-Bestaetigung.
+#   3. Leerer Bucket / kein *.fc.gpg in >=1 Ordner → sauberer Skip (kein Abbruch).
+# ================================================================
+action_restore_from_r2() {
+
+  # ---- Vorbedingungen ----
+  log "Vorbedingungen pruefen (R2-Restore)"
+  [[ -f "${APP_DIR}/.env" ]] \
+    || err "R2-Restore: .env fehlt in ${APP_DIR} — erst Bootstrap vollstaendig durchlaufen."
+  command -v docker  >/dev/null 2>&1 || err "R2-Restore: docker fehlt."
+  command -v rclone  >/dev/null 2>&1 || err "R2-Restore: rclone fehlt (bootstrap installiert es)."
+  command -v gpg     >/dev/null 2>&1 || err "R2-Restore: gpg fehlt."
+
+  # R2-Vars aus .env pruefen (kein :? hier — compose-Lesson; eigener Guard).
+  local _r2_check
+  _r2_check="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+set -euo pipefail
+set -a; source "$APP_DIR/.env"; set +a
+missing=""
+[[ -n "${R2_ACCESS_KEY_ID:-}"     ]] || missing="${missing} R2_ACCESS_KEY_ID"
+[[ -n "${R2_SECRET_ACCESS_KEY:-}" ]] || missing="${missing} R2_SECRET_ACCESS_KEY"
+[[ -n "${R2_BUCKET:-}"            ]] || missing="${missing} R2_BUCKET"
+# R2_ENDPOINT oder R2_ACCOUNT_ID ist noetig
+if [[ -z "${R2_ENDPOINT:-}" && -z "${R2_ACCOUNT_ID:-}" ]]; then
+  missing="${missing} R2_ENDPOINT/R2_ACCOUNT_ID"
+fi
+printf '%s' "${missing# }"
+EOSU
+)"
+  if [[ -n "$_r2_check" ]]; then
+    printf '\n\033[1;31m✖ R2-Restore: fehlende .env-Variablen: %s\033[0m\n' "$_r2_check"
+    printf '  R2-Creds in .env eintragen, dann .env.gpg neu verschluesseln:\n'
+    printf '    ./scripts/encrypt-env.sh\n\n'
+    return 0
+  fi
+  ok "Vorbedingungen OK"
+
+  # ---- Supabase hochziehen (idempotent) ----
+  log "Supabase-Stack sicherstellen (falls nicht laufend)"
+  local _sb_running=0
+  sudo -u "$APP_USER" bash <<'EOSU' && _sb_running=1 || _sb_running=0
+docker inspect --format='{{.State.Running}}' supabase-db 2>/dev/null | grep -q '^true$'
+EOSU
+  if (( _sb_running == 0 )); then
+    log "supabase-db laeuft noch nicht — hochziehen"
+    cf_ensure_tunnel_if_token
+    sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+set -euo pipefail
+cd "$APP_DIR"
+docker compose pull web_assistent supabase-kong
+docker compose --profile vps up -d web_assistent supabase-kong cloudflared
+EOSU
+    ok "Supabase-Stack gestartet"
+  else
+    ok "supabase-db laeuft bereits"
+  fi
+
+  # supabase-Marker setzen (idempotent)
+  _ensure_supabase_marker
+
+  # ---- Pruefen ob R2-Ordner *.fc.gpg enthalten (Empty-Bucket-Sicherheitsnetz) ----
+  # BLOCKER-Fix: rclone-Exit-Code explizit fangen; bei Fehler Sentinel "R2_ERROR:<folder>"
+  # ausgeben und exit 0 damit der Heredoc IMMER sauber endet. Aeusserer Aufrufer unterscheidet:
+  #   "R2_ERROR:" → R2-Verbindungsfehler (Creds/Netzwerk) → return 1 mit klarer Meldung.
+  #   Leer          → echter leerer Bucket → sauberer Skip (return 0).
+  #   Foldernamen   → fehlende *.fc.gpg → sauberer Skip (return 0).
+  log "R2-Verfuegbarkeit pruefen (jüngste *.fc.gpg je Ordner)"
+  local _r2_check_out
+  _r2_check_out="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+set -uo pipefail
+set -a; source "$APP_DIR/.env"; set +a
+# R2-Remote via Env-Vars (nie in argv)
+R2_EP="${R2_ENDPOINT:-}"
+if [[ -z "$R2_EP" ]]; then
+  R2_EP="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+fi
+export RCLONE_CONFIG_R2_TYPE=s3
+export RCLONE_CONFIG_R2_PROVIDER=Cloudflare
+export RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+export RCLONE_CONFIG_R2_ENDPOINT="$R2_EP"
+export RCLONE_CONFIG_R2_REGION=auto
+export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
+
+missing=""
+# SUGGESTION 1: rclone-stderr in Tempfile fangen, Snippet in Sentinel einbetten.
+# Tempfile via mktemp + trap, damit kein Datei-Leak beim exit 0 nach R2_ERROR.
+_rclone_err_tmp="$(mktemp)"
+trap 'rm -f "$_rclone_err_tmp"' EXIT
+for folder in _supabase_core brew_assistent rapt_dashboard; do
+  # Lesson C2: rclone-Output in Variable fangen, Exit-Code separat pruefen.
+  # Bei rclone-Fehler (Bad Creds, Netzwerk): Sentinel ausgeben, exit 0 (Heredoc bleibt sauber).
+  lsf_out="$(rclone lsf "R2:${R2_BUCKET}/${folder}/" --include '*.fc.gpg' 2>"$_rclone_err_tmp")"
+  rclone_exit=$?
+  if (( rclone_exit != 0 )); then
+    # Erster nicht-leerer stderr-Satz als kompakter Hinweis (max 120 Zeichen).
+    _rclone_snippet="$(grep -v '^$' "$_rclone_err_tmp" 2>/dev/null | head -1 | cut -c1-120 || true)"
+    printf 'R2_ERROR:%s' "$folder"
+    [[ -n "$_rclone_snippet" ]] && printf ':%s' "$_rclone_snippet"
+    exit 0
+  fi
+  latest="$(printf '%s\n' "$lsf_out" | sort | tail -1 || true)"
+  if [[ -z "$latest" ]]; then
+    missing="${missing} ${folder}"
+  fi
+done
+printf '%s' "${missing# }"
+EOSU
+)"
+
+  # Sentinel-Auswertung: R2_ERROR → Creds/Netzwerk-Problem (kein stiller Skip)
+  # Format: R2_ERROR:<folder>[:<rclone-stderr-snippet>]
+  if [[ "$_r2_check_out" == R2_ERROR:* ]]; then
+    local _err_rest="${_r2_check_out#R2_ERROR:}"
+    local _err_folder="${_err_rest%%:*}"
+    local _err_snippet="${_err_rest#*:}"
+    # Wenn kein Snippet vorhanden (kein zweites ':'), snippet = leer setzen.
+    [[ "$_err_snippet" == "$_err_folder" ]] && _err_snippet=""
+    printf '\n\033[1;31m✖ R2-Verbindung fehlgeschlagen (Ordner: %s).\033[0m\n' "$_err_folder"
+    [[ -n "$_err_snippet" ]] && printf '  rclone: %s\n' "$_err_snippet"
+    printf '  Ursache: Bad Credentials, Netzwerkfehler oder falscher Endpoint.\n'
+    printf '  Massnahmen:\n'
+    printf '    1. R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_ACCOUNT_ID in .env pruefen.\n'
+    printf '    2. rclone lsf R2:<bucket>/ manuell testen.\n'
+    printf '    3. Dann erneut versuchen.\n\n'
+    return 1
+  fi
+
+  if [[ -n "$_r2_check_out" ]]; then
+    printf '\n\033[1;33m⚠ Kein *.fc.gpg in R2-Ordner: %s\033[0m\n' "$_r2_check_out"
+    printf '  Sicherheitsnetz: kein Backup verfuegbar → Stack laeuft mit frischer DB weiter.\n'
+    printf '  Tipp: erst ein Backup erstellen (z.B. ./scripts/backup.sh), dann erneut versuchen.\n\n'
+    return 0
+  fi
+  ok "R2-Backup in allen drei Ordnern vorhanden"
+
+  # ---- Ueberschreib-Schutz: auth.users auf neuem VPS pruefen ----
+  # IMPORTANT 2-Fix: Heredoc ohne -e; psql-Fehler / leere Ausgabe → Sentinel "UNKNOWN",
+  # das der Aufrufer konservativ als "nicht leer" behandelt.
+  log "Ueberschreib-Schutz: auth.users-Count pruefen"
+  local _existing_users
+  _existing_users="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+set -uo pipefail
+set -a; source "$APP_DIR/.env" || { printf 'UNKNOWN'; exit 0; }; set +a
+[[ -n "${POSTGRES_PASSWORD:-}" ]] \
+  || { printf 'UNKNOWN'; exit 0; }
+count="$(docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" supabase-db \
+  psql -tA -U supabase_admin -d postgres \
+  -c "SELECT count(*) FROM auth.users;" 2>/dev/null)"
+psql_exit=$?
+if (( psql_exit != 0 )) || [[ -z "$count" ]]; then
+  printf 'UNKNOWN'
+  exit 0
+fi
+printf '%s' "${count//[[:space:]]/}"
+EOSU
+)"
+  _existing_users="${_existing_users//[[:space:]]/}"
+
+  # IMPORTANT 2-Fix: Konservative Auswertung:
+  #   Numerisch > 0  → Daten vorhanden (Warnung + force-restore-Prompt).
+  #   "UNKNOWN"      → DB-Status unbekannt (Fehler/psql-Timeout) → konservativ wie > 0 behandeln.
+  #   "0"            → frische leere DB → kein force-Prompt noetig.
+  local _force_needed=0
+  if [[ "$_existing_users" == "UNKNOWN" ]]; then
+    printf '\n\033[1;33m⚠ WARNUNG: auth.users-Count konnte nicht ermittelt werden (DB-Fehler oder POSTGRES_PASSWORD fehlt).\033[0m\n'
+    printf '  Konservative Annahme: DB koennte Daten enthalten — force-restore-Bestaetigung wird verlangt.\n\n'
+    _force_needed=1
+  elif [[ "$_existing_users" =~ ^[0-9]+$ ]] && (( _existing_users > 0 )); then
+    printf '\n\033[1;33m⚠ WARNUNG: Auf diesem VPS existieren bereits %s auth.users.\033[0m\n' \
+      "$_existing_users"
+    printf '  Ein Restore (--clean) wuerde diese vorhandenen Daten ueberschreiben.\n'
+    printf '  Szenarien:\n'
+    printf '    a) Frischer VPS — diese Benutzer sind nur die Initialdaten (gewollt).\n'
+    printf '    b) Bereits produktiver VPS — Restore wuerde echte Nutzerdaten zerstoeren!\n\n'
+    _force_needed=1
+  fi
+
+  # ---- Sicherheits-Bestaetigung ----
+  printf '\n\033[1;34m▶ Restore-Plan — bitte bestaetigen\033[0m\n\n'
+  printf '  Quelle:  juengstes Backup je Ordner aus R2 (latest)\n'
+  printf '  Ziel:    Container supabase-db → DB postgres\n'
+  printf '  Schritte: core → brew_assistent → rapt_dashboard\n'
+  printf '  ACHTUNG: --clean droppt vorhandene Objekte vor dem Neuanlegen.\n\n'
+
+  # IMPORTANT 1-Fix: ASSUME_YES ist implementiert (konsistent mit restore.sh --yes-Muster).
+  # Setzt force-restore UND restore-Bestaetigung im Nicht-TTY-Modus voraus.
+  # Nur in Kombination mit nicht-leerem / nicht-UNKNOWN users-Count tatsaechlich genutzt.
+  local _assume_yes="${ASSUME_YES:-0}"
+
+  # BLOCKER-Fix: UNKNOWN + ASSUME_YES=1 → harter Abbruch.
+  # UNKNOWN bedeutet DB-Zustand unklar (kein POSTGRES_PASSWORD, psql-Timeout, …) —
+  # kein automatisierter destruktiver Restore gegen unbekannten Zustand.
+  # Bei TTY + UNKNOWN bleibt der konservative force-restore-Prompt (s. u.).
+  if [[ "$_existing_users" == "UNKNOWN" && "$_assume_yes" == "1" ]]; then
+    printf '\033[1;31m✖ UNKNOWN DB-State + ASSUME_YES=1 — automatisierter destruktiver Restore verweigert.\033[0m\n' >&2
+    printf '  DB-Health zuerst klaeren (POSTGRES_PASSWORD in .env pruefen, supabase-db-Container pruefen).\n' >&2
+    return 1
+  fi
+
+  if (( _force_needed == 1 )); then
+    if [[ -t 0 ]]; then
+      local _force_ans
+      read -rp "Vorhandene Daten ueberschreiben? Tippe 'force-restore' zum Bestaetigen oder Enter zum Abbrechen: " _force_ans
+      if [[ "$_force_ans" != "force-restore" ]]; then
+        echo "  Abgebrochen (Ueberschreib-Schutz)."
+        return 0
+      fi
+      printf '  \033[1;33m⚠ Fortfahren — vorhandene auth.users werden durch Restore ueberschrieben.\033[0m\n\n'
+    elif [[ "$_assume_yes" == "1" ]]; then
+      printf '  \033[1;33m⚠ ASSUME_YES=1 gesetzt — Ueberschreib-Schutz uebersprungen (Nicht-TTY).\033[0m\n\n'
+    else
+      printf '\033[1;31m✖ Nicht-TTY + vorhandene Daten — Restore aus Sicherheitsgruenden abgebrochen.\033[0m\n'
+      printf '  Fuer automatisierten Restore: ASSUME_YES=1 als Env-Var setzen.\n\n'
+      return 0
+    fi
+  fi
+
+  if [[ -t 0 ]]; then
+    local _confirm_ans
+    read -rp "Restore starten? Tippe 'restore' zum Bestaetigen: " _confirm_ans
+    [[ "$_confirm_ans" == "restore" ]] || { echo "  Abgebrochen."; return 0; }
+  elif [[ "$_assume_yes" == "1" ]]; then
+    printf '  \033[1;33m⚠ ASSUME_YES=1 gesetzt — Restore-Bestaetigung uebersprungen (Nicht-TTY).\033[0m\n\n'
+  else
+    printf '\033[1;31m✖ Kein TTY — Restore aus Sicherheitsgruenden abgebrochen (kein Blind-Restore).\033[0m\n'
+    printf '  Fuer automatisierten Restore: ASSUME_YES=1 als Env-Var setzen.\n\n'
+    return 0
+  fi
+
+  # ---- Restore: core → brew_assistent → rapt_dashboard ----
+  # restore.sh all latest --yes: zwingende Reihenfolge, Bestaetigung bereits eingeholt.
+  log "Restore: core → brew_assistent → rapt_dashboard (latest aus R2)"
+  sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+set -euo pipefail
+cd "$APP_DIR"
+./scripts/restore.sh all latest --yes
+EOSU
+
+  ok "Restore abgeschlossen"
+
+  # ---- Abschluss ----
+  _ensure_supabase_marker
+  cf_reconcile_if_token
+
+  printf '\n\033[1;32m  ✓ R2-Restore abgeschlossen — Supabase laeuft mit den Daten aus R2.\033[0m\n'
+  printf '  Smoke-Check: Login in der App + je eine Query auf aibrewgenius.* und rapt.*\n\n'
+}
+
+# ================================================================
+# HAUPT-MENÜ (V3)
 # Punkt 1 = Mehrfachauswahl-TUI (Zusammenlegung der alten Punkte 1+2)
-# Punkt 2 = Migrations-Pfad (frueherer Punkt 3 — unveraendert)
+# Punkt 2 = Migrations-Pfad (VPS-Umzug) — unveraendert
+# Punkt 3 = Erstdaten aus R2 wiederherstellen (latest) — NEU
 # ================================================================
 main_menu() {
   while true; do
     printf '\n\033[1;34m▶ Brewing-Stack — Aktion waehlen\033[0m\n\n'
     printf '  1) Einheiten auswaehlen & starten   (Mehrfachauswahl: Apps, Watchtower, Portainer)\n'
     printf '  2) App migrieren (VPS-Umzug)        (Backup alt → Stop alt → Start neu → Restore)\n'
+    printf '  3) Aus R2 wiederherstellen (latest)  (Disaster-Recovery / Erst-Lauf — frischer VPS ohne alten VPS, destruktiv)\n'
     printf '  q) Beenden\n\n'
-    read -rp "Auswahl [1-2,q]: " menu_choice
+    read -rp "Auswahl [1-3,q]: " menu_choice
 
     case "$menu_choice" in
       1)
@@ -1559,12 +1825,15 @@ main_menu() {
       2)
         action_migrate_unit
         ;;
+      3)
+        action_restore_from_r2
+        ;;
       q|Q)
         echo "  Beenden."
         return 0
         ;;
       *)
-        printf '  Ungueltige Eingabe: %s — Bitte 1, 2 oder q eingeben.\n' "$menu_choice"
+        printf '  Ungueltige Eingabe: %s — Bitte 1, 2, 3 oder q eingeben.\n' "$menu_choice"
         ;;
     esac
   done
@@ -1617,5 +1886,10 @@ cat <<EOF
                Manuell (als ${APP_USER}): ./scripts/backup.sh
   Backup-Log   tail -f /var/log/brewing-backup.log
   Restore      ./scripts/restore.sh all       (core → apps, manuell, destruktiv)
+
+  Erstdaten    Menü-Option 3 "Erstdaten aus R2 wiederherstellen" — zieht das juengste
+               Backup (latest) aus R2 und restored es (core → brew_assistent → rapt).
+               Nur auf frischem VPS: destruktiv, explizite Bestaetigung erforderlich.
+               Voraussetzung: R2-Creds in .env + Backup in R2 vorhanden.
 
 EOF

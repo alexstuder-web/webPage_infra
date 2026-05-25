@@ -89,7 +89,7 @@ No-op — kein Fehler, kein Alarm.
 Container auf. Es gibt keinen „Backup über den Tunnel" — der Cloudflare-TCP-Tunnel
 (`db-tcp.<domain>`) ist für den **Proxy** (`DATABASE_URL`, Rolle `proxy_sync`), nicht
 fürs Backup. Will man die DB von einem anderen VPS aus sichern, geht das nur per SSH auf
-den DB-VPS (genau das macht der Migrations-Flow — → [Abschnitt 6](#6-restore-szenario-2-migration--vps-umzug-bootstrapsh---menu-option-3)).
+den DB-VPS (genau das macht der Migrations-Flow — → [Abschnitt 6](#6-restore-szenario-2-migration--vps-umzug-bootstrapsh---menu-option-2)).
 
 ```
 Drei Dumps back-to-back auf dem DB-VPS (Sekundenabstand):
@@ -142,9 +142,107 @@ Drei Dumps back-to-back auf dem DB-VPS (Sekundenabstand):
 
 ---
 
-## 5. Restore-Szenario 1: Disaster Recovery (VPS tot/neu)
+## 5. Initialer R2-Seed (einmaliger Vorgang — bereits erledigt, 2026-05-25)
+
+Der erste R2-Backup-Stand wurde am 2026-05-25 vom lokalen Dev-Stack (Volume
+`webpage_infra_supabase-db-data`, 2 auth.users, Schemas aibrewgenius + rapt mit
+Produktiv-Testdaten) erzeugt. Methode: normales `backup.sh` ohne `--label` — kein
+dediziertes Seed-Label, damit `latest`-Logik ihn findet.
+
+Verwendete Dateinamen (als Referenz):
+- `_supabase_core/core_20260525_074013.fc.gpg` (4.5 MB)
+- `brew_assistent/aibrewgenius_20260525_074013.fc.gpg` (416 KB)
+- `rapt_dashboard/rapt_20260525_074013.fc.gpg` (12 KB)
+
+Dieser Stand ist der Ausgangspunkt für Erst-Bootstraps neuer VPS via Menü-Option 3
+(→ [§5a](#5a-restore-szenario-1a-erstlauf-auf-frischem-vps-bootstrap-menu-option-3)).
+Künftige nightly Backups ersetzen diesen Stand (Retention N=7, rotation-exempt nur bei
+`--label`).
+
+---
+
+## 5a. Restore-Szenario 1a: Erstlauf auf frischem VPS (`bootstrap.sh --menu`, Option 3)
+
+**Situation:** Ein frischer VPS soll NICHT mit einer leeren Datenbank starten, sondern
+den letzten Stand aus R2 laden — **ohne** SSH-Zugang zu einem alten VPS. Deckt zwei Fälle ab:
+(1) **Erst-Lauf** (es gab noch nie einen VPS) und (2) **Disaster Recovery** (alter VPS tot/weg,
+also kein Migrations-Umzug möglich). Die Migration (Option 2) braucht einen LAUFENDEN alten VPS
+und hilft in beiden Fällen nicht — dafür ist genau dieser Pfad da.
+
+**Voraussetzung:** R2-Creds in `.env` gesetzt + mindestens ein Backup in R2 vorhanden
+(alle drei Ordner: `_supabase_core`, `brew_assistent`, `rapt_dashboard`).
+
+### Ablauf
+
+1. **Bootstrap auf dem neuen VPS (vollständig durchlaufen lassen):**
+   ```
+   curl -fsSL https://raw.githubusercontent.com/alexstuder-web/webPage_infra/main/scripts/bootstrap.sh \
+     -o bootstrap.sh && chmod +x bootstrap.sh && sudo bash bootstrap.sh
+   ```
+   Der Bootstrap installiert alle Tools, clont das Repo, entschlüsselt `.env` (GPG-Passphrase
+   aus Bitwarden), schreibt `/etc/brewing/gpg.pass` und startet den nightly Cron.
+
+2. **Menü-Option 1 — Apps & Supabase starten (optional):**
+   `bootstrap.sh --menu` → Option 1 → `brew_assistent + Supabase` auswählen.
+   Supabase-DB initialisiert sich mit frischen Rollen/Schemas. Supabase-Marker wird gesetzt.
+   **Dieser Schritt ist optional** — `action_restore_from_r2` (Option 3) startet Supabase
+   selbst hoch, falls es noch nicht läuft (idempotente Hochzieh-Logik).
+
+3. **Menü-Option 3 — Erstdaten aus R2 restoren:**
+   ```
+   sudo bash ~/webPage_infra/scripts/bootstrap.sh --menu
+   # → Option 3: Erstdaten aus R2 wiederherstellen (latest, destruktiv)
+   ```
+
+   `action_restore_from_r2()` führt folgende Schritte durch:
+   - Vorbedingungen prüfen (`.env`, docker, rclone, gpg, R2-Vars).
+   - Supabase hochziehen falls nicht laufend (idempotent).
+   - Supabase-Marker setzen (idempotent via `_ensure_supabase_marker`).
+   - R2-Verfügbarkeit prüfen: jüngste `*.fc.gpg` je Ordner. Fehlt eine → sauberer
+     Skip mit Hinweis, kein Abbruch des Bootstraps.
+   - Überschreib-Schutz: `SELECT count(*) FROM auth.users` — wenn > 0: Warnung +
+     explizite Bestätigung `force-restore` erforderlich. Im Nicht-TTY-Modus: Abbruch.
+   - Tippe-`restore`-Prompt (TTY-Pflicht).
+   - `./scripts/restore.sh all latest --yes` — zwingende Reihenfolge:
+     `core` → `brew_assistent` → `rapt_dashboard`.
+   - Tabellen-Counts nach Restore: `auth.users`, `aibrewgenius.recipes`, `rapt.brew_sessions`.
+   - `cf_reconcile_if_token` (Cloudflare-Routing).
+
+4. **Smoke-Check:** Login in der App + je eine Query auf `aibrewgenius.*` und `rapt.*`.
+
+### Sicherheits-Guards
+
+| Guard | Verhalten |
+|---|---|
+| Leerer Bucket / fehlendes `*.fc.gpg` in ≥1 Ordner | Sauberer Skip + Hinweis, Exit 0. Stack läuft mit frischer DB weiter. |
+| `auth.users > 0` auf Ziel-VPS | Warnung + `force-restore`-Eingabe nötig. |
+| Kein TTY | Abbruch (kein Blind-Restore). |
+| R2-Vars fehlen in `.env` | Klarer Hinweis + Return 0 (kein Stacktrace). |
+| `ASSUME_YES=1` + DB-Zustand `UNKNOWN` | Harter Abbruch (`return 1`). DB-Health zuerst klären — kein automatisierter destruktiver Restore gegen unbekannten Zustand. |
+| `ASSUME_YES=1` + bekannter Zustand (0 oder > 0) + kein TTY | Proceed mit Warnung in stdout — Bestätigung gilt als via Env-Var erteilt. |
+
+### pg_restore-Fehler bei Nicht-Supabase-Image (bekannte Nicht-Fatale)
+
+Beim Restore gegen ein plain postgres-Image (z.B. für isolierte Tests) erscheinen
+Fehler zu `timescaledb`, `pg_graphql`, `pgjwt`, `pgsodium`, Vault usw. — diese
+Extensions existieren nur im Supabase-Image. Das ist erwartetes Verhalten und kein
+Anzeichen eines fehlgeschlagenen Restores. Erfolgskriterium: Tabellen-Counts > 0 am Ende.
+
+### Passphrase-Quelle für Restore
+
+Gleich wie bei manuellem `restore.sh`:
+1. `/etc/brewing/gpg.pass` (mode 600, owner `alex`) — vorhanden nach Bootstrap.
+2. `$GPG_PASSPHRASE`-Env.
+3. Interaktiver Prompt (nur mit TTY).
+
+---
+
+## 5b. Restore-Szenario 1b: Disaster Recovery (VPS tot/neu, manuelle Variante)
 
 **Situation:** der VPS ist zerstört oder ein neuer leerer VPS ersetzt ihn.
+Diese Variante beschreibt den manuellen Weg via `restore.sh` direkt —
+die integrierte Bootstrap-Option 3 (→ [§5a](#5a-restore-szenario-1a-erstlauf-auf-frischem-vps-bootstrap-menu-option-3))
+ist der bevorzugte Weg.
 
 ### Runbook
 
@@ -194,7 +292,7 @@ Drei Dumps back-to-back auf dem DB-VPS (Sekundenabstand):
 
 ---
 
-## 6. Restore-Szenario 2: Migration / VPS-Umzug (`bootstrap.sh --menu`, Option 3)
+## 6. Restore-Szenario 2: Migration / VPS-Umzug (`bootstrap.sh --menu`, Option 2)
 
 **Situation:** Die gesamte Supabase / DB-Unit soll von einem laufenden alten VPS auf
 einen neuen VPS verschoben werden.
@@ -202,7 +300,7 @@ einen neuen VPS verschoben werden.
 **Was ist stateful, was nicht:**
 - **Supabase (DB)** ist die einzige stateful Unit — sie wird migriert (Backup + Restore).
 - **brew_assistent, rapt_dashboard, brew-proxy, WebPageAlexStuder** sind zustandslose
-  Apps — sie werden **ohne** Backup/Restore via „Einzelne App installieren" (Menü-Option 2)
+  Apps — sie werden **ohne** Backup/Restore via „Einheiten auswaehlen & starten" (Menü-Option 1)
   auf dem Ziel-VPS neu gestartet. Kein per-App-Migrations-Menü.
 
 **R2 ist das Transportmedium:** der Dump geht alt-VPS → R2 → neu-VPS. Es gibt keine
@@ -215,7 +313,7 @@ Migrations-Flow prüft das am Anfang und gibt einen Credential-Schritt-Hinweis f
 
 ```
 sudo bash ~/webPage_infra/scripts/bootstrap.sh --menu
-# Menü → Option 3 (App migrieren)
+# Menü → Option 2 (App migrieren)
 # → Auswahl: 1) Supabase / DB migrieren
 # → SSH-Daten des alten VPS eingeben
 ```
@@ -258,7 +356,7 @@ bevor Schritt (c) gestartet wird. Volumes und Daten auf dem alten VPS bleiben in
 
 #### (c) Supabase auf neuem VPS hochziehen
 
-`bootstrap.sh` startet die Supabase-Container auf dem neuen VPS (analog Menü-Option 2:
+`bootstrap.sh` startet die Supabase-Container auf dem neuen VPS (analog Menü-Option 1:
 `docker compose --profile vps up -d web_assistent supabase-kong cloudflared`).
 `cf_ensure_tunnel_if_token` läuft vorher (Tunnel-Ensure pro VPS).
 Nach erfolgreichem Start: `supabase`-Marker auf neuem VPS idempotent setzen.
@@ -305,7 +403,7 @@ Im Normalfall (dedizierter Migrations-VPS, frische DB) läuft dieser Check durch
 Nach erfolgreicher Migration sind folgende manuelle Schritte nötig:
 
 1. **Zustandslose Apps auf neuem VPS starten:**
-   `bootstrap.sh --menu` → Option 2 (Einzelne App installieren) für jede App:
+   `bootstrap.sh --menu` → Option 1 (Einheiten auswaehlen & starten) für die gewünschten Apps:
    brew_assistent, rapt_dashboard, brew-proxy, WebPageAlexStuder.
    Kein Backup/Restore nötig — Apps sind stateless.
 
@@ -426,7 +524,7 @@ Exit-Code.
     idempotent an, falls `supabase-db` zum Zeitpunkt des Bootstrap-Laufs bereits läuft.
     Für VPS, die vor der Marker-Einführung gebootstrapped wurden (kein Marker vorhanden,
     DB läuft aber schon), heilt der nächste `bootstrap.sh`-Lauf den fehlenden Marker.
-  - **Install-Unit-Pfad:** `action_install_unit` (Menü-Option 2) setzt den
+  - **Install-Unit-Pfad:** `action_select_and_start` (Menü-Option 1) setzt den
     `supabase`-Marker nach erfolgreichem `docker compose up` via `_ensure_supabase_marker`
     (gegated auf laufenden `supabase-db`-Container).
 - **Cron** (nightly ~03:00) — `/etc/cron.d/brewing-backup`:
