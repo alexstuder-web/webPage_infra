@@ -1183,8 +1183,15 @@ EOSU
   # nicht, aber curl_rc=$? muss unmittelbar danach stehen).
   log "Portainer Hub-Probe: ${server_url}"
   local probe_status curl_rc
-  probe_status="$(curl -o /dev/null -sS -w '%{http_code}' -m 3 "${server_url}" 2>/dev/null)"
-  curl_rc=$?
+  # set -e Fix: ein PLAIN "var=$(cmd)" bricht unter set -e ab, wenn cmd != 0 endet
+  # (anders als 'local var=$(cmd)', das den Exit maskiert). curl scheitert hier erwartbar
+  # (die Hub-URL existiert beim Erst-Bootstrap noch nicht) → in if/else kapseln, in dem
+  # set -e nicht greift, sonst stirbt der ganze Bootstrap VOR dem docker compose up.
+  if probe_status="$(curl -o /dev/null -sS -w '%{http_code}' -m 3 "${server_url}" 2>/dev/null)"; then
+    curl_rc=0
+  else
+    curl_rc=$?
+  fi
 
   if [[ "$probe_status" =~ ^[2-5][0-9][0-9]$ ]]; then
     # Hub antwortet mit einem echten HTTP-Status → Agent werden
