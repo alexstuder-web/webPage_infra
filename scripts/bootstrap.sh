@@ -1342,7 +1342,10 @@ _tui_interactive() {
   local n=${#_TUI_LABELS[@]}
   local cursor=0
   # Default-Vorauswahl kopieren
-  local selected=("${_TUI_DEFAULTS[@]}")
+  # NOTE: intentionally NOT named "selected" — a local "selected" would shadow the
+  # caller's "selected" variable through the nameref _result, causing the nameref
+  # assignment at the end to write back to this local instead of the caller's array.
+  local _tui_sel=("${_TUI_DEFAULTS[@]}")
   local prev_lines=0
 
   # stty-Settings sichern, dann raw-Modus (kein Newline noetig fuer Tastendruck).
@@ -1363,7 +1366,7 @@ _tui_interactive() {
   printf '  cloudflared wird immer automatisch mitgestartet.\n\n'
 
   # Erste Zeichnung
-  _tui_draw "$cursor" selected 0
+  _tui_draw "$cursor" _tui_sel 0
   prev_lines=$(( n + 1 ))  # n Eintrags-Zeilen + 1 Hilfszeile
 
   local result=1  # Default: abgebrochen
@@ -1377,10 +1380,13 @@ _tui_interactive() {
         IFS= read -rsn2 -t 0.05 rest 2>/dev/null || rest=""
         case "$rest" in
           '[A')  # Pfeil hoch
-            (( cursor > 0 )) && (( cursor-- )) || cursor=$(( n - 1 ))
+            # NOTE: avoid "(( cursor-- )) || ..." — (( expr )) exits 1 when the
+            # result is 0, so decrementing to 0 would falsely trigger the else branch.
+            if (( cursor > 0 )); then (( cursor-- )); else cursor=$(( n - 1 )); fi
             ;;
           '[B')  # Pfeil runter
-            (( cursor < n-1 )) && (( cursor++ )) || cursor=0
+            # Same reason: (( cursor++ )) exits 1 when cursor was 0 (pre-increment value).
+            if (( cursor < n-1 )); then (( cursor++ )); else cursor=0; fi
             ;;
           *)
             # Unbekannte Sequenz: schlucken
@@ -1389,10 +1395,10 @@ _tui_interactive() {
         ;;
       ' ')
         # Leertaste: togglen
-        if (( selected[cursor] == 0 )); then
-          selected[$cursor]=1
+        if (( _tui_sel[cursor] == 0 )); then
+          _tui_sel[$cursor]=1
         else
-          selected[$cursor]=0
+          _tui_sel[$cursor]=0
         fi
         ;;
       '' | $'\n' | $'\r')
@@ -1409,7 +1415,7 @@ _tui_interactive() {
         ;;
     esac
 
-    _tui_draw "$cursor" selected "$prev_lines"
+    _tui_draw "$cursor" _tui_sel "$prev_lines"
     prev_lines=$(( n + 1 ))
   done
 
@@ -1422,7 +1428,7 @@ _tui_interactive() {
   printf '\n'
 
   # Ergebnis kopieren
-  _result=("${selected[@]}")
+  _result=("${_tui_sel[@]}")
   return "$result"
 }
 
@@ -1433,7 +1439,10 @@ _tui_interactive() {
 _tui_fallback() {
   local -n _result_fb=$1
   local n=${#_TUI_LABELS[@]}
-  local selected=("${_TUI_DEFAULTS[@]}")
+  # NOTE: intentionally NOT named "selected" — a local "selected" would shadow the
+  # caller's "selected" variable through the nameref _result_fb, causing the nameref
+  # assignment at the end to write back to this local instead of the caller's array.
+  local _tui_sel=("${_TUI_DEFAULTS[@]}")
 
   printf '\n\033[1;34m▶ Einheiten auswaehlen & starten (Text-Modus)\033[0m\n'
   printf '  Eintraege durch Tippen der Nummern togglen.\n'
@@ -1443,7 +1452,7 @@ _tui_fallback() {
     local i
     for (( i=0; i<n; i++ )); do
       local mk
-      (( selected[i] == 1 )) && mk="[x]" || mk="[ ]"
+      (( _tui_sel[i] == 1 )) && mk="[x]" || mk="[ ]"
       printf '  %d) %s  %s\n' "$(( i+1 ))" "$mk" "${_TUI_LABELS[$i]}"
     done
     printf '\n  Eingabe: Nummer(n) zum Togglen (1-%d), a=alle, RET/leer=Starten, q=Abbrechen: ' "$n"
@@ -1453,14 +1462,14 @@ _tui_fallback() {
 
     case "$ans" in
       q|Q)
-        _result_fb=("${selected[@]}")
+        _result_fb=("${_tui_sel[@]}")
         return 1
         ;;
       ''|$'\n')
         break
         ;;
       a|A)
-        for (( i=0; i<n; i++ )); do selected[$i]=1; done
+        for (( i=0; i<n; i++ )); do _tui_sel[$i]=1; done
         ;;
       *)
         # Nummern-Liste auswerten (mehrere Nummern moeglich, leerzeichen-getrennt).
@@ -1471,10 +1480,10 @@ _tui_fallback() {
         for num in "${nums[@]}"; do
           if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= n )); then
             local idx=$(( num - 1 ))
-            if (( selected[idx] == 0 )); then
-              selected[$idx]=1
+            if (( _tui_sel[idx] == 0 )); then
+              _tui_sel[$idx]=1
             else
-              selected[$idx]=0
+              _tui_sel[$idx]=0
             fi
           else
             printf '  Unbekannte Eingabe: %s (ignoriert)\n' "$num"
@@ -1485,7 +1494,7 @@ _tui_fallback() {
     printf '\n'
   done
 
-  _result_fb=("${selected[@]}")
+  _result_fb=("${_tui_sel[@]}")
   return 0
 }
 
