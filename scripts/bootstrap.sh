@@ -352,17 +352,19 @@ EOSU
     chmod 600 "$pass_tmp"
     printf '%s' "$_gpg_pass" > "$pass_tmp"
 
+    # /etc/brewing IMMER sicherstellen — UNABHÄNGIG davon ob gpg.pass neu geschrieben wird.
+    # (Bug-Fix: vorher steckte das install -d im else-Zweig → bei vorhandener gpg.pass
+    # wurde es übersprungen und ein altes 700-Dir blieb, sodass decrypt-env.sh als alex
+    # die Passphrase nicht lesen konnte.) install -d setzt das Mode auch auf bestehende Dirs.
+    # mode 711 (drwx--x--x): alex muss DURCHQUEREN können, um die eigenen Dateien zu lesen
+    # (gpg.pass 600, stateful-units.d/* 644 — beide alex-owned), die cron + decrypt-env.sh
+    # als alex brauchen. 711 statt 755: alex erreicht bekannte Pfade, kann den Inhalt aber
+    # nicht listen; root behält Owner (alex kann root's cf-dns.ini nicht ersetzen).
+    install -d -m 711 -o root -g root /etc/brewing
     if _gpgpass_done; then
       ok "/etc/brewing/gpg.pass bereits vorhanden — übersprungen"
     else
       log "GPG-Passphrase für nightly Backup hinterlegen (/etc/brewing/gpg.pass)"
-      # /etc/brewing als root anlegen, aber mode 711 (drwx--x--x): alex muss das
-      # Verzeichnis DURCHQUEREN können, um die eigenen Dateien zu lesen (gpg.pass 600,
-      # stateful-units.d/* 644 — beide alex-owned), die cron + decrypt-env.sh als alex
-      # brauchen. 700-root würde alex am Traversieren hindern → decrypt-env.sh fände die
-      # Passphrase nicht. 711 (statt 755): alex erreicht bekannte Pfade, kann den Inhalt
-      # aber nicht listen, und root behält Owner (alex kann root's cf-dns.ini nicht ersetzen).
-      install -d -m 711 -o root -g root /etc/brewing
       install -m 600 -o "$APP_USER" -g "$APP_USER" "$pass_tmp" /etc/brewing/gpg.pass
       ok "/etc/brewing/gpg.pass geschrieben (owner ${APP_USER}, mode 600)"
     fi
