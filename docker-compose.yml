@@ -352,7 +352,9 @@ services:
         condition: service_healthy
       auth-assistent:
         condition: service_started
-    env_file: .env
+    # Env-Scoping: kein env_file — die environment:-Map unten deckt den vollständigen
+    # Runner-Vertrag (DB_HOST/PGPASSWORD/BASELINE_FILE/MIGRATIONS_DIR/STACK_LABEL/
+    # REQUIRE_PREMIGRATION_BACKUP). .env existiert in CI nicht → env_file wäre fatal.
     environment:
       DB_HOST: db-assistent
       PGPASSWORD: ${ASSISTENT_POSTGRES_PASSWORD}
@@ -501,7 +503,8 @@ services:
         condition: service_healthy
       auth-rapt:
         condition: service_started
-    env_file: .env
+    # Env-Scoping: kein env_file — die environment:-Map unten deckt den vollständigen
+    # Runner-Vertrag. .env existiert in CI nicht → env_file wäre fatal.
     environment:
       DB_HOST: db-rapt
       PGPASSWORD: ${RAPT_POSTGRES_PASSWORD}
