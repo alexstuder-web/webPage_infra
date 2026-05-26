@@ -619,6 +619,12 @@ services:
     environment:
       TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
     networks:
+      # cloudflared muss JEDES Netz erreichen, dessen Container es per Tunnel routet:
+      # brewing_net (web-hauptseite, portainer, posteio), assistent_net (web-assistent,
+      # kong/api-proxy-assistent), rapt_net (web-rapt, kong/api-proxy-rapt). Ohne brewing_net
+      # liefen alexstuder.cloud + portainer. + webmail. ins Leere (cloudflared erreicht den
+      # Ziel-Container nicht → 502).
+      - brewing_net
       - assistent_net
       - rapt_net
 
