@@ -356,9 +356,13 @@ EOSU
       ok "/etc/brewing/gpg.pass bereits vorhanden — übersprungen"
     else
       log "GPG-Passphrase für nightly Backup hinterlegen (/etc/brewing/gpg.pass)"
-      # /etc/brewing als root anlegen; gpg.pass: mode 600, chown an alex damit
-      # cron (läuft als alex) und decrypt-env.sh (als alex) die Datei lesen können.
-      install -d -m 700 -o root -g root /etc/brewing
+      # /etc/brewing als root anlegen, aber mode 711 (drwx--x--x): alex muss das
+      # Verzeichnis DURCHQUEREN können, um die eigenen Dateien zu lesen (gpg.pass 600,
+      # stateful-units.d/* 644 — beide alex-owned), die cron + decrypt-env.sh als alex
+      # brauchen. 700-root würde alex am Traversieren hindern → decrypt-env.sh fände die
+      # Passphrase nicht. 711 (statt 755): alex erreicht bekannte Pfade, kann den Inhalt
+      # aber nicht listen, und root behält Owner (alex kann root's cf-dns.ini nicht ersetzen).
+      install -d -m 711 -o root -g root /etc/brewing
       install -m 600 -o "$APP_USER" -g "$APP_USER" "$pass_tmp" /etc/brewing/gpg.pass
       ok "/etc/brewing/gpg.pass geschrieben (owner ${APP_USER}, mode 600)"
     fi
@@ -822,7 +826,7 @@ EOSU
   # S-3 FIX: expliziter Existenzcheck statt install … || true (die || true würde
   # falsche Ownership maskieren und ein folgendes touch bei unbeschreibbarem Pfad
   # bricht unter set -euo pipefail ab).
-  [[ -d /etc/brewing ]] || install -d -m 700 -o root -g root /etc/brewing
+  [[ -d /etc/brewing ]] || install -d -m 711 -o root -g root /etc/brewing
   # Mode 600 setzen BEVOR der Token hineingeschrieben wird.
   touch "$cf_ini"
   chmod 600 "$cf_ini"
