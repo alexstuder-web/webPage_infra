@@ -20,6 +20,7 @@ on:
       - "scripts/db-init-runner.sh"
       - "db-init/Dockerfile"
       - ".github/workflows/db-init-runner-build.yml"
+  workflow_dispatch:   # manueller Start via Actions-Tab "Run workflow" / API dispatches
 
 permissions:
   contents: read
