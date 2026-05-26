@@ -307,6 +307,64 @@ else
   echo "  PORTAINER_ROLE=${_portainer_role_val:-auto} (nicht hub) — Portainer-Hub-Routen werden uebersprungen"
 fi
 
+# ---- Frühzeitiger Access-Capability-Check (FAIL-SAFE) ----
+# Wird NUR auf Hub-VPS ausgeführt. Prüft, ob der API-Token den Scope
+# "Access: Apps and Policies: Edit" hat UND Zero Trust auf diesem Account
+# eingerichtet ist. Schlägt der Check fehl, werden alle _portainer_hub-Routen
+# (portainer.* und edge.*) NICHT in DESIRED_ROUTES_JSON aufgenommen →
+# kein DNS-CNAME, kein Tunnel-Ingress → Portainer bleibt ausschliesslich lokal
+# erreichbar (SSH-Tunnel: ssh -L 9000:localhost:9000 user@vps).
+#
+# WICHTIG: Kein cf_call() — cf_call() ruft err()→exit bei HTTP-Fehler.
+# Stattdessen: eigener toleranter curl; Exit-Code + HTTP-Code werden getrennt
+# ausgewertet (Lesson: nie curl -w '%{http_code}' mit || echo 'X' kombinieren).
+ACCESS_CAPABLE=0
+if (( IS_PORTAINER_HUB == 1 )); then
+  log "Access-Capability-Check (frühzeitig, Fail-Safe)"
+  _acc_http_code=""
+  _acc_body=""
+  _acc_raw=""
+  _acc_curl_exit=0
+  _acc_raw="$(curl -sS -w '\n%{http_code}' \
+    -H "$AUTH_HEADER" -H "Content-Type: application/json" \
+    "${CF_API}/accounts/${CLOUDFLARE_ACCOUNT_ID}/access/apps" 2>/dev/null)" \
+    || _acc_curl_exit=$?
+  _acc_http_code="${_acc_raw##*$'\n'}"
+  _acc_body="${_acc_raw%$'\n'*}"
+
+  # Auswertung: HTTP 2xx + success=true → capable
+  if (( _acc_curl_exit == 0 )) \
+     && [[ "$_acc_http_code" =~ ^2 ]] \
+     && [[ "$(printf '%s' "$_acc_body" | jq -r '.success // false')" == "true" ]]; then
+    ACCESS_CAPABLE=1
+    ok "Access-Capability: Token + Zero Trust OK — Portainer-Routen werden exponiert"
+  else
+    # Nicht-fatal: gelber Hinweis, kein exit 1.
+    printf '\n\033[1;33m' >&2
+    printf '╔══════════════════════════════════════════════════════════════════════════╗\n' >&2
+    printf '║  HINWEIS: Cloudflare Access nicht einrichtbar (Token-Scope fehlt        ║\n' >&2
+    printf '║  oder Zero Trust Team-Domain nicht konfiguriert).                       ║\n' >&2
+    printf '╠══════════════════════════════════════════════════════════════════════════╣\n' >&2
+    printf '║  Portainer wird NICHT oeffentlich exponiert (Fail-Safe).                ║\n' >&2
+    printf '║  portainer.alexstuder.cloud + edge.alexstuder.cloud werden NICHT        ║\n' >&2
+    printf '║  in DNS/Tunnel aufgenommen — Portainer nur lokal erreichbar:            ║\n' >&2
+    printf '║    ssh -L 9000:localhost:9000 user@vps                                  ║\n' >&2
+    printf '╠══════════════════════════════════════════════════════════════════════════╣\n' >&2
+    printf '║  HTTP-Code: %-59s ║\n' "${_acc_http_code:-keine Antwort (curl exit ${_acc_curl_exit})}" >&2
+    printf '╠══════════════════════════════════════════════════════════════════════════╣\n' >&2
+    printf '║  Schritte zur Behebung:                                                 ║\n' >&2
+    printf '║  1. Cloudflare Dashboard → Zero Trust → Settings → Team-Domain          ║\n' >&2
+    printf '║     sicherstellen (einmalig, wenn noch nicht aktiviert).                ║\n' >&2
+    printf '║  2. API-Token (CLOUDFLARE_API_TOKEN in .env) mit Scope:                 ║\n' >&2
+    printf '║       Account › Access: Apps and Policies › Edit                        ║\n' >&2
+    printf '║     erstellen oder erweitern.                                           ║\n' >&2
+    printf '║  3. ./scripts/cloudflare-reconcile.sh erneut ausfuehren.               ║\n' >&2
+    printf '╚══════════════════════════════════════════════════════════════════════════╝\n' >&2
+    printf '\033[0m\n' >&2
+    ok "Reconcile laeuft weiter (Tunnel + App-DNS + Mail bleiben unveraendert)"
+  fi
+fi
+
 # Alle Routen aus JSON lesen, pro Route Container prüfen.
 # Ergebnis: JSON-Array nur mit den beanspruchten Routen.
 DESIRED_ROUTES_JSON="[]"
@@ -318,12 +376,24 @@ while IFS= read -r route_json; do
   hostname_val="$(printf '%s' "$route_json" | jq -r '.hostname')"
   container_name="$(_service_to_container "$service")"
 
-  # Portainer-Hub-Gate: _portainer_hub:true-Routen nur auf Hub-VPS beanspruchen.
+  # Portainer-Hub-Gate: _portainer_hub:true-Routen nur auf Hub-VPS beanspruchen
+  # UND nur wenn Access einrichtbar (ACCESS_CAPABLE=1).
+  # Zweistufig:
+  #   a) nicht Hub-VPS → überspringen (wie bisher)
+  #   b) Hub-VPS, aber ACCESS_CAPABLE=0 → überspringen (FAIL-SAFE: nie exponieren
+  #      ohne Access-Schutz). Portainer bleibt nur lokal erreichbar.
   is_hub_route="$(printf '%s' "$route_json" | jq -r '._portainer_hub // false')"
-  if [[ "$is_hub_route" == "true" ]] && (( IS_PORTAINER_HUB == 0 )); then
-    echo "  Uebersprungen (nicht Hub-VPS): ${hostname_val}"
-    SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
-    continue
+  if [[ "$is_hub_route" == "true" ]]; then
+    if (( IS_PORTAINER_HUB == 0 )); then
+      echo "  Uebersprungen (nicht Hub-VPS): ${hostname_val}"
+      SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+      continue
+    fi
+    if (( ACCESS_CAPABLE == 0 )); then
+      echo "  Uebersprungen (Access nicht einrichtbar — Fail-Safe): ${hostname_val}"
+      SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+      continue
+    fi
   fi
 
   running="$(docker inspect --format='{{.State.Running}}' \
@@ -483,19 +553,20 @@ fi
 #   "App policy" sichtbar — keine Nachteile.
 #
 # Fehlerverhalten:
-#   - Wenn der Token keinen Access:Edit-Scope hat (403) oder Zero Trust nicht
-#     aktiviert ist: LAUTER Warn-Block + Exit 1 am Ende des Reconcile.
-#     KEIN stilles Weiterlaufen — eine ungeschützte Management-UI ist gefährlich.
-#     Aber: Tunnel + DNS wurden bereits geschrieben → harter Abbruch würde den
-#     Operator über den Fehler täuschen. Stattdessen: Reconcile läuft durch,
-#     meldet am Ende alle Fehler zusammen, und gibt Exit 1.
+#   - Kein Access-Scope / kein Zero Trust → wird bereits im frühen
+#     Access-Capability-Check (ACCESS_CAPABLE=0) abgefangen; Step 4 wird dann
+#     NICHT ausgeführt und Portainer wird NICHT exponiert (Fail-Safe).
+#   - ACCESS_CAPABLE=1 aber ein späterer API-Call schlägt mid-run fehl
+#     (z.B. Race-Condition, temporärer CF-Fehler): LAUTER Warn-Block + Exit 1.
+#     In diesem Fall haben wir exponiert (DNS+Ingress gesetzt) und der Schutz
+#     fehlt → harter Abbruch ist gerechtfertigt.
 # ============================================================================
 
 # Flag: wurde die Access-Einrichtung übersprungen oder hat sie versagt?
 # 0 = OK / nicht Hub  1 = fehlgeschlagen
 _ACCESS_SETUP_FAILED=0
 
-if (( IS_PORTAINER_HUB == 1 )); then
+if (( IS_PORTAINER_HUB == 1 )) && (( ACCESS_CAPABLE == 1 )); then
   log "Cloudflare Access — portainer.alexstuder.cloud absichern (Hub-VPS)"
 
   # PORTAINER_ACCESS_EMAIL aus .env lesen; Default: alex@alexstuder.ch
@@ -515,26 +586,19 @@ if (( IS_PORTAINER_HUB == 1 )); then
   # (export VAR=$(cmd)-Äquivalent). Zweizeilig: erst zuweisen, dann prüfen.
   _access_apps_raw=""
   if ! _access_apps_raw="$(cf_call GET "/accounts/${CLOUDFLARE_ACCOUNT_ID}/access/apps")"; then
+    # Dieser Pfad ist nach dem frühzeitigen ACCESS_CAPABLE-Check nur noch durch
+    # eine Race-Condition / transienten CF-Fehler erreichbar. DNS + Ingress wurden
+    # bereits gesetzt (ACCESS_CAPABLE=1 hat den Tunnel-Expose erlaubt).
     printf '\n\033[1;31m' >&2
     printf '╔══════════════════════════════════════════════════════════════════════════╗\n' >&2
     printf '║  SICHERHEITS-WARNUNG: Cloudflare Access konnte NICHT eingerichtet werden ║\n' >&2
     printf '╠══════════════════════════════════════════════════════════════════════════╣\n' >&2
-    printf '║  portainer.alexstuder.cloud ist UNGESCHUETZT OEFFENTLICH ERREICHBAR.    ║\n' >&2
+    printf '║  portainer.alexstuder.cloud ist OEFFENTLICH ERREICHBAR (DNS+Ingress     ║\n' >&2
+    printf '║  wurden gesetzt), aber Access-Schutz konnte nicht angelegt werden.      ║\n' >&2
     printf '╠══════════════════════════════════════════════════════════════════════════╣\n' >&2
-    printf '║  Ursache: GET /access/apps fehlgeschlagen.                              ║\n' >&2
-    printf '║  Haeufigstes Problem: API-Token hat NICHT den Scope                     ║\n' >&2
-    printf '║    "Access: Apps and Policies: Edit"                                    ║\n' >&2
-    printf '║  Oder: Cloudflare Zero Trust ist auf diesem Account noch nicht          ║\n' >&2
-    printf '║  aktiviert (Team-Domain fehlt).                                         ║\n' >&2
-    printf '╠══════════════════════════════════════════════════════════════════════════╣\n' >&2
-    printf '║  Sofort-Massnahmen:                                                     ║\n' >&2
-    printf '║  1. Cloudflare Dashboard → Zero Trust → Settings → sicherstellen dass   ║\n' >&2
-    printf '║     eine Team-Domain konfiguriert ist.                                  ║\n' >&2
-    printf '║  2. API-Token (CLOUDFLARE_API_TOKEN in .env) mit folgendem Scope        ║\n' >&2
-    printf '║     neu erstellen oder erweitern:                                       ║\n' >&2
-    printf '║       Account › Access: Apps and Policies › Edit                        ║\n' >&2
-    printf '║  3. ./scripts/cloudflare-reconcile.sh erneut ausfuehren.               ║\n' >&2
-    printf '║  Portainer jetzt NICHT oeffentlich nutzen bis Access aktiv ist!         ║\n' >&2
+    printf '║  Ursache: GET /access/apps fehlgeschlagen (transienter CF-Fehler?).     ║\n' >&2
+    printf '║  Massnahme: ./scripts/cloudflare-reconcile.sh erneut ausfuehren.        ║\n' >&2
+    printf '║  Portainer bis dahin NICHT oeffentlich nutzen!                          ║\n' >&2
     printf '╚══════════════════════════════════════════════════════════════════════════╝\n' >&2
     printf '\033[0m\n' >&2
     _ACCESS_SETUP_FAILED=1
@@ -880,13 +944,15 @@ fi
 # Abschluss
 # ============================================================================
 if (( _ACCESS_SETUP_FAILED == 1 )); then
+  # Dieser Pfad wird nur noch erreicht wenn ACCESS_CAPABLE=1 war (frühzeitiger Check
+  # hat bestanden), aber ein nachfolgender API-Call mid-run fehlgeschlagen ist.
+  # Portainer ist bereits exponiert (DNS+Ingress gesetzt) OHNE vollständigen Schutz.
   printf '\n\033[1;31m' >&2
   printf '╔══════════════════════════════════════════════════════════════════════════╗\n' >&2
   printf '║  RECONCILE ABGESCHLOSSEN — ABER: Access-Einrichtung fehlgeschlagen!     ║\n' >&2
   printf '║  Tunnel + DNS wurden gesetzt; Portainer-Access-Schutz FEHLT.            ║\n' >&2
   printf '║  Sofort handeln — portainer.alexstuder.cloud ist ungeschuetzt!          ║\n' >&2
-  printf '║  Schritte: Token-Scope (Access: Apps and Policies: Edit) pruefen,       ║\n' >&2
-  printf '║  Zero Trust Team-Domain sicherstellen, Reconcile erneut ausfuehren.     ║\n' >&2
+  printf '║  Reconcile erneut ausfuehren um Access-App/Policy anzulegen.            ║\n' >&2
   printf '╚══════════════════════════════════════════════════════════════════════════╝\n' >&2
   printf '\033[0m\n' >&2
   exit 1
