@@ -493,15 +493,34 @@ EOSU
     CLEANUP_FILES+=("$token_tmp")
     chmod 600 "$token_tmp"
 
-    # Token holen und in Tempfile schreiben — kein set -x, kein echo
-    # Zweizeilig: erst zuweisen, dann exportieren (kein export VAR="$(cmd)")
+    # Token holen und in Tempfile schreiben — kein set -x, kein echo.
+    # CF_API_TOKEN + CF_ACCOUNT_ID sind Secrets; sie werden NICHT als
+    # KEY=value-Argument an sudo übergeben (ps-sichtbar!). Stattdessen
+    # landen sie in je einem mode-600-Tempfile und werden dort via cat gelesen.
+    # (Lesson 2026-05-24: Secrets nie in sudo-Env-Argumente — in Dateien transportieren.)
+    local cf_api_token_file cf_account_id_file
+    cf_api_token_file="$(sudo -u "$APP_USER" mktemp)"
+    CLEANUP_FILES+=("$cf_api_token_file")
+    chmod 600 "$cf_api_token_file"
+    printf '%s' "$cf_api_token" > "$cf_api_token_file"
+    unset cf_api_token
+
+    cf_account_id_file="$(sudo -u "$APP_USER" mktemp)"
+    CLEANUP_FILES+=("$cf_account_id_file")
+    chmod 600 "$cf_account_id_file"
+    printf '%s' "$cf_account_id" > "$cf_account_id_file"
+    unset cf_account_id
+
     sudo -u "$APP_USER" -H \
-      CF_API_TOKEN="$cf_api_token" \
-      CF_ACCOUNT_ID="$cf_account_id" \
+      CF_API_TOKEN_FILE="$cf_api_token_file" \
+      CF_ACCOUNT_ID_FILE="$cf_account_id_file" \
       CF_TUNNEL_ID="$tunnel_id" \
       TOKEN_TMP="$token_tmp" \
       bash <<'EOSU'
 set -euo pipefail
+# Secrets aus Dateien lesen — NICHT via Env-Argumente übergeben (ps-sichtbar).
+CF_API_TOKEN="$(cat "$CF_API_TOKEN_FILE")"
+CF_ACCOUNT_ID="$(cat "$CF_ACCOUNT_ID_FILE")"
 # Connector-Token abrufen (GET /accounts/{acct}/cfd_tunnel/{id}/token)
 # Authorization-Header enthält den API-Token (pre-existing Muster).
 raw="$(curl -sS -w '\n%{http_code}' -X GET \
@@ -549,8 +568,12 @@ chmod 600 "$APP_DIR/.env"   # I-3: Mode nach mv erzwingen (umask-sicher)
 EOSU
 
     # Tempfiles sofort aufräumen + aus CLEANUP_FILES entfernen
-    rm -f "$token_tmp" "$env_tmp" 2>/dev/null || true
-    mapfile -t CLEANUP_FILES < <(printf '%s\n' "${CLEANUP_FILES[@]}" | grep -vxF "$token_tmp" | grep -vxF "$env_tmp")
+    rm -f "$token_tmp" "$env_tmp" "$cf_api_token_file" "$cf_account_id_file" 2>/dev/null || true
+    mapfile -t CLEANUP_FILES < <(printf '%s\n' "${CLEANUP_FILES[@]}" \
+      | grep -vxF "$token_tmp" \
+      | grep -vxF "$env_tmp" \
+      | grep -vxF "$cf_api_token_file" \
+      | grep -vxF "$cf_account_id_file")
 
     ok "Cloudflare Tunnel-Ensure abgeschlossen (Token in lokaler .env — nicht in .env.gpg)"
   else
@@ -1473,7 +1496,8 @@ action_select_and_start() {
   if (( selected[0] == 1 )); then
     log "brew_assistent + assistent-Supabase-Stack ausgewaehlt"
     echo "  Services: web_assistent kong-assistent (depends_on zieht db-assistent, auth-assistent, rest-assistent mit)"
-    svc_list="${svc_list} web_assistent kong-assistent"
+    echo "            db-init-assistent (one-shot Init-Container — Baseline + Migrationen; No-op wenn bereits angewendet)"
+    svc_list="${svc_list} web_assistent kong-assistent db-init-assistent"
     has_supabase=1
   fi
 
@@ -1481,7 +1505,8 @@ action_select_and_start() {
   if (( selected[1] == 1 )); then
     log "RAPT Dashboard + rapt-Supabase-Stack ausgewaehlt"
     echo "  Services: web_rapt kong-rapt (depends_on zieht db-rapt, auth-rapt, rest-rapt mit)"
-    svc_list="${svc_list} web_rapt kong-rapt"
+    echo "            db-init-rapt (one-shot Init-Container — Baseline + Migrationen; No-op wenn bereits angewendet)"
+    svc_list="${svc_list} web_rapt kong-rapt db-init-rapt"
   fi
 
   # Eintrag 2: brew-proxy — Phase 3 Proxy-Split (2026-05-25).
@@ -1499,8 +1524,8 @@ docker inspect --format='{{.State.Running}}' db-assistent 2>/dev/null | grep -q 
 EOSU
     if (( assistent_running == 0 && has_supabase == 0 )); then
       printf '  \033[1;33m⚠ db-assistent laeuft nicht und wurde nicht mitausgewaehlt —\033[0m\n'
-      printf '  \033[1;33m  kong-assistent wird automatisch mitgestartet (assistent-Proxy braucht assistent-Supabase).\033[0m\n'
-      svc_list="${svc_list} kong-assistent"
+      printf '  \033[1;33m  kong-assistent + db-init-assistent werden automatisch mitgestartet.\033[0m\n'
+      svc_list="${svc_list} kong-assistent db-init-assistent"
       has_supabase=1
     elif (( assistent_running == 1 )); then
       echo "  db-assistent laeuft bereits — kein Mitstart noetig."
@@ -1514,8 +1539,8 @@ docker inspect --format='{{.State.Running}}' db-rapt 2>/dev/null | grep -q '^tru
 EOSU
     if (( rapt_running == 0 && selected[1] == 0 )); then
       printf '  \033[1;33m⚠ db-rapt laeuft nicht und wurde nicht mitausgewaehlt —\033[0m\n'
-      printf '  \033[1;33m  kong-rapt wird automatisch mitgestartet (rapt-Proxy braucht rapt-Supabase).\033[0m\n'
-      svc_list="${svc_list} kong-rapt"
+      printf '  \033[1;33m  kong-rapt + db-init-rapt werden automatisch mitgestartet.\033[0m\n'
+      svc_list="${svc_list} kong-rapt db-init-rapt"
     elif (( rapt_running == 1 )); then
       echo "  db-rapt laeuft bereits — kein Mitstart noetig."
     fi
@@ -1577,14 +1602,31 @@ EOSU
   fi
 
   if [[ -n "$unique_svcs" ]]; then
+    # ---- DB_INIT_RUNNER_TAG-Guard: Warnung wenn unpinned ----
+    # Kein harter Abbruch — der allererste Bootstrap hat noch kein gepinntes Tag.
+    # Reproduzierbare Deploys erfordern jedoch DB_INIT_RUNNER_TAG=<sha> in .env.
+    local _init_tag=""
+    _init_tag="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+grep -E '^DB_INIT_RUNNER_TAG=[[:print:]]' "$APP_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2- || true
+EOSU
+)"
+    if [[ -z "$_init_tag" ]]; then
+      printf '\n  \033[1;33m⚠ DB_INIT_RUNNER_TAG ist nicht in .env gesetzt —\033[0m\n'
+      printf '  \033[1;33m  db-init-Container nutzen :latest (nicht reproduzierbar).\033[0m\n'
+      printf '  \033[1;33m  Fuer reproduzierbare Deploys: DB_INIT_RUNNER_TAG=<sha> in .env pinnen.\033[0m\n\n'
+    fi
+
     log "Starte Services: ${unique_svcs} cloudflared"
     # --profile vps: benoetigt fuer watchtower und cloudflared (profiles: [vps]).
     # --profile mail: benoetigt fuer posteio (profiles: [mail]); schadet nicht wenn kein Mail ausgewaehlt.
     # Beide Profiles kombinierfbar: kein doppelter compose-Aufruf noetig.
+    # db-init-assistent / db-init-rapt (restart: "no") sind in $SVCS enthalten wenn
+    # der jeweilige Stack ausgewaehlt wurde — sie starten einmalig, Schema-Init wird
+    # ausgefuehrt (Baseline + Migrationen), dann exit 0 (No-op bei unveraendertem Schema).
     sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" SVCS="$unique_svcs" bash <<'EOSU'
 set -euo pipefail
 cd "$APP_DIR"
-# pull: Service-Liste ohne cloudflared (cloudflared wird getrennt via --profile vps up gestartet)
+# pull: Service-Liste inklusive db-init-* und cloudflared
 # shellcheck disable=SC2086
 docker compose --profile vps --profile mail pull $SVCS cloudflared
 # shellcheck disable=SC2086
@@ -1613,11 +1655,15 @@ EOSU
     || { (( selected[2] == 1 )) && [[ -n "${rapt_running+x}" ]] && (( rapt_running == 1 )); }; then
     _ensure_db_marker db-rapt
   fi
-  # Phase 2: DB-Init übernimmt die db-init-assistent / db-init-rapt Init-Container
-  # beim 'compose up' (Baseline + schema_migrations-getrackte Migrationen).
-  # bootstrap.sh macht keinen DB-Init mehr.
+  # DB-Init: db-init-assistent / db-init-rapt wurden im compose-up-Aufruf oben
+  # explizit in die Service-Liste aufgenommen (restart: "no" → nur einmaliger Lauf).
+  # Sie führen Baseline + schema_migrations-Migrationen aus und sind idempotent
+  # (No-op bei unveraendertem Schema). Auf dem Migrate-/Restore-Pfad (action_migrate_unit,
+  # action_restore_from_r2) werden sie BEWUSST weggelassen — dort liefert pg_restore
+  # das Schema, und ein zusaetzlicher db-init-Lauf wuerde den Restore-Zustand nicht aendern
+  # (das Idempotenz-Gate in db-init-runner.sh erkennt schema_migrations als vorhanden).
   if (( has_supabase == 1 || selected[1] == 1 )); then
-    ok "DB-Init: wird von db-init-assistent / db-init-rapt Init-Containern beim Stack-Start erledigt."
+    ok "DB-Init: db-init-Container laufen via compose up (oben gestartet) — Baseline + Migrationen."
   fi
 
   # ---- Portainer starten (nach compose up, damit cloudflared bereits laeuft) ----
@@ -1896,14 +1942,51 @@ EOSU
   [[ "$migrate_ans" == "migrate" ]] || { echo "  Abgebrochen."; return 0; }
 
   # ===========================================================================
+  # SCHRITT (a) PRE-FLIGHT — /etc/brewing/gpg.pass auf altem VPS prüfen
+  # backup.sh braucht die GPG-Passphrase via Passphrase-Kette:
+  #   GPG_PASS_FILE > /etc/brewing/gpg.pass > ~/.config/brewing/gpg.pass > $GPG_PASSPHRASE > Prompt.
+  # Auf einem VPS ohne interaktiven Terminal-Kontext (dieser SSH-Aufruf) wird der
+  # Prompt nicht erreichbar sein — ein fehlendes gpg.pass lässt backup.sh
+  # mit "Passphrase nicht gefunden" fehlschlagen (unklar für den Operator).
+  # Pre-Flight prüft explizit, bevor der Backup-Aufruf gemacht wird.
+  # ===========================================================================
+  log "(a) Pre-Flight: /etc/brewing/gpg.pass auf altem VPS pruefen"
+  if ! ssh -o BatchMode=yes -o ConnectTimeout=15 \
+           -o StrictHostKeyChecking=accept-new \
+           -p "$old_port" "${old_user}@${old_host}" \
+           bash -s <<'REMOTE'
+set -euo pipefail
+if [[ -s /etc/brewing/gpg.pass ]]; then exit 0; fi
+if [[ -s "${HOME}/.config/brewing/gpg.pass" ]]; then exit 0; fi
+[[ -n "${GPG_PASSPHRASE:-}" ]] && exit 0
+printf 'FEHLER: GPG-Passphrase auf altem VPS nicht gefunden.\n' >&2
+printf 'Passphrase-Kette: GPG_PASS_FILE > /etc/brewing/gpg.pass > ~/.config/brewing/gpg.pass > $GPG_PASSPHRASE\n' >&2
+printf 'Loesungen:\n' >&2
+printf '  1. Auf altem VPS: install -m 600 -o alex -g alex /dev/stdin /etc/brewing/gpg.pass\n' >&2
+printf '     (dann Passphrase eingeben, Ctrl-D)\n' >&2
+printf '  2. Oder: GPG_PASS_FILE=/pfad/zur/pass-datei ./scripts/backup.sh manuell ausfuehren\n' >&2
+exit 1
+REMOTE
+  then
+    err "(a) Pre-Flight gescheitert: GPG-Passphrase auf altem VPS (${old_user}@${old_host}) nicht verfuegbar.
+   Backup auf altem VPS wuerde fehlschlagen — Migration abgebrochen.
+   Loesungshinweise stehen in der obigen Ausgabe."
+  fi
+  ok "(a) Pre-Flight: gpg.pass auf altem VPS vorhanden"
+
+  # ===========================================================================
   # SCHRITT (a) — Backup auf altem VPS erstellen
   # ===========================================================================
   log "(a) Frisches Backup auf altem VPS erstellen (--label pre-migration)"
   ssh -o BatchMode=yes -o ConnectTimeout=30 \
       -o StrictHostKeyChecking=accept-new \
       -p "$old_port" "${old_user}@${old_host}" \
-      'cd ~/webPage_infra && ./scripts/backup.sh --label pre-migration' \
+      bash -s <<'REMOTE' \
     || err "Backup auf altem VPS fehlgeschlagen — Migration abgebrochen. Alter Stand bleibt laufend."
+set -euo pipefail
+cd ~/webPage_infra
+./scripts/backup.sh --label pre-migration
+REMOTE
   ok "(a) Backup erstellt"
 
   # ===========================================================================
@@ -1953,12 +2036,24 @@ EOSU
     stop_svcs="${stop_svcs} db-rapt kong-rapt auth-rapt rest-rapt web_rapt api_proxy_rapt"
   fi
   local stop_svcs_trimmed="${stop_svcs# }"
+  # stop_svcs_trimmed wird via bash-s-Heredoc übergeben — NICHT direkt in den
+  # SSH-Kommandostring interpoliert (Injection-Schutz; Lesson 2026-05-24:
+  # Variablen nie direkt in SSH-Remote-Strings konkatenieren).
+  # Der Wert kommt als erstes Argument ($1) in der Remote-Shell an.
+  # Service-Namen enthalten nur [a-z_-] — kein Injection-Risiko, aber konsistentes
+  # Muster ist wichtiger als der minimale Scope hier.
   ssh -o BatchMode=yes -o ConnectTimeout=15 \
       -o StrictHostKeyChecking=accept-new \
       -p "$old_port" "${old_user}@${old_host}" \
-      "cd ~/webPage_infra && docker compose stop ${stop_svcs_trimmed} 2>/dev/null || true
-       docker compose stop 2>/dev/null || true" \
+      bash -s -- "$stop_svcs_trimmed" <<'REMOTE' \
     || err "Stop auf altem VPS fehlgeschlagen. Bitte manuell pruefen: ssh ${old_user}@${old_host} 'cd ~/webPage_infra && docker compose ps'"
+set -euo pipefail
+cd ~/webPage_infra
+STOP_SVCS="$1"
+# shellcheck disable=SC2086
+docker compose stop $STOP_SVCS 2>/dev/null || true
+docker compose stop 2>/dev/null || true
+REMOTE
 
   # Verifikation: DB-Container(s) wirklich gestoppt?
   # Separater SSH-Call — docker compose stop Exit-Code ist immer 0, unabhaengig vom Ergebnis.
@@ -2095,19 +2190,24 @@ EOSU
   # SCHRITT (e) — DB-Marker auf altem VPS entfernen (Backup → No-op)
   # ===========================================================================
   log "(e) DB-Marker auf altem VPS entfernen (${unit_label})"
-  local rm_cmd=""
-  if (( do_assistent == 1 )); then
-    rm_cmd="${rm_cmd} rm -f /etc/brewing/stateful-units.d/db-assistent;"
-  fi
-  if (( do_rapt == 1 )); then
-    rm_cmd="${rm_cmd} rm -f /etc/brewing/stateful-units.d/db-rapt;"
-  fi
-  local rm_cmd_trimmed="${rm_cmd# }"
+  # Marker-Namen werden als Positionsargumente ($1, $2) an die Remote-Shell übergeben —
+  # NICHT als Shell-Kommando-String interpoliert (Injection-Schutz; Lesson 2026-05-24).
+  # Fixe Pfade sind sicher; das Muster ist konsistent mit anderen SSH-Aufrufen im File.
+  local rm_args=()
+  (( do_assistent == 1 )) && rm_args+=("db-assistent")
+  (( do_rapt      == 1 )) && rm_args+=("db-rapt")
+
   ssh -o BatchMode=yes -o ConnectTimeout=15 \
       -o StrictHostKeyChecking=accept-new \
       -p "$old_port" "${old_user}@${old_host}" \
-      "$rm_cmd_trimmed" \
-    || printf '  \033[1;33m⚠ Marker-Entfernen fehlgeschlagen — bitte manuell auf altem VPS: %s\033[0m\n' "$rm_cmd_trimmed"
+      bash -s -- "${rm_args[@]}" <<'REMOTE' \
+    || printf '  \033[1;33m⚠ Marker-Entfernen fehlgeschlagen — bitte manuell auf altem VPS pruefen:\033[0m\n  rm -f /etc/brewing/stateful-units.d/{db-assistent,db-rapt}\n'
+set -euo pipefail
+for marker in "$@"; do
+  rm -f "/etc/brewing/stateful-units.d/${marker}"
+  printf 'Marker entfernt: /etc/brewing/stateful-units.d/%s\n' "$marker"
+done
+REMOTE
   ok "(e) DB-Marker auf altem VPS entfernt — Backup dort jetzt No-op fuer ${unit_label}"
 
   # ===========================================================================
@@ -2262,7 +2362,7 @@ EOSU
     [[ "$folder" =~ ^[a-zA-Z0-9_-]+$ ]] \
       || { printf '\033[1;31m✖ Interner Fehler: ungültiger Ordner: %s\033[0m\n' "$folder" >&2; return 2; }
     sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" FOLDER="$folder" bash <<'EOSU'
-set -uo pipefail
+set -euo pipefail
 set -a; source "$APP_DIR/.env"; set +a
 R2_EP="${R2_ENDPOINT:-}"
 if [[ -z "$R2_EP" ]]; then
