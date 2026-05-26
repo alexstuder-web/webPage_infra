@@ -100,10 +100,12 @@ services:
   #
   # assistent-Proxy: OpenAI + Brewfather; gegen kong-assistent (assistent_net).
   #   KEIN DATABASE_URL — kein db-sync in dieser Rolle.
-  #   OPENAI_API_KEY kommt via env_file: .env.
+  #   OPENAI_API_KEY explizit gesetzt; RAPT_SERVICE_ROLE_KEY NICHT im Container.
   # rapt-Proxy:      RAPT-Telemetrie + db-sync; gegen kong-rapt (rapt_net).
   #   DATABASE_URL → RAPT_PROXY_DATABASE_URL (proxy_sync@db-rapt).
-  #   OPENAI_API_KEY nicht forciert — kommt via env_file: .env, wird ignoriert.
+  #   RAPT_SERVICE_ROLE_KEY explizit gesetzt; OPENAI_API_KEY NICHT im Container.
+  # Env-Scoping: kein env_file — explizite environment:-Maps pro Proxy.
+  #   Weder OPENAI_API_KEY noch RAPT_SERVICE_ROLE_KEY landen beim jeweils anderen.
   #
   # Netz-Isolation (Auth-Isolation auf Netz-Ebene, zusätzlich zur JWT-Prüfung):
   #   api_proxy_assistent  ∈ assistent_net  (sieht kong-assistent, web_assistent; NICHT kong-rapt)
@@ -125,21 +127,34 @@ services:
     depends_on:
       kong-assistent:
         condition: service_started
-    env_file: .env
+    # NO env_file — env vars are scoped explicitly below.
+    # Only vars required by the assistent role land in this container.
+    # RAPT_SERVICE_ROLE_KEY, DATABASE_URL, RAPT_SYNC_ENABLED and all
+    # rapt-stack secrets are intentionally absent.
     environment:
+      # ── Identity ────────────────────────────────────────────────────────────
       PROXY_ROLE: assistent
-      # SUPABASE_INTERNAL_URL für diese Rolle: kong-assistent im selben assistent_net.
-      # Default greift wenn ASSISTENT_PROXY_SUPABASE_URL in .env nicht gesetzt.
+      # ── Supabase / Kong (assistent stack) ───────────────────────────────────
       SUPABASE_INTERNAL_URL: ${ASSISTENT_PROXY_SUPABASE_URL:-http://kong-assistent:8000}
-      # CORS_ORIGIN für die assistent-Web-App (leer = kein CORS-Restrict; prod: https://aibrewgenius.alexstuder.cloud).
+      SUPABASE_ANON_KEY: ${ASSISTENT_ANON_KEY}
+      # ── OpenAI (required for assistent role; proxy aborts at startup if absent) ──
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      # ── SSO (assistent SIGNS tickets; secret shared with rapt proxy) ─────────
+      SSO_SIGNING_SECRET: ${SSO_SIGNING_SECRET}
+      # ── CORS ────────────────────────────────────────────────────────────────
       CORS_ORIGIN: ${ASSISTENT_PROXY_CORS_ORIGIN:-}
-      # DATABASE_URL wird NICHT gesetzt — assistent-Proxy hat keinen db-sync.
-      # OPENAI_API_KEY kommt via env_file: .env (Pflicht für die assistent-Rolle; Proxy-Guard prüft es).
-      # ── SSO Phase 5 (2026-05-25) ────────────────────────────────────────────
-      # SSO_SIGNING_SECRET (aus .env via env_file): assistent-Proxy SIGNIERT Tickets damit.
-      # Kein explizites environment-Mapping nötig — env_file: .env liefert es automatisch.
-      # RAPT_SERVICE_ROLE_KEY wird von diesem Proxy NICHT verwendet (nur rapt-Proxy braucht ihn).
-      # ────────────────────────────────────────────────────────────────────────
+      # ── Optional tuning vars (all have safe in-code defaults) ────────────────
+      PORT: ${PROXY_PORT:-3000}
+      BREWFATHER_BASE_URL: ${BREWFATHER_BASE_URL:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      OPENAI_FETCH_TIMEOUT_MS: ${OPENAI_FETCH_TIMEOUT_MS:-}
+      AUTH_FETCH_TIMEOUT_MS: ${AUTH_FETCH_TIMEOUT_MS:-}
+      BF_FETCH_TIMEOUT_MS: ${BF_FETCH_TIMEOUT_MS:-}
+      IMAGE_FETCH_TIMEOUT_MS: ${IMAGE_FETCH_TIMEOUT_MS:-}
+      SSO_TICKET_TTL_SECS: ${SSO_TICKET_TTL_SECS:-}
+      SSO_CLOCK_SKEW_SECS: ${SSO_CLOCK_SKEW_SECS:-}
+      # DATABASE_URL intentionally omitted — assistent proxy has no db-sync.
+      # RAPT_SERVICE_ROLE_KEY intentionally omitted — assistent proxy never uses it.
     labels:
       com.centurylinklabs.watchtower.enable: "true"
     networks:
@@ -153,30 +168,40 @@ services:
     depends_on:
       kong-rapt:
         condition: service_started
-    env_file: .env
+    # NO env_file — env vars are scoped explicitly below.
+    # Only vars required by the rapt role land in this container.
+    # OPENAI_API_KEY is intentionally absent (rapt proxy never calls OpenAI).
     environment:
+      # ── Identity ────────────────────────────────────────────────────────────
       PROXY_ROLE: rapt
-      # SUPABASE_INTERNAL_URL für diese Rolle: kong-rapt im selben rapt_net.
-      # Default greift wenn RAPT_PROXY_SUPABASE_URL in .env nicht gesetzt.
+      # ── Supabase / Kong (rapt stack) ─────────────────────────────────────────
       SUPABASE_INTERNAL_URL: ${RAPT_PROXY_SUPABASE_URL:-http://kong-rapt:8000}
-      # DATABASE_URL für db-sync (proxy_sync@db-rapt).
-      # Vollständiger Conn-String IMMER in .env — kein verschachteltes ${:-} (cicd-Lesson 2026-05-24).
-      # sslmode=disable korrekt: Postgres hat SSL=off; TLS = Cloudflare Tunnel (Cross-VPS).
+      SUPABASE_ANON_KEY: ${RAPT_ANON_KEY}
+      # ── DB-sync (proxy_sync@db-rapt) ─────────────────────────────────────────
+      # Vollständiger Conn-String IMMER in .env — kein verschachteltes ${:-}
+      # (cicd-Lesson 2026-05-24: :? filewide → Lesson; ${VAR} ohne Default).
       DATABASE_URL: ${RAPT_PROXY_DATABASE_URL}
-      # RAPT_SYNC_ENABLED: db-sync-Schalter. Default true.
       RAPT_SYNC_ENABLED: ${RAPT_SYNC_ENABLED:-true}
-      # CORS_ORIGIN für die rapt-Web-App (leer = kein CORS-Restrict; prod: https://rapt.alexstuder.cloud).
+      # ── SSO (rapt VERIFIES tickets + mints sessions via service_role) ─────────
+      SSO_SIGNING_SECRET: ${SSO_SIGNING_SECRET}
+      RAPT_SERVICE_ROLE_KEY: ${RAPT_SERVICE_ROLE_KEY}
+      # ── CORS ────────────────────────────────────────────────────────────────
       CORS_ORIGIN: ${RAPT_PROXY_CORS_ORIGIN:-}
-      # OPENAI_API_KEY kommt via env_file: .env — für rapt-Rolle irrelevant, wird ignoriert.
-      # ── SSO Phase 5 (2026-05-25) ────────────────────────────────────────────
-      # SSO_SIGNING_SECRET (aus .env via env_file): rapt-Proxy VERIFIZIERT Tickets damit.
-      # Kein explizites environment-Mapping nötig — env_file: .env liefert es automatisch.
-      # RAPT_SERVICE_ROLE_KEY (aus .env via env_file): NUR für SSO-Redeem GoTrue-Admin-Calls
-      # (/api/sso/redeem: User finden/anlegen in Auth R, R-Session per service_role mint).
-      # Kein explizites environment-Mapping nötig — env_file: .env liefert es automatisch.
-      # ISOLATIONS-GARANTIE: RAPT_SERVICE_ROLE_KEY ist rapt-Stack-spezifisch (signiert mit
-      # RAPT_JWT_SECRET); den assistent-Proxy-Code darf er nie erreichen (er liest ihn nicht).
-      # ────────────────────────────────────────────────────────────────────────
+      # ── Optional tuning vars (all have safe in-code defaults) ────────────────
+      PORT: ${PROXY_PORT:-3000}
+      RAPT_SYNC_INTERVAL_MS: ${RAPT_SYNC_INTERVAL_MS:-}
+      RAPT_FETCH_TIMEOUT_MS: ${RAPT_FETCH_TIMEOUT_MS:-}
+      RAPT_CACHE_INTERVAL_MS: ${RAPT_CACHE_INTERVAL_MS:-}
+      RAPT_TOKEN_ENDPOINT: ${RAPT_TOKEN_ENDPOINT:-}
+      RAPT_API_BASE: ${RAPT_API_BASE:-}
+      RAPT_CONTROLLER_ENDPOINT: ${RAPT_CONTROLLER_ENDPOINT:-}
+      RAPT_TELEMETRY_ENDPOINT: ${RAPT_TELEMETRY_ENDPOINT:-}
+      RAPT_CONTROLLER_USE: ${RAPT_CONTROLLER_USE:-}
+      AUTH_FETCH_TIMEOUT_MS: ${AUTH_FETCH_TIMEOUT_MS:-}
+      SSO_TICKET_TTL_SECS: ${SSO_TICKET_TTL_SECS:-}
+      SSO_CLOCK_SKEW_SECS: ${SSO_CLOCK_SKEW_SECS:-}
+      # OPENAI_API_KEY intentionally omitted — rapt proxy never calls OpenAI.
+      # BREWFATHER_BASE_URL intentionally omitted — Brewfather routes are assistent-only.
     labels:
       com.centurylinklabs.watchtower.enable: "true"
     networks:
