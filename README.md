@@ -2,68 +2,111 @@
 
 **Single source of truth** für das gesamte Brewing-Ökosystem auf einem VPS.
 Alle Anwendungen kommen als **fertige Container-Images** aus Docker Hub —
-dieses Repo enthält nur Compose-Files, Configs und Bootstrap.
+dieses Repo enthält nur Compose-Files, Configs, Bootstrap und die Backup-Scripts.
+
+> **Architektur in einem Satz:** zwei **voneinander unabhängige Lean-Supabase-Stacks**
+> (je eigene DB + Auth) — einer für `brew_assistent`, einer für `RAPT_Dashboard` —
+> plus je ein eigener API-Proxy. Kein geteiltes `auth`, keine geteilte DB. Auto-Login
+> zwischen den Apps läuft über eine **REST-SSO**-Schnittstelle, nicht über geteilte Logins.
 
 ## Bootstrap auf frischem Ubuntu-VPS
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/alexstuder-web/webPage_infra/main/scripts/bootstrap.sh \
-  -o bootstrap.sh && chmod +x bootstrap.sh && ./bootstrap.sh
+  -o bootstrap.sh && chmod +x bootstrap.sh && sudo ./bootstrap.sh
 ```
 
-Drei interaktive Eingaben:
+Interaktive Eingaben (Install-Pfad):
 
-1. Bitwarden E-Mail
-2. Bitwarden Master-Passwort *(holt die GPG-Passphrase aus Item
+1. Passwort für neuen Linux-User `alex`
+2. Bitwarden E-Mail *(nur falls `.env` noch fehlt)*
+3. Bitwarden Master-Passwort *(holt die GPG-Passphrase aus Item
    `ALEXSTUDER_WEBPAGE_GPG_PASSWORD`)*
-3. Passwort für neuen Linux-User `alex`
 
-Was passiert automatisch: `apt upgrade` → User `alex` + Docker installieren →
-Bitwarden CLI → Repo nach `/home/alex/webPage_infra` clonen → `.env`
-entschlüsseln → `docker compose --profile vps up -d`.
+`bootstrap.sh` ist **menügesteuert** (Neu-Installieren · einzelne App · Migrate von
+altem VPS · Restore aus R2). Was der Install-Pfad automatisch tut:
 
-**Threat-Model-Hinweis:** `bootstrap.sh` wird per `curl -fsSL` aus dem privaten
-GitHub-Org-Repo geladen und direkt ausgeführt — ohne gesonderte Checksum-Verifikation.
-Das Sicherheitsmodell lautet "trust your own repo": wer schreibenden Zugriff auf
-`alexstuder-web/webPage_infra` oder den DNS-Namen `raw.githubusercontent.com` kontrolliert,
-kann beliebigen Code als root einschleusen. Mitigations: Org-Repo ist privat,
-GitHub-Account mit 2FA gesichert, Bitwarden-Session und GPG-Passphrase werden erst nach
-der Skript-Ausführung abgerufen und landen nicht im Skript selbst.
+`apt upgrade` → User `alex` + Docker + `cron`/`rclone`/`jq` → Bitwarden CLI →
+`webPage_infra` nach `/home/alex/webPage_infra` clonen → **App-Repos
+`brew_assistent-new` + `RAPT_Brewing_Dashboard-new` als Geschwister shallow-clonen**
+(liefern die `db_scripts/` für die DB-Init-Mounts) → `.env` entschlüsseln →
+`docker compose --profile vps up -d <gewählte Services inkl. db-init>` → die
+`db-init-*`-Container legen Baseline + Migrationen an → Cloudflare-Tunnel + DNS
+reconcilen → nightly-Backup-Cron einrichten.
+
+**Threat-Model-Hinweis:** `bootstrap.sh` wird per `curl -fsSL` aus dem GitHub-Org-Repo
+geladen und direkt als root ausgeführt — ohne gesonderte Checksum-Verifikation. Das
+Sicherheitsmodell lautet "trust your own repo": wer schreibenden Zugriff auf
+`alexstuder-web/webPage_infra` oder den DNS-Namen `raw.githubusercontent.com`
+kontrolliert, kann beliebigen Code als root einschleusen. Mitigations: GitHub-Account
+mit 2FA, Bitwarden-Session und GPG-Passphrase werden erst nach der Skript-Ausführung
+abgerufen und landen nicht im Skript selbst.
 
 ## Enthaltene Services
+
+Zwei **Lean-Supabase**-Stacks (nur `db + auth + rest + kong` — `realtime`, `storage`,
+`studio`, `meta` werden bewusst **nicht** betrieben), getrennt nach App über
+eigene Netze, Volumes, Secrets und Ports.
 
 | Container | Image | Updates |
 |---|---|---|
 | `web-hauptseite` | `${DOCKERHUB_USERNAME}/web_hauptseite:latest` | Watchtower (`:latest`) |
 | `web-assistent` | `${DOCKERHUB_USERNAME}/web_assistent:latest` | Watchtower (`:latest`) |
 | `web-rapt` | `${DOCKERHUB_USERNAME}/web_rapt:latest` | Watchtower (`:latest`) |
-| `api-proxy` | `${DOCKERHUB_USERNAME}/brew_proxy:latest` | Watchtower (`:latest`) |
-| `supabase-db` | `supabase/postgres:15.8.1.060` | manuell (gepinnt) |
-| `supabase-auth` | `supabase/gotrue:v2.176.1` | manuell (gepinnt) |
-| `supabase-rest` | `postgrest/postgrest:v12.2.10` | manuell (gepinnt) |
-| `supabase-realtime` | `supabase/realtime:v2.34.43` | manuell (gepinnt) |
-| `supabase-storage` | `supabase/storage-api:v1.13.3` | manuell (gepinnt) |
-| `supabase-meta` | `supabase/postgres-meta:v0.96.3` | manuell (gepinnt) |
-| `supabase-studio` | `supabase/studio:2026.04.27-sha-5f60601` | manuell (gepinnt) |
-| `supabase-kong` | `kong:2.8.1` | manuell (gepinnt) |
-| `cloudflared` | `cloudflare/cloudflared:2026.5.0` | manuell (gepinnt) |
-| `watchtower` | `containrrr/watchtower:latest` | self-update |
+| `api-proxy-assistent` | `${DOCKERHUB_USERNAME}/brew_proxy:latest` (`PROXY_ROLE=assistent`) | Watchtower (`:latest`) |
+| `api-proxy-rapt` | `${DOCKERHUB_USERNAME}/brew_proxy:latest` (`PROXY_ROLE=rapt`) | Watchtower (`:latest`) |
+| **assistent-Stack** | | |
+| `db-assistent` | `supabase/postgres:15.8.1.060` | manuell (gepinnt) |
+| `auth-assistent` | `supabase/gotrue:v2.176.1` | manuell (gepinnt) |
+| `rest-assistent` | `postgrest/postgrest:v12.2.10` | manuell (gepinnt) |
+| `kong-assistent` | `kong:2.8.1` | manuell (gepinnt) |
+| `db-init-assistent` | `${DOCKERHUB_USERNAME}/db_init_runner:${DB_INIT_RUNNER_TAG:-latest}` | Init-Container (one-shot) |
+| **rapt-Stack** | | |
+| `db-rapt` | `supabase/postgres:15.8.1.060` (TimescaleDB) | manuell (gepinnt) |
+| `auth-rapt` | `supabase/gotrue:v2.176.1` | manuell (gepinnt) |
+| `rest-rapt` | `postgrest/postgrest:v12.2.10` | manuell (gepinnt) |
+| `kong-rapt` | `kong:2.8.1` | manuell (gepinnt) |
+| `db-init-rapt` | `${DOCKERHUB_USERNAME}/db_init_runner:${DB_INIT_RUNNER_TAG:-latest}` | Init-Container (one-shot) |
+| **Infra / optional** | | |
+| `cloudflared` | `cloudflare/cloudflared:2026.5.0` | manuell · `profiles: [vps]` |
+| `watchtower` | `containrrr/watchtower:latest` | self-update · `profiles: [vps]` |
+| `portainer` | `portainer/portainer-ce:2.27.3` | manuell · `profiles: [portainer-hub]` |
+| `portainer_edge_agent` | `portainer/agent:2.27.3` | manuell · `profiles: [portainer-agent]` |
+| `posteio` | `analogic/poste.io:2.4` | manuell · `profiles: [mail]` |
 
 App-Container haben das Label `com.centurylinklabs.watchtower.enable=true` →
-Watchtower zieht alle 5 Min neue `:latest` Images. Supabase bleibt gepinnt,
-Updates nur über bewusstes Anheben der Image-Tags + Re-deploy.
+Watchtower zieht alle 5 Min neue `:latest` Images. Supabase, cloudflared, Portainer
+und Mail bleiben gepinnt; Updates nur über bewusstes Anheben der Image-Tags + Re-deploy.
+
+## Datenbanken — getrennt pro App
+
+- **Zwei eigenständige DBs**: `db-assistent` (Schema `aibrewgenius`) und `db-rapt`
+  (Schema `rapt`, TimescaleDB-Hypertables für Telemetrie). Jede DB hat ihr **eigenes
+  `auth`** (eigene GoTrue). Keine geteilte `auth.users`, kein cross-DB-FK.
+- **Schemas leben im jeweiligen App-Repo** (`brew_assistent-new/db_scripts/`,
+  `RAPT_Brewing_Dashboard-new/db_scripts/`), **nicht** hier. Der Bootstrap mountet
+  sie read-only in den passenden `db-init-*`-Container.
+- **DB-Init**: pro Stack ein One-Shot-Init-Container (`db_init_runner`-Image). Er
+  wartet auf `auth.users`, wendet die `baseline.sql` an und danach alle noch nicht
+  applizierten `migrations/NNN_*.sql` (Tracking via `public.schema_migrations`).
+  Idempotent — ein erneuter Lauf ist ein No-op. **Migrations-Konzept:** pro App eine
+  Init-Baseline, danach forward-only nummerierte Migrationen.
+- **SSO via REST**: das RAPT-Dashboard bietet eine Auto-Login-Schnittstelle. Der
+  assistent-Proxy signiert ein kurzlebiges single-use Login-Ticket, der rapt-Proxy
+  löst es server-zu-server ein (`service_role`/GoTrue-Admin) und gibt dem User eine
+  echte RAPT-Session — ohne zweiten Login und ohne Secret im Browser.
 
 ## Secrets — `.env.gpg`
 
-Alle Secrets liegen verschlüsselt als `.env.gpg` im Repo (AES-256, symmetrisch).
-Die GPG-Passphrase steckt in **Bitwarden** unter
-Item `ALEXSTUDER_WEBPAGE_GPG_PASSWORD`.
+Alle Runtime-Secrets liegen verschlüsselt als `.env.gpg` im Repo (AES-256, symmetrisch).
+Die GPG-Passphrase steckt in **Bitwarden** unter Item `ALEXSTUDER_WEBPAGE_GPG_PASSWORD`.
+`decrypt-/encrypt-env.sh` lösen die Passphrase autonom auf (`GPG_PASS_FILE` →
+`/etc/brewing/gpg.pass` → `~/.config/brewing/gpg.pass` → `$GPG_PASSPHRASE` → Prompt).
 
 ### Secret hinzufügen / ändern
 
 ```bash
-export GPG_PASSPHRASE="$(bw get password ALEXSTUDER_WEBPAGE_GPG_PASSWORD)"
-./scripts/decrypt-env.sh        # .env.gpg → .env
+./scripts/decrypt-env.sh        # .env.gpg → .env  (Passphrase wird autonom gelöst)
 $EDITOR .env                    # Wert ändern
 ./scripts/encrypt-env.sh        # .env → .env.gpg
 git add .env.gpg && git commit -m "update env" && git push
@@ -72,18 +115,29 @@ git add .env.gpg && git commit -m "update env" && git push
 Auf dem VPS: `git pull && ./scripts/decrypt-env.sh && docker compose --profile vps up -d`.
 
 **Niemals** die unverschlüsselte `.env` committen — `.gitignore` blockt das.
+**Keine** globalen RAPT-/Brewfather-Creds in der `.env`: beide sind rein per-User
+(RAPT-Keys + Brewfather-Keys im Vault der jeweiligen DB, von den Proxies per RPC gelesen).
 
 ## Lokales Dev-Setup
 
 ```bash
-# .env zuerst entschlüsseln (siehe oben)
+./scripts/decrypt-env.sh        # .env zuerst entschlüsseln
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 ```
 
-Dev-Override aktiviert Localhost-Ports (`:8081` web_assistent, `:8082` web_rapt,
-`:8090` web_hauptseite, `:8083` api_proxy, `:54321` kong, `:54322` postgres,
-`:54323` studio). `cloudflared` + `watchtower` laufen lokal **nicht** (sind
-hinter `profiles: [vps]`).
+Dev-Override aktiviert Localhost-Ports:
+
+| Port | Service | | Port | Service |
+|---|---|---|---|---|
+| `:8090` | web_hauptseite | | `:54321` | kong-assistent |
+| `:8081` | web_assistent | | `:54322` | db-assistent (Postgres) |
+| `:8082` | web_rapt | | `:54331` | kong-rapt |
+| `:8083` | api_proxy_assistent | | `:54332` | db-rapt (Postgres) |
+| `:8085` | api_proxy_rapt | | | |
+
+`cloudflared`, `watchtower`, `portainer*` und `posteio` laufen lokal **nicht**
+(hinter `profiles`). Kein Studio-Container — fürs DB-Inspizieren `psql` gegen
+`:54322`/`:54332` oder ein externes GUI.
 
 ## Cloudflare Tunnel + DNS  (pro VPS dynamisch, idempotent via API)
 
@@ -96,36 +150,38 @@ routet nur die Hostnames, deren Ziel-Container **auf ihm tatsächlich laufen**.
 
 Reihenfolge beim Bootstrap:
 1. **Tunnel-Ensure** (`cf_ensure_tunnel_if_token`): sucht `brewing-<hostname>` in der
-   CF-Account-Tunnel-Liste → ID + Token holen oder neuen Tunnel anlegen.
+   CF-Account-Tunnel-Liste → ID + Connector-Token holen oder neuen Tunnel anlegen.
    Token und ID werden in die **lokale `.env`** geschrieben (nie in `.env.gpg`).
-2. **Container starten** (`docker compose --profile vps up -d … cloudflared`):
-   `cloudflared` liest `TUNNEL_TOKEN` aus `.env` — ist der Token neu, wird der
-   Container beim `up -d` recreated.
-3. **Reconcile** (`cf_reconcile_if_token`): gleicht Tunnel-Ingress + DNS-CNAMEs
-   gegen die laufenden Container ab. Nicht laufende Ziel-Container werden
-   übersprungen (kein Hostname auf diesem VPS beansprucht).
+2. **Container starten** (`docker compose --profile vps up -d`): `cloudflared` liest
+   `CLOUDFLARE_TUNNEL_TOKEN` aus `.env`.
+3. **Reconcile** (`cloudflare-reconcile.sh`): gleicht Tunnel-Ingress + DNS-CNAMEs
+   gegen die laufenden Container ab. Nicht laufende Ziele werden übersprungen.
 
 Routing-Map liegt deklarativ in [`scripts/cloudflare-routes.json`](scripts/cloudflare-routes.json):
 
-| Hostname | Container:Port | Notiz |
+| Hostname | Ziel | Notiz |
 |---|---|---|
 | `alexstuder.cloud` | `web-hauptseite:80` | Landing |
 | `aibrewgenius.alexstuder.cloud` | `web-assistent:80` | AiBrewGenius UI |
 | `rapt.alexstuder.cloud` | `web-rapt:80` | Fermentation Dashboard |
-| `api.alexstuder.cloud` | `api-proxy:3000` | OpenAI/RAPT/Brewfather Proxy |
-| `supabase.alexstuder.cloud` | `supabase-kong:8000` | Auth/REST/Realtime/Storage API |
-| `studio.alexstuder.cloud` | `supabase-studio:3000` | Admin UI — Cloudflare Access davor! |
-| `db-tcp.alexstuder.cloud` | `tcp://supabase-db:5432` | TCP-Postgres cross-VPS |
+| `api-assistent.alexstuder.cloud` | `api-proxy-assistent:3000` | OpenAI/Brewfather-Proxy |
+| `api-rapt.alexstuder.cloud` | `api-proxy-rapt:3000` | RAPT/db-sync-Proxy |
+| `api.alexstuder.cloud` | `api-proxy-assistent:3000` | Legacy-Alias |
+| `db-assistent.alexstuder.cloud` | `kong-assistent:8000` | assistent-Supabase-API |
+| `db-rapt.alexstuder.cloud` | `kong-rapt:8000` | rapt-Supabase-API |
+| `supabase.alexstuder.cloud` | `kong-assistent:8000` | Legacy-Alias |
+| `db-tcp.alexstuder.cloud` | `tcp://db-assistent:5432` | TCP-Postgres cross-VPS |
+| `portainer.alexstuder.cloud` | `portainer:9000` | Admin-UI — Cloudflare Access davor (Hub-VPS) |
+| `edge.alexstuder.cloud` | `portainer:8000` | Edge-Agent-Endpoint (öffentlich) |
+| `webmail.alexstuder.cloud` | `posteio:80` | Poste.io Webmail |
 
-`./scripts/cloudflare-reconcile.sh` ist **idempotent**: bei jedem Lauf wird
-die Tunnel-Ingress-Config gegen die JSON gediffed, nur **laufende** Ziel-Container
-werden beansprucht, fehlende DNS-CNAMEs angelegt, abweichende umgebogen.
-Wird vom `bootstrap.sh` automatisch nach dem Container-Start aufgerufen und
+`./scripts/cloudflare-reconcile.sh` ist **idempotent**: bei jedem Lauf wird die
+Tunnel-Ingress-Config gegen die JSON gediffed, nur **laufende** Ziel-Container werden
+beansprucht, fehlende DNS-CNAMEs angelegt, abweichende umgebogen, verwaiste eigene
+CNAMEs aufgeräumt. Zusätzlich richtet es (nur Hub-VPS) Cloudflare Access für
+`portainer.` ein und (nur mit `mail`-Marker / laufendem posteio) die Mail-DNS-Records
+(MX/SPF/DMARC/DKIM). Wird vom `bootstrap.sh` nach dem Container-Start aufgerufen und
 kann jederzeit manuell laufen — z.B. nach Editieren der `routes.json`.
-
-"Was du startest, wird geroutet" — auf einem VPS mit nur `web-rapt` laufend
-wird nur `rapt.alexstuder.cloud` beansprucht; die anderen Hostnames bleiben
-beim VPS, der die jeweiligen Container betreibt.
 
 ### API-Token erstellen  (einmalig, geteilt über alle VPS)
 
@@ -136,24 +192,19 @@ beim VPS, der die jeweiligen Container betreibt.
    | Type | Resource | Permission | Wofür |
    |---|---|---|---|
    | Account | Cloudflare Tunnel | **Edit** | Tunnel anlegen (`POST cfd_tunnel`), Token holen, Ingress schreiben |
-   | Zone | DNS | Edit | CNAMEs anlegen/ändern/löschen |
+   | Zone | DNS | Edit | CNAMEs + Mail-Records anlegen/ändern/löschen |
    | Zone | Zone | Read | Zone-Auflösung |
-   | Account | Access: Apps and Policies | **Edit** | Access-App + Allow-Policy für `portainer.alexstuder.cloud` automatisch anlegen (Hub-VPS) |
+   | Account | Access: Apps and Policies | **Edit** | Access-App + Allow-Policy für `portainer.` (nur Hub-VPS) |
 
-   **Hinweis:** `Cloudflare Tunnel: Edit` deckt sowohl das **Anlegen** neuer Tunnel
-   (`POST /accounts/.../cfd_tunnel`) als auch das Schreiben der Ingress-Config
-   (`PUT .../configurations`) ab — kein separater Scope nötig.
-   `Access: Apps and Policies: Edit` wird **nur auf dem Hub-VPS** aktiv genutzt
-   (`PORTAINER_ROLE=hub`); auf allen anderen VPS erzeugt er keinen API-Call.
-   **Einmalige Voraussetzung:** Cloudflare Zero Trust muss auf dem Account aktiviert
-   sein (Team-Domain konfiguriert — einmalig im Zero-Trust-Dashboard). Ohne diese
-   Voraussetzung schlägt der Access-Schritt mit einem deutlichen Warn-Block fehl.
+   **Hinweis:** `Cloudflare Tunnel: Edit` deckt Anlegen + Ingress-Schreiben ab.
+   `Access: Apps and Policies: Edit` wird **nur auf dem Hub-VPS** (`PORTAINER_ROLE=hub`)
+   genutzt; Voraussetzung dort: Cloudflare Zero Trust aktiviert (Team-Domain). Ohne
+   den Scope/Zero-Trust schlägt nur der Access-Schritt mit deutlichem Warn-Block fehl.
 
-4. **Account Resources** → All accounts (oder selektiv)
-5. **Zone Resources** → Specific zone → `alexstuder.cloud`
-6. Create → Token **einmalig** kopieren
+4. **Account Resources** → All accounts · **Zone Resources** → `alexstuder.cloud`
+5. Create → Token **einmalig** kopieren
 
-Nur **drei** Werte in `.env.gpg` (geteilt):
+Nur **drei** geteilte Werte in `.env.gpg`:
 
 ```env
 CLOUDFLARE_API_TOKEN=<token>
@@ -161,145 +212,104 @@ CLOUDFLARE_ACCOUNT_ID=<id>
 CLOUDFLARE_ZONE_ID=<id>
 ```
 
-`CLOUDFLARE_TUNNEL_TOKEN` und `CLOUDFLARE_TUNNEL_ID` **nicht** in `.env.gpg` eintragen —
+`CLOUDFLARE_TUNNEL_TOKEN` und `CLOUDFLARE_TUNNEL_ID` **nicht** in `.env.gpg` —
 der Bootstrap setzt sie pro VPS automatisch in der **lokalen** `.env`.
-
-```bash
-# Nach dem Setzen der drei geteilten CF-Werte in .env:
-./scripts/encrypt-env.sh && git add .env.gpg && git commit && git push
-```
-
-Die Zone ID steht im Dashboard unter `alexstuder.cloud` rechte Sidebar;
-die Account ID auf der Dashboard-Hauptseite rechte Sidebar.
 
 ## Backup & Restore
 
-**Variante A — pro App getrennte Dumps.** Beide Apps teilen sich eine Postgres-DB
-und das `auth`-Schema (Logins). Pro Backup-Lauf entstehen **drei** verschlüsselte
-Dumps in eigene Ordner (lokal + R2-Bucket `backup`):
+**Zwei strikt getrennte DBs = zwei getrennte Backups.** Es gibt kein geteiltes
+`auth` mehr, also auch keinen 3-fach-Split und keine Restore-Reihenfolge. Was
+gesichert wird, steuern **Marker** unter `/etc/brewing/stateful-units.d/` — ein
+stateless-VPS ohne Marker macht `backup.sh` zum sauberen No-op.
 
-| Ordner | pg_dump | Inhalt |
+| Unit (Marker) | Quelle | → Ordner (lokal + R2 `backup/`) |
 |---|---|---|
-| `_supabase_core/` | `--exclude-schema=aibrewgenius --exclude-schema=rapt` | `auth` + `storage` + `public` + `_realtime` + Rest |
-| `brew_assistent/` | `-n aibrewgenius` | Schema `aibrewgenius` |
-| `rapt_dashboard/` | `-n rapt` | Schema `rapt` |
+| `db-assistent` | `pg_dump -Fc` gegen `db-assistent` | `backups/db-assistent/` → `backup/db-assistent/` |
+| `db-rapt` | `pg_dump -Fc` gegen `db-rapt` (TimescaleDB-Hooks) | `backups/db-rapt/` → `backup/db-rapt/` |
+| `mail` | `poste-data` als `tar` | `backups/mail/` → `backup/mail/` |
 
 ```bash
-# Manuelles Backup (drei verschlüsselte Dumps → lokal + R2). Als 'alex', kein sudo.
+# Manuelles Backup aller aktiven Units (verschlüsselt → lokal + R2). Als 'alex', kein sudo.
 ./scripts/backup.sh
 
-# Pre-Migration-Backup mit Label (alle drei, rotation-exempt)
-./scripts/backup.sh --label pre-migration     # → ..._pre-migration.fc.gpg
+# Pre-Migration-Backup mit Label (rotation-exempt)
+./scripts/backup.sh --label pre-migration
 
 # Nur lokal, kein Off-site-Upload
 ./scripts/backup.sh --no-upload
 
-# Andere Retention (Standard N=7 neueste pro Ordner, lokal + R2)
+# Andere Retention (Standard: neueste N=7 pro Ordner, lokal + R2)
 BACKUP_KEEP=14 ./scripts/backup.sh
 
-# Restore ALLER Schemas in zwingender Reihenfolge (core → apps), jüngste aus R2
-./scripts/restore.sh all
-
-# Restore eines einzelnen Ziels (jüngste aus dem passenden R2-Ordner)
-./scripts/restore.sh core
-./scripts/restore.sh rapt_dashboard
-./scripts/restore.sh brew_assistent latest
-
-# Restore aus konkreter lokaler Datei (ein Ziel)
-./scripts/restore.sh rapt_dashboard backups/rapt_dashboard/rapt_20260523_030000.fc.gpg
+# Restore — Ziel ist zwingend (kein automatischer Lauf):
+./scripts/restore.sh all                  # beide DBs, jüngste aus R2
+./scripts/restore.sh db-assistent latest  # nur assistent-DB
+./scripts/restore.sh db-rapt latest       # nur rapt-DB (TimescaleDB-Hooks automatisch)
+./scripts/restore.sh db-rapt backups/db-rapt/db-rapt_20260525_030000.fc.gpg  # lokale Datei
 
 # Cron-Log der nightly Backups
 tail -f /var/log/brewing-backup.log
 ```
 
-Echter, nicht-reproduzierbarer State liegt nur im zentralen Supabase-Postgres
-(Schemas `auth`, `aibrewgenius`, `rapt`, `storage`, `_realtime`, `public`). Alles
-andere ist stateless (Git + Docker-Hub-Images). Konzept-Details:
-[`BACKUP_RESTORE.md`](BACKUP_RESTORE.md).
+Konzept-Details: [`BACKUP_RESTORE.md`](BACKUP_RESTORE.md).
 
 ```
-scripts/backup.sh   (drei getrennte Pipelines, kein Klartext-Dump auf Platte)
-  docker exec supabase-db pg_dump -Fc -U supabase_admin -d postgres <schema-args>
-     ▼  gpg --symmetric AES256  (gleiche Passphrase wie .env.gpg)
-  backups/_supabase_core/core_<TS>.fc.gpg          ─► R2 backup/_supabase_core/
-  backups/brew_assistent/aibrewgenius_<TS>.fc.gpg  ─► R2 backup/brew_assistent/
-  backups/rapt_dashboard/rapt_<TS>.fc.gpg          ─► R2 backup/rapt_dashboard/
-     └─► Retention PRO ORDNER: neueste N=7 behalten (lokal + R2), BACKUP_KEEP
+scripts/backup.sh   (pro Marker-Unit eine Pipeline, kein Klartext-Dump auf Platte)
+  docker exec db-<unit> pg_dump -Fc -U supabase_admin -d postgres
+     ▼  gpg --symmetric AES256  (gleiche Passphrase wie .env.gpg, via --passphrase-file)
+  backups/<unit>/<unit>_<TS>[_<label>].fc.gpg   ─► R2 backup/<unit>/
+     └─► Retention PRO ORDNER: neueste N=7 behalten (lokal + R2), BACKUP_KEEP; Labels exempt
 
-scripts/restore.sh all
+scripts/restore.sh <all|db-assistent|db-rapt>
   je Ziel:  (R2 holen) → entschlüsseln → pg_restore --clean --if-exists --no-owner
-  Reihenfolge: core ZUERST, dann brew_assistent, dann rapt_dashboard
+  db-rapt:  timescaledb_pre_restore() VOR / post_restore() NACH pg_restore (Hypertable-Chunks!)
 ```
 
 - **Trigger:** nightly um 03:00 via `cron` (`/etc/cron.d/brewing-backup`), von
   `bootstrap.sh` eingerichtet. Läuft direkt **als `alex` (kein sudo/root)**: alex
-  ist in der `docker`-Gruppe (`docker exec` ohne sudo) und owner von Repo +
-  Passphrase-Datei `/etc/brewing/gpg.pass` (mode 600, owner alex) → liest sie ohne
-  Prompt. `cron`s minimaler PATH wird in `backup.sh`/`cron.d` auf einen sane Wert
-  gesetzt, damit `docker`/`gpg`/`rclone` auflösen.
+  ist in der `docker`-Gruppe und owner von Repo + `/etc/brewing/gpg.pass`
+  (mode 600) → liest die Passphrase ohne Prompt.
 - **Verschlüsselung:** symmetrisch AES-256, **gleiche Passphrase wie `.env.gpg`**.
-  R2 sieht nie Klartext — nur die fertigen `.fc.gpg` gehen raus.
-- **Konsistenz (bewusste Entscheidung):** die drei Dumps laufen **back-to-back
-  ohne geteilten Snapshot** (kein `pg_export_snapshot`). Das lässt ein winziges
-  Inkonsistenz-Fenster zwischen den Dumps offen — ein während des Laufs neu
-  angelegter `auth.users`-Eintrag könnte im `core`-Dump fehlen, aber von einem
-  später gedumpten App-Eintrag referenziert werden. Beim nightly-Lauf um 03:00
-  gibt es praktisch keine Schreiblast, und `--no-owner`/nicht-fatale Fehler beim
-  Restore fangen den Rand-Fall ab. Bewusst keine Snapshot-Koordination, um die
-  bash-Komplexität (offene psql-Session über drei Dumps) zu vermeiden.
+  R2 sieht nie Klartext — nur die fertigen `.fc.gpg`/`.tar.gpg` gehen raus.
+- **Unabhängigkeit:** jede DB hat ihr eigenes `auth`, daher ist jeder Dump
+  **in sich konsistent** und einzeln restore-bar — keine Reihenfolge-Abhängigkeit.
+- **TimescaleDB (`db-rapt`):** `restore.sh` wrappt `pg_restore` mit
+  `timescaledb_pre_restore()`/`post_restore()` (Extension-Guard, **nicht** auf
+  "nur db-rapt" hartkodiert) — sonst kämen die Telemetrie-Hypertables leer zurück.
+  `post_restore`-Fehler → harter Abbruch (DB nicht vertrauen).
 - **R2-Credentials:** `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET=backup`
-  und entweder `R2_ENDPOINT` oder `R2_ACCOUNT_ID` in `.env` (siehe `.env.example`).
-  Token: Cloudflare Dashboard → R2 → *Manage R2 API Tokens* (Object Read & Write,
-  auf den Bucket gescopt). rclone-Creds werden via `RCLONE_CONFIG_R2_*`-Env-Vars
-  übergeben (nie in der Kommandozeile/`ps`). Danach `./scripts/encrypt-env.sh` +
-  commit `.env.gpg`.
-- **Retention:** count-based, **neueste N=7 pro Ordner** (`BACKUP_KEEP`, default 7),
-  **lokal UND R2**. `backup.sh` löscht in jedem `backups/<ordner>/` und nach dem
-  Upload auch im R2-Ordner alles außer den neuesten N (per `rclone lsf`/`rclone
-  delete`). Gelabelte Dumps (`--label`) bleiben unangetastet und zählen nicht mit.
-  Keine R2-Lifecycle-Rule mehr nötig.
+  und `R2_ENDPOINT` (bzw. `R2_ACCOUNT_ID`) in `.env`. rclone-Creds via
+  `RCLONE_CONFIG_R2_*`-Env-Vars (nie in der Kommandozeile/`ps`).
+- **Retention:** count-based, neueste N=7 pro Ordner (`BACKUP_KEEP`), lokal UND R2.
+  Gelabelte Dumps (`--label`) sind exempt.
 
-### Restore — der fragile Teil
+### Restore — bekannte, nicht-fatale Fehler
 
-Das `supabase/postgres`-Image legt `auth`, `storage`, `_realtime`, Extensions und
-Roles beim ersten Start **selbst** an. `pg_restore --clean --if-exists` droppt
-diese Image-Objekte vor dem Neuanlegen und löst so die Kollisionen. App-Migrationen
-sind im jeweiligen Dump enthalten — kein separater Schritt nötig.
+Das `supabase/postgres`-Image legt `auth`, Extensions und Roles beim ersten Start
+**selbst** an. `pg_restore --clean --if-exists --no-owner` droppt/überschreibt diese
+Image-Objekte. Erwartbare, **nicht** fatale Meldungen:
 
-**Reihenfolge ist zwingend:** `core` zuerst (legt `auth.users` an), dann die
-App-Schemas — `aibrewgenius` und `rapt` referenzieren beide `auth.users`.
-`restore.sh all` erzwingt diese Reihenfolge automatisch.
-
-Restore läuft **nie** automatisch und **nie** ohne explizites Ziel-Argument
-(`core`/`brew_assistent`/`rapt_dashboard`/`all`) plus interaktive Bestätigung
-(`restore` tippen) bzw. `--yes`.
-
-**Bekannte, nicht-fatale Restore-Fehler** (erwartbar, kein echter Fehlschlag):
-
-- `publication "supabase_realtime" already exists` / `... does not exist`
-- Fehler/Warnungen rund um `extensions`-Schema, `pgsodium`, `vault`
 - `role "..." already exists` (vom Image vorab angelegt) — wegen `--no-owner` unkritisch
 - `must be owner of extension ...` für vom Image verwaltete Extensions
+- Warnungen rund um `extensions`-Schema, `pgsodium`, `vault`
 
-`restore.sh` ruft `pg_restore` daher **ohne** `--exit-on-error` auf und bewertet
-den Erfolg über die Tabellen-Counts am Ende + den App-Smoke-Check (Login + je eine
-Query auf `aibrewgenius.*` und `rapt.*`), nicht über den Exit-Code.
+`restore.sh` ruft `pg_restore` daher **ohne** `--exit-on-error` auf und bewertet den
+Erfolg über die Tabellen-Counts (inkl. `telemetry_*`-Hypertables bei db-rapt), nicht
+über den Exit-Code. Restore läuft **nie** automatisch und **nie** ohne Ziel-Argument
+plus Bestätigung (`restore` tippen) bzw. `--yes`.
 
-**Disaster-Recovery-Gesamtbild:** neuer VPS → `bootstrap.sh` (frischer Stack,
-Image-Init legt Roles/Schemas an) → `restore.sh all` (core → apps, aus R2-Bucket
-`backup`) → `cloudflare-reconcile.sh`.
+**Disaster-Recovery:** neuer VPS → `bootstrap.sh` (Menüpunkt *Restore aus R2*) →
+`restore.sh all` → `cloudflare-reconcile.sh`. Für den Umzug eines **laufenden** VPS:
+Menüpunkt *Migrate* (SSH zum alten VPS, Stop-Verifikation, pre-migration-Backup, Restore).
 
 ## Wartung auf dem VPS
 
 ```bash
-# Status
-docker compose --profile vps ps
+docker compose --profile vps ps                       # Status
+docker logs -f cloudflared                            # Logs
+docker logs -f api-proxy-assistent                    # (bzw. api-proxy-rapt)
 
-# Logs eines Containers
-docker logs -f cloudflared
-docker logs -f api-proxy
-
-# Manueller Pull + Restart eines App-Containers (z.B. nach Bug-Fix)
+# Einzelnen App-Container neu ziehen (z.B. nach Bug-Fix)
 docker compose --profile vps pull web_assistent
 docker compose --profile vps up -d web_assistent
 
@@ -307,9 +317,8 @@ docker compose --profile vps up -d web_assistent
 docker compose --profile vps pull
 docker compose --profile vps up -d
 
-# Stack stoppen / starten
-docker compose --profile vps down
-docker compose --profile vps up -d
+# DB-Schema neu anwenden (Init-Container erneut laufen lassen — idempotent)
+docker compose --profile vps up -d --force-recreate db-init-assistent db-init-rapt
 
 # Cloudflare Hostnames + DNS abgleichen (nach Edit von scripts/cloudflare-routes.json)
 ./scripts/cloudflare-reconcile.sh
@@ -318,30 +327,35 @@ docker compose --profile vps up -d
 ## Architektur
 
 ```
-Docker Hub                                                Ubuntu VPS
-┌────────────────────────┐                          ┌────────────────────────┐
-│ alexstuder-web/        │                          │ ~/webPage_infra        │
-│  - web_hauptseite      │  ◀── watchtower pull ──  │   docker-compose.yml   │
-│  - web_assistent       │       (alle 5 min)       │   .env.gpg → .env      │
-│  - web_rapt            │                          │   supabase/kong.yml    │
-│  - brew_proxy          │                          │   supabase/db_init/    │
-└────────────────────────┘                          └────────────────────────┘
-       ▲                                                       ▲
-       │ docker build                                          │ cloudflared
-       │ (GitHub Actions on push to main)                      │ tunnel
-       │                                                       │
-┌──────┴───────────┐ ┌─────────────┐                  ┌────────┴────────┐
-│ brew_assistent   │ │ brew-proxy  │  …               │ Cloudflare DNS  │
-│ RAPT_Dashboard   │ │             │                  │ alexstuder.cloud│
-│ WebPageAlexStuder│ │             │                  │ (später .ch)    │
-└──────────────────┘ └─────────────┘                  └─────────────────┘
+Docker Hub                                              Ubuntu VPS  (~/webPage_infra)
+┌────────────────────────┐                       ┌──────────────────────────────────────┐
+│ alexstuder-web/        │                        │ docker-compose.yml · .env.gpg → .env  │
+│  - web_hauptseite      │ ◀── watchtower pull ── │                                        │
+│  - web_assistent       │      (alle 5 min)      │  assistent-Stack      rapt-Stack       │
+│  - web_rapt            │                        │  ┌─────────────┐      ┌─────────────┐  │
+│  - brew_proxy          │                        │  │ db-assistent│      │ db-rapt     │  │
+│  - db_init_runner      │                        │  │ auth/rest/  │      │ auth/rest/  │  │
+└────────────────────────┘                        │  │ kong-assist.│      │ kong-rapt   │  │
+       ▲                                           │  │ db-init ─┐  │      │ db-init ─┐  │  │
+       │ docker build (GitHub Actions,             │  └──────────┼──┘      └──────────┼──┘  │
+       │ on push to main)                          │   mount db_scripts/  mount db_scripts/ │
+       │                                           │   api-proxy-assistent  api-proxy-rapt  │
+┌──────┴────────────┐ ┌────────────┐               │                                        │
+│ brew_assistent    │ │ brew-proxy │ …             │   cloudflared ──► Cloudflare Tunnel    │
+│ RAPT_Dashboard    │ │            │               │   (+ portainer/posteio optional)       │
+│ WebPageAlexStuder │ │            │               └────────────────────────────────────────┘
+└───────────────────┘ └────────────┘                          │ alexstuder.cloud (später .ch)
+   (db_scripts/ = Schema-Quelle, beim Bootstrap geklont)       ▼
+                                                        Cloudflare DNS + Access
 ```
 
 ## GitHub Org Secrets
 
-Unter `alexstuder-web` (scoped auf App-Repos, nicht `webPage_infra`):
+Unter `alexstuder-web`:
 
 - `DOCKERHUB_USERNAME`
 - `DOCKERHUB_TOKEN`
 
-Mehr nicht. Alles andere kommt aus `.env.gpg`.
+Genutzt von den App-Repo-Build-Workflows **und** vom `db_init_runner`-Build-Workflow
+hier in `webPage_infra` (`.github/workflows/db-init-runner-build.yml`). Alles andere
+kommt aus `.env.gpg`.
