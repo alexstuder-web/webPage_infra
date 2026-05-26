@@ -546,6 +546,11 @@ services:
     image: portainer/portainer-ce:2.27.3
     profiles: [portainer-hub]
     restart: unless-stopped
+    # CSRF/Origin-Schutz (Portainer >=2.20): hinter dem Cloudflare-Tunnel lehnt Portainer
+    # sonst ALLE UI-API-Calls ab → Browser-Fehler "Unable to retrieve server settings and
+    # status". --trusted-origins macht den oeffentlichen Origin (https-Hostname) trusted.
+    # cloudflared reicht den Original-Host standardmaessig durch, daher genuegt das.
+    command: ["--trusted-origins", "${PORTAINER_TRUSTED_ORIGINS:-https://portainer.alexstuder.cloud}"]
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - portainer_data:/data
