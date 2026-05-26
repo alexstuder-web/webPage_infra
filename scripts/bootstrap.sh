@@ -15,8 +15,9 @@
 #
 # Interaktive Eingaben werden NUR dann angefordert, wenn der jeweilige
 # Schritt tatsächlich ausgeführt werden muss (lazy):
-#   - BW-Mail + BW-Master-PW: nur falls .env fehlt
-#   - Linux-User-PW:          nur falls User 'alex' neu angelegt wird
+#   - BW-Mail + BW-Master-PW: nur falls .env fehlt ODER User 'alex' neu angelegt
+#   - Linux-User-PW:          kommt aus Bitwarden-Item ALEX_USER_PASSWORD
+#                             (kein interaktiver Passwort-Prompt mehr)
 # ============================================================================
 
 set -euo pipefail
@@ -89,15 +90,9 @@ run_base_bootstrap() {
   Ziel: $APP_DIR  (User: $APP_USER, UID 1000)
 EOF
 
-  # Linux-User-PW nur abfragen, falls User neu angelegt wird
-  local user_pass=""
-  if ! _user_exists; then
-    read -srp "Passwort für neuen Linux-User '${APP_USER}': " user_pass; echo
-    local user_pass2
-    read -srp "  (wiederholen): " user_pass2; echo
-    [[ "$user_pass" == "$user_pass2" ]] || err "Passwörter stimmen nicht überein"
-    [[ -n "$user_pass" ]] || err "Passwort darf nicht leer sein"
-  fi
+  # Merker: wurde User in diesem Lauf neu angelegt?
+  # Wird sowohl für die BW-Guard als auch für das spätere chpasswd genutzt.
+  local user_newly_created=0
 
   # ---------------------------------------------------------------- System-Packages
   if _base_packages_done; then
@@ -116,16 +111,16 @@ EOF
   if _user_exists; then
     ok "User '${APP_USER}' existiert bereits — kein erneutes chpasswd"
   else
-    log "Linux-User '$APP_USER' anlegen"
+    log "Linux-User '$APP_USER' anlegen (gesperrt — Passwort folgt aus Bitwarden)"
     useradd -m -s /bin/bash -u 1000 "$APP_USER"
-    printf '%s\n' "${APP_USER}:${user_pass}" | chpasswd
-    unset user_pass  # Secret sofort nach chpasswd vergessen
     usermod -aG sudo "$APP_USER"
-    ok "User '$APP_USER' bereit (sudo)"
+    # Passwort wird NICHT hier gesetzt — kommt aus BW-Item ALEX_USER_PASSWORD
+    # im nachfolgenden BW-Login-Block und wird dort via chpasswd gesetzt.
+    user_newly_created=1
+    ok "User '$APP_USER' angelegt (sudo; Passwort wird aus Bitwarden geholt)"
   fi
   # Docker-Gruppe: immer sicherstellen (idempotent)
   usermod -aG docker "$APP_USER" 2>/dev/null || true
-  unset user_pass user_pass2 2>/dev/null || true
 
   # ---------------------------------------------------------------- Docker
   if _docker_done; then
@@ -267,87 +262,131 @@ EOSU
     fi
   done
 
-  # ---------------------------------------------------------------- BW Login + Passphrase (lazy)
-  if _env_done && _gpgpass_done; then
-    ok ".env + gpg.pass bereits vorhanden — BW-Login übersprungen"
+  # ---------------------------------------------------------------- BW Login + Passphrase + alex-Passwort (lazy)
+  # BW-Block läuft wenn:
+  #   - .env oder gpg.pass fehlt (normaler Erst-Bootstrap), ODER
+  #   - User 'alex' wurde in diesem Lauf neu angelegt (braucht Passwort aus BW).
+  # Idempotenz: re-run mit existierendem User + vollständiger .env überspringt den Block.
+  #
+  # DESIGN: Bitwarden läuft komplett als root, Secrets nur in root-lokalen Shell-Variablen.
+  # Kein Cross-User-Tempfile mehr (fs.protected_regular=2 auf modernen Ubuntu-Kerneln
+  # blockiert root beim Öffnen eines fremd-owned Files in einem world-writable sticky-Dir).
+  # Muster: mktemp als root → root-owned → root darf schreiben → kein Permission-Fehler.
+  if _env_done && _gpgpass_done && (( user_newly_created == 0 )); then
+    ok ".env + gpg.pass bereits vorhanden + User existiert — BW-Login übersprungen"
   else
-    log "Bitwarden-Eingaben für .env-Entschlüsselung"
-    local bw_email bw_pass
+    log "Bitwarden-Eingaben (GPG-Passphrase + ggf. alex-Passwort)"
+    local bw_email
     read -rp "Bitwarden E-Mail: " bw_email
-    read -srp "Bitwarden Master-Passwort: " bw_pass; echo
-    [[ -n "$bw_email" && -n "$bw_pass" ]] || err "BW-Eingaben dürfen nicht leer sein"
+    # BW_PASSWORD: in Export-Variable halten, niemals in argv/log.
+    # read -s schreibt nie auf stdout → kein Risiko durch set -x (set -x ist ohnehin aus).
+    local BW_PASSWORD
+    read -srp "Bitwarden Master-Passwort: " BW_PASSWORD; echo
+    [[ -n "$bw_email" && -n "$BW_PASSWORD" ]] || err "BW-Eingaben dürfen nicht leer sein"
+    export BW_PASSWORD
 
-    # Tempfiles für Secret-Transport: sofort in CLEANUP_FILES registrieren.
-    local bw_pass_file pass_tmp
-    bw_pass_file="$(sudo -u "$APP_USER" mktemp)"
-    CLEANUP_FILES+=("$bw_pass_file")
-    pass_tmp="$(sudo -u "$APP_USER" mktemp)"
+    # --- Bitwarden als root: Login / Unlock ---
+    # bw läuft als root; kein sudo -u alex, kein Cross-User-Tempfile.
+    # --passwordenv BW_PASSWORD: Passwort nie in argv (ps-sicher).
+    bw config server https://vault.bitwarden.com >/dev/null 2>&1 || true
+    local _bw_status
+    _bw_status="$(bw status 2>/dev/null | jq -r '.status // empty' || true)"
+    local BW_SESSION
+    if [[ "$_bw_status" == "unauthenticated" || -z "$_bw_status" ]]; then
+      bw logout &>/dev/null || true
+      BW_SESSION="$(bw login "$bw_email" --passwordenv BW_PASSWORD --raw)"
+    else
+      BW_SESSION="$(bw unlock --passwordenv BW_PASSWORD --raw)"
+    fi
+    unset BW_PASSWORD
+    [[ -n "$BW_SESSION" && ${#BW_SESSION} -ge 20 ]] \
+      || err "Bitwarden-Session ungültig (leer oder zu kurz) — E-Mail/Passwort prüfen"
+    export BW_SESSION
+
+    bw sync --session "$BW_SESSION" >/dev/null
+
+    # --- Secret: GPG-Passphrase ---
+    local _gpg_pass
+    _gpg_pass="$(bw get password "$BW_ITEM" --session "$BW_SESSION")"
+    [[ -n "$_gpg_pass" && "$_gpg_pass" != "null" ]] \
+      || err "Bitwarden-Item '${BW_ITEM}' fehlt oder ist leer — GPG-Passphrase nicht abrufbar"
+
+    # --- Secret: alex-Passwort (nur wenn User in diesem Lauf neu angelegt) ---
+    local _alex_pw=""
+    if (( user_newly_created == 1 )); then
+      _alex_pw="$(bw get password ALEX_USER_PASSWORD --session "$BW_SESSION")"
+      [[ -n "$_alex_pw" && "$_alex_pw" != "null" ]] \
+        || { bw lock --session "$BW_SESSION" &>/dev/null || true
+             unset BW_SESSION bw_email _gpg_pass _alex_pw
+             err "Bitwarden-Item 'ALEX_USER_PASSWORD' fehlt oder ist leer.
+  Anlegen unter: https://vault.bitwarden.com → Neues Element → Name: ALEX_USER_PASSWORD"; }
+    fi
+
+    # --- BW aufräumen (sofort nach Secret-Fetch, vor jeder weiterer Arbeit) ---
+    bw lock --session "$BW_SESSION" &>/dev/null || true
+    unset BW_SESSION bw_email
+
+    if (( user_newly_created == 1 )); then
+      ok "BW-Secrets abgeholt (GPG-Passphrase + alex-PW)"
+    else
+      ok "BW-Secrets abgeholt (GPG-Passphrase)"
+    fi
+
+    # ---------------------------------------------------------------- alex-Passwort setzen (nur bei frisch angelegtem User)
+    # Secret über stdin an chpasswd — nie in argv/log.
+    if (( user_newly_created == 1 )); then
+      log "Passwort für '${APP_USER}' aus Bitwarden setzen"
+      printf '%s\n' "${APP_USER}:${_alex_pw}" | chpasswd
+      unset _alex_pw
+      ok "Passwort für '${APP_USER}' gesetzt"
+    else
+      unset _alex_pw
+    fi
+
+    # ---------------------------------------------------------------- GPG-Passphrase persistieren
+    # Tempfile als root anlegen (root-owned → root darf schreiben, kein protected_regular-Problem).
+    # chmod 600 VOR dem Schreiben (Lesson 2026-05-24).
+    local pass_tmp
+    pass_tmp="$(mktemp)"
     CLEANUP_FILES+=("$pass_tmp")
-    chmod 600 "$bw_pass_file" "$pass_tmp"
-    printf "%s" "$bw_pass" > "$bw_pass_file"
-    unset bw_pass
+    chmod 600 "$pass_tmp"
+    printf '%s' "$_gpg_pass" > "$pass_tmp"
 
-    sudo -u "$APP_USER" -H \
-      BW_EMAIL="$bw_email" \
-      BW_PASS_FILE="$bw_pass_file" \
-      BW_ITEM="$BW_ITEM" \
-      PASS_TMP="$pass_tmp" \
-      bash <<'EOSU'
-set -euo pipefail
-# Zweizeilig: erst zuweisen (failt sofort bei Fehler), dann exportieren.
-BW_PASSWORD="$(cat "$BW_PASS_FILE")"
-export BW_PASSWORD
-bw config server https://vault.bitwarden.com >/dev/null 2>&1 || true
-status="$(bw status 2>/dev/null | jq -r .status || echo unauthenticated)"
-if [[ "$status" == "unauthenticated" ]]; then
-  bw login "$BW_EMAIL" --passwordenv BW_PASSWORD >/dev/null
-fi
-BW_SESSION="$(bw unlock --passwordenv BW_PASSWORD --raw)"
-export BW_SESSION
-bw sync >/dev/null
-bw get password "$BW_ITEM" > "$PASS_TMP"
-EOSU
-
-    rm -f "$bw_pass_file"
-    # bw_pass_file aus CLEANUP_FILES entfernen (bereits gelöscht).
-    # Echtes Array-Filtern: mapfile + grep -vxF statt String-Ersetzung die ein
-    # Leer-Element hinterlässt (und dann 'rm -f ""' riskiert).
-    mapfile -t CLEANUP_FILES < <(printf '%s\n' "${CLEANUP_FILES[@]}" | grep -vxF "$bw_pass_file")
-    ok "Passphrase abgeholt"
+    if _gpgpass_done; then
+      ok "/etc/brewing/gpg.pass bereits vorhanden — übersprungen"
+    else
+      log "GPG-Passphrase für nightly Backup hinterlegen (/etc/brewing/gpg.pass)"
+      # /etc/brewing als root anlegen; gpg.pass: mode 600, chown an alex damit
+      # cron (läuft als alex) und decrypt-env.sh (als alex) die Datei lesen können.
+      install -d -m 700 -o root -g root /etc/brewing
+      install -m 600 -o "$APP_USER" -g "$APP_USER" "$pass_tmp" /etc/brewing/gpg.pass
+      ok "/etc/brewing/gpg.pass geschrieben (owner ${APP_USER}, mode 600)"
+    fi
 
     # ---------------------------------------------------------------- .env entschlüsseln
+    # decrypt-env.sh wird als alex ausgeführt (Repo-Owner) und findet die Passphrase
+    # über GPG_PASS_FILE=/etc/brewing/gpg.pass (bereits alex-readable, s.o.).
+    # Kein GPG_PASSPHRASE in einer Shell-Variable nötig — kein Secret im Prozess-Env.
     if _env_done; then
       ok ".env bereits vorhanden — Decrypt übersprungen"
     else
       log ".env entschlüsseln"
       sudo -u "$APP_USER" -H \
         APP_DIR="$APP_DIR" \
-        PASS_TMP="$pass_tmp" \
+        GPG_PASS_FILE="/etc/brewing/gpg.pass" \
         bash <<'EOSU'
 set -euo pipefail
 cd "$APP_DIR"
 [[ -f .env ]] && rm -f .env
-# Zweizeilig: erst zuweisen (failt sofort bei Fehler), dann exportieren.
-GPG_PASSPHRASE="$(cat "$PASS_TMP")"
-export GPG_PASSPHRASE
 ./scripts/decrypt-env.sh
 EOSU
       ok ".env geschrieben"
     fi
 
-    # ---------------------------------------------------------------- GPG-Passphrase persistieren
-    if _gpgpass_done; then
-      ok "/etc/brewing/gpg.pass bereits vorhanden — übersprungen"
-    else
-      log "GPG-Passphrase für nightly Backup hinterlegen (/etc/brewing/gpg.pass)"
-      install -d -m 700 -o "$APP_USER" -g "$APP_USER" /etc/brewing
-      install -m 600 -o "$APP_USER" -g "$APP_USER" "$pass_tmp" /etc/brewing/gpg.pass
-      ok "/etc/brewing/gpg.pass geschrieben (owner ${APP_USER}, mode 600)"
-    fi
-
+    # pass_tmp aufräumen (GPG-Passphrase nicht länger im Filesystem nötig — gpg.pass ist die persistente Kopie).
     rm -f "$pass_tmp"
-    # pass_tmp aus CLEANUP_FILES entfernen (bereits gelöscht) — echtes Filtern.
     mapfile -t CLEANUP_FILES < <(printf '%s\n' "${CLEANUP_FILES[@]}" | grep -vxF "$pass_tmp")
+    unset _gpg_pass
   fi
 
   # ---------------------------------------------------------------- Nightly Backup (cron)
@@ -498,17 +537,24 @@ EOSU
     # KEY=value-Argument an sudo übergeben (ps-sichtbar!). Stattdessen
     # landen sie in je einem mode-600-Tempfile und werden dort via cat gelesen.
     # (Lesson 2026-05-24: Secrets nie in sudo-Env-Argumente — in Dateien transportieren.)
+    #
+    # fs.protected_regular=2 Fix: Tempfiles als ROOT anlegen (plain mktemp, kein
+    # sudo -u alex), chmod 600 VOR dem Schreiben, root schreibt rein (root-owned →
+    # ok), dann chown APP_USER damit die alex-laufende Heredoc sie per cat lesen kann.
+    # (Option b — wie in der cicd-reviewer-Analyse empfohlen.)
     local cf_api_token_file cf_account_id_file
-    cf_api_token_file="$(sudo -u "$APP_USER" mktemp)"
+    cf_api_token_file="$(mktemp)"
     CLEANUP_FILES+=("$cf_api_token_file")
     chmod 600 "$cf_api_token_file"
     printf '%s' "$cf_api_token" > "$cf_api_token_file"
+    chown "$APP_USER" "$cf_api_token_file"
     unset cf_api_token
 
-    cf_account_id_file="$(sudo -u "$APP_USER" mktemp)"
+    cf_account_id_file="$(mktemp)"
     CLEANUP_FILES+=("$cf_account_id_file")
     chmod 600 "$cf_account_id_file"
     printf '%s' "$cf_account_id" > "$cf_account_id_file"
+    chown "$APP_USER" "$cf_account_id_file"
     unset cf_account_id
 
     sudo -u "$APP_USER" -H \
