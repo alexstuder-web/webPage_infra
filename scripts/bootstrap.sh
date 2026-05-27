@@ -119,8 +119,6 @@ EOF
     user_newly_created=1
     ok "User '$APP_USER' angelegt (sudo; Passwort wird aus Bitwarden geholt)"
   fi
-  # Docker-Gruppe: immer sicherstellen (idempotent)
-  usermod -aG docker "$APP_USER" 2>/dev/null || true
 
   # ---------------------------------------------------------------- Docker
   if _docker_done; then
@@ -139,6 +137,16 @@ EOF
   fi
   systemctl enable --now docker
   ok "Docker $(docker --version | awk '{print $3}' | tr -d ,) läuft"
+
+  # Docker-Gruppe: MUSS nach der Docker-Installation laufen — die Gruppe 'docker'
+  # wird erst vom docker-ce-Paket angelegt. Vorher (vor dem apt-install) schlug
+  # 'usermod -aG docker' still fehl ('group docker does not exist'), alex landete
+  # nie in der Gruppe und 'sudo -u alex docker compose' bekam später
+  # 'permission denied … /var/run/docker.sock'. sudo -u alex liest die Gruppen
+  # frisch via initgroups, daher gilt die Mitgliedschaft sofort für alle
+  # nachfolgenden 'docker compose'-Aufrufe in diesem Bootstrap-Lauf. Idempotent.
+  usermod -aG docker "$APP_USER"
+  ok "User '$APP_USER' ist in der docker-Gruppe"
 
   # ---------------------------------------------------------------- Bitwarden CLI
   # Bevorzugt: snap (signierter Channel, Signatur-Verifikation eingebaut).
