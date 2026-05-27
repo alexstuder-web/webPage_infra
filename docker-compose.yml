@@ -541,16 +541,19 @@ services:
 
   portainer:
     container_name: portainer
-    # Pinned CE — kein Watchtower-Label (Management-Tool versionsgepinnt halten).
-    # Aktuelle stabile CE-Version: 2.27.3 (Stand 2026-05).
-    image: portainer/portainer-ce:2.27.3
+    # Pinned CE-LTS — kein Watchtower-Label (Management-Tool versionsgepinnt halten).
+    # 2.27.9 LTS ist die erste Version mit TRUSTED_ORIGINS (CSRF-Fix fuer Reverse-Proxy).
+    image: portainer/portainer-ce:2.27.9
     profiles: [portainer-hub]
     restart: unless-stopped
-    # CSRF/Origin-Schutz (Portainer >=2.20): hinter dem Cloudflare-Tunnel lehnt Portainer
-    # sonst ALLE UI-API-Calls ab → Browser-Fehler "Unable to retrieve server settings and
-    # status". --trusted-origins macht den oeffentlichen Origin (https-Hostname) trusted.
-    # cloudflared reicht den Original-Host standardmaessig durch, daher genuegt das.
-    command: ["--trusted-origins", "${PORTAINER_TRUSTED_ORIGINS:-https://portainer.alexstuder.cloud}"]
+    # CSRF/Origin-Schutz (gorilla/csrf, strikt ab Portainer 2.27.7): hinter dem Cloudflare-
+    # Tunnel ist der Browser-Origin der oeffentliche Hostname; ohne Freigabe lehnt Portainer
+    # alle UI-API-Calls ab ("Origin invalid" / "Unable to retrieve server settings").
+    # Korrektur 2026-05-27: TRUSTED_ORIGINS ist eine ENV-VAR ab 2.27.9 — NICHT das Flag
+    # --trusted-origins (das kennt <2.27.9 nicht → Crash "unknown long flag"). WICHTIG:
+    # nur der Hostname, KEIN https://, kein Pfad, kein Port. Mehrere kommasepariert.
+    environment:
+      TRUSTED_ORIGINS: ${PORTAINER_TRUSTED_ORIGINS:-portainer.alexstuder.cloud}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - portainer_data:/data
@@ -560,13 +563,13 @@ services:
   portainer_edge_agent:
     container_name: portainer_edge_agent
     # Portainer Agent (Edge-Modus via EDGE=1).
-    # Pinned auf dieselbe Minor-Version wie der Hub (2.27.3).
+    # Pinned auf dieselbe Minor-Version wie der Hub (2.27.9).
     # profiles: [portainer-agent] — EDGE_KEY Interpolation feuert NUR wenn dieser Profile aktiv ist.
     # Chicken-and-Egg-Sicherung: Hub-VPS hat beim Erst-Bootstrap keinen Key; der Agent-
     # Service muss aus dem Default-Set raus, damit compose ohne Key ladbar bleibt.
     # Lesson 2026-05-24: Container-Vars müssen im environment:-Block stehen.
     # Lesson 2026-05-24: :? in compose environment wäre filewide — ${VAR:-} ist korrekt.
-    image: portainer/agent:2.27.3
+    image: portainer/agent:2.27.9
     profiles: [portainer-agent]
     restart: unless-stopped
     environment:
