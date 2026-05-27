@@ -635,7 +635,12 @@ services:
 
   watchtower:
     container_name: watchtower
-    image: containrrr/watchtower
+    # Gepflegter Fork: containrrr/watchtower wurde am 2025-12-17 archiviert und
+    # spricht nur Docker-Client-API 1.25 → moderne Engines lehnen das ab
+    # ("client version 1.25 is too old, minimum supported API version is 1.40")
+    # und der Container crash-loopt. nickfedor/watchtower ist drop-in-kompatibel
+    # (gleiche Flags/Labels), nur mit aktueller Docker-SDK gebaut.
+    image: nickfedor/watchtower
     profiles: [vps]
     restart: unless-stopped
     volumes:
