@@ -114,6 +114,16 @@ db_password_for() {
   esac
 }
 
+# app_schema_for <target>: PostgreSQL-Schema-Name der App, wird zur "frische DB"-
+# Erkennung benutzt. db-rapt → "rapt", db-assistent → "aibrewgenius".
+app_schema_for() {
+  case "$1" in
+    db-assistent) printf 'aibrewgenius' ;;
+    db-rapt)      printf 'rapt' ;;
+    *)            err "app_schema_for: unbekanntes Ziel '$1'" ;;
+  esac
+}
+
 # target_folder <target>: R2-Ordner für ein einzelnes Ziel.
 target_folder() {
   case "$1" in
@@ -273,7 +283,39 @@ restore_one() {
   [[ -s "$dump" ]] || err "[$target] Entschlüsselter Dump ist leer"
 
   log "[$target] pg_restore Whole-DB (Quelle: ${desc})"
-  echo "  Ziel: Container ${container} → DB 'postgres' (--clean --if-exists --no-owner)"
+
+  # ---- Frische-DB-Erkennung: --clean konditional ----
+  # `--clean --if-exists` ist im Migrations-Pfad nötig (DB läuft schon mit alten
+  # Daten — pg_restore muss vor dem Insert droppen). Bei Disaster-Recovery in
+  # eine FRISCHE supabase/postgres-DB crasht --clean aber den Container:
+  # pg_restore versucht Objekte aus extensions/auth zu droppen, die der
+  # Supabase-Init gerade frisch aufgebaut hat → Backend-Worker bricht ab →
+  # postgres reagiert mit shutdown. Smoke-Test 2026-05-28 beobachtet.
+  #
+  # Heuristik "frisch": das App-Schema (aibrewgenius/rapt) existiert noch nicht.
+  # Das schema wird erst von Migrations oder vom Restore selbst angelegt; eine
+  # rein per supabase-init initialisierte DB hat es garantiert nicht. Damit ist
+  # der Test 100% trennscharf zwischen "frisch hochgezogen" und "läuft schon".
+  local app_schema; app_schema="$(app_schema_for "$target")"
+  local _schema_exists _schema_rc=0
+  _schema_exists="$(docker exec -e PGPASSWORD="$pgpassword" "$container" \
+    psql -tA -U supabase_admin -d postgres \
+    -c "SELECT count(*) FROM information_schema.schemata WHERE schema_name = '${app_schema}';" 2>/dev/null)" \
+    || _schema_rc=$?
+  if (( _schema_rc != 0 )); then
+    err "[$target] Schema-Existenz-Probe scheiterte (psql Exit ${_schema_rc}) — DB-Verbindung prüfen"
+  fi
+  _schema_exists="${_schema_exists//[[:space:]]/}"
+
+  local _pgr_clean_args=()
+  if [[ "$_schema_exists" == "0" ]]; then
+    echo "  Frische DB erkannt (Schema '${app_schema}' fehlt) → pg_restore OHNE --clean"
+    echo "  Ziel: Container ${container} → DB 'postgres' (--no-owner --no-acl)"
+  else
+    _pgr_clean_args=(--clean --if-exists)
+    echo "  Schema '${app_schema}' vorhanden → pg_restore MIT --clean --if-exists"
+    echo "  Ziel: Container ${container} → DB 'postgres' (--clean --if-exists --no-owner --no-acl)"
+  fi
 
   # ---- TimescaleDB-Restore-Hooks (bedingt) ----
   # timescaledb_pre_restore() / timescaledb_post_restore() existieren nur wenn die
@@ -333,7 +375,7 @@ restore_one() {
   # das bei vorzeitigem Abbruch errexit dauerhaft falsch hinterlassen könnte.
   local rc=0
   docker exec -i -e PGPASSWORD="$pgpassword" "$container" \
-    pg_restore --clean --if-exists --no-owner \
+    pg_restore "${_pgr_clean_args[@]}" --no-owner --no-acl \
                -U supabase_admin -d postgres < "$dump" \
     || rc=$?
   if (( rc != 0 )); then

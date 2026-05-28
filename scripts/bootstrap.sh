@@ -453,6 +453,28 @@ EOF
   chmod 644 /var/log/brewing-backup.log
   ok "Cron aktiv: $cron_file → backup.sh als ${APP_USER} (Log: /var/log/brewing-backup.log)"
 
+  # ---------------------------------------------------------------- Wöchentlicher Restore-Smoke (cron)
+  # Sonntag 04:00 — 1h nach dem nightly backup, also frischer Dump liegt da.
+  # Beweist wiederkehrend, dass die GPG-verschlüsselten R2-Backups wirklich
+  # wiederherstellbar sind (inkl. TimescaleDB-Hypertables) — verhindert dass wir
+  # erst beim echten Notfall merken, dass die Backups silently kaputt geworden sind.
+  # Scoped per Marker wie backup.sh: ohne db-rapt-/db-assistent-Marker → No-op.
+  log "Wöchentlicher Restore-Smoke-Cron einrichten (So 04:00, als ${APP_USER})"
+  local smoke_cron="/etc/cron.d/brewing-restore-smoke"
+  cat > "$smoke_cron" <<EOF
+# Brewing Restore-Smoke — wöchentlich (So 04:00). Von bootstrap.sh erzeugt (idempotent).
+# Zieht für jede vorhandene stateful DB-Unit einen Throwaway-Container hoch und
+# verifiziert das neueste lokale Backup. Prod-Container bleibt unangetastet.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+0 4 * * 0 ${APP_USER} for u in db-assistent db-rapt; do [ -f /etc/brewing/stateful-units.d/\$u ] && ${APP_DIR}/scripts/restore-smoke.sh \$u; done >> /var/log/brewing-restore-smoke.log 2>&1
+EOF
+  chmod 644 "$smoke_cron"
+  touch /var/log/brewing-restore-smoke.log
+  chown "$APP_USER:$APP_USER" /var/log/brewing-restore-smoke.log
+  chmod 644 /var/log/brewing-restore-smoke.log
+  ok "Cron aktiv: $smoke_cron → restore-smoke.sh So 04:00 (Log: /var/log/brewing-restore-smoke.log)"
+
   # ---------------------------------------------------------------- Marker-Registry-Verzeichnis sicherstellen
   # /etc/brewing/stateful-units.d/ — Marker-Dateien steuern, welche stateful Units
   # auf diesem VPS installiert sind (von backup.sh ausgelesen).
