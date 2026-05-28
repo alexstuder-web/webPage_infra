@@ -519,6 +519,21 @@ EOSU
     echo "  db-rapt läuft noch nicht — Backfill übersprungen (Marker wird beim Install-Unit-Start gesetzt)."
   fi
 
+  # Portainer-Marker-Backfill (selbstheilend): wenn Hub-Container läuft, Marker idempotent setzen.
+  local _portainer_running=0
+  sudo -u "$APP_USER" bash <<'EOSU' 2>/dev/null && _portainer_running=1 || _portainer_running=0
+docker inspect --format='{{.State.Running}}' portainer 2>/dev/null | grep -q '^true$'
+EOSU
+  local portainer_marker="${units_dir}/portainer"
+  if [[ -f "$portainer_marker" ]]; then
+    ok "portainer-Marker bereits vorhanden — ${portainer_marker}"
+  elif (( _portainer_running == 1 )); then
+    install -m 644 -o "$APP_USER" -g "$APP_USER" /dev/null "$portainer_marker"
+    ok "portainer-Marker gesetzt (Backfill: portainer läuft) → ${portainer_marker}"
+  else
+    echo "  portainer läuft nicht — Backfill übersprungen (Marker wird beim Hub-Start gesetzt)."
+  fi
+
 } # end run_base_bootstrap
 
 # ================================================================
@@ -748,6 +763,30 @@ EOSU
     ok "${db_unit}-Marker gesetzt → ${db_marker}"
   else
     printf '  \033[1;33m⚠ %s laeuft noch nicht — Marker NICHT gesetzt (Unit kam nicht hoch?).\033[0m\n' "$db_unit"
+  fi
+}
+
+# ---------------------------------------------------------------- Portainer-Marker idempotent setzen
+# Setzt /etc/brewing/stateful-units.d/portainer (mode 644, owner alex), falls der
+# portainer-Container läuft. Genauso wie _ensure_db_marker: scoped per Marker, kein
+# Container läuft → kein Marker, kein Backup-Lauf. Wird vom Hub-Start aufgerufen.
+_ensure_portainer_marker() {
+  local units_dir="/etc/brewing/stateful-units.d"
+  local marker="${units_dir}/portainer"
+  install -d -m 755 -o "$APP_USER" -g "$APP_USER" "$units_dir" 2>/dev/null || true
+  if [[ -f "$marker" ]]; then
+    ok "portainer-Marker bereits vorhanden — ${marker}"
+    return 0
+  fi
+  local _running=0
+  sudo -u "$APP_USER" bash <<'EOSU' 2>/dev/null && _running=1 || _running=0
+docker inspect --format='{{.State.Running}}' portainer 2>/dev/null | grep -q '^true$'
+EOSU
+  if (( _running == 1 )); then
+    install -m 644 -o "$APP_USER" -g "$APP_USER" /dev/null "$marker"
+    ok "portainer-Marker gesetzt → ${marker} (Backup/Restore von portainer_data aktiv)"
+  else
+    printf '  \033[1;33m⚠ portainer läuft nicht — Marker NICHT gesetzt.\033[0m\n'
   fi
 }
 
@@ -1289,6 +1328,12 @@ docker compose --profile vps --profile portainer-hub pull portainer 2>/dev/null 
 docker compose --profile vps --profile portainer-hub up -d portainer cloudflared
 EOSU
   ok "Portainer Hub gestartet"
+
+  # Marker für Backup-Discovery setzen — nightly backup.sh sichert dann das
+  # portainer_data-Volume (Admin-Hash + Settings + Endpoints + JWT-Secret),
+  # restore.sh kann es zurückspielen. Sonst kein Backup → nach Disaster muss
+  # man Admin-Setup + OTP-Timeout neu durchstehen.
+  _ensure_portainer_marker
   printf '\n  \033[1;33m⚠ CREDENTIAL-SCHRITTE (Portainer Hub, einmalig):\033[0m\n'
   printf '  1. Portainer-Admin-Passwort im ersten UI-Login setzen:\n'
   printf '     https://portainer.alexstuder.cloud\n'

@@ -140,6 +140,15 @@ unit_jobs() {
       # Ordner: mail, Stem: poste. Dateiname: poste_<TS>.tar.gpg
       printf '%s\n' "mail poste tar"
       ;;
+    portainer)
+      # Portainer-BoltDB liegt in einem Named-Volume (alexstuder_portainer_data).
+      # Hot-Copy ist gefährlich (BoltDB-mmap + halb-committed state nach Restore
+      # → korrupte DB), darum stoppt volume_one() den Container für ~5s.
+      # Wert: nach Disaster-Recovery ist der Admin-Account, alle Endpoints +
+      # Settings sofort da; kein OTP-Setup-Walzer und 5min-Security-Timeout.
+      # Ordner: portainer, Stem: portainer. Dateiname: portainer_<TS>.tar.gpg
+      printf '%s\n' "portainer portainer volume"
+      ;;
     # Erweiterungspunkt: weitere Units hier als neuer case-Zweig eintragen.
     *)
       err "unit_jobs: unbekannte Unit '$1'"
@@ -201,6 +210,14 @@ MAIL_CONTAINER="${MAIL_CONTAINER:-posteio}"
 if [[ -d "$STATEFUL_UNITS_DIR" ]] && [[ -f "${STATEFUL_UNITS_DIR}/mail" ]]; then
   docker inspect "$MAIL_CONTAINER" >/dev/null 2>&1 \
     || err "Container '$MAIL_CONTAINER' läuft nicht — Stack starten (docker compose up -d posteio)"
+fi
+
+# portainer-Check: nur wenn portainer-Marker da. Container MUSS laufen — volume_one()
+# wird ihn kurz stoppen, das geht aber nicht wenn er gar nicht existiert.
+PORTAINER_CONTAINER="${PORTAINER_CONTAINER:-portainer}"
+if [[ -d "$STATEFUL_UNITS_DIR" ]] && [[ -f "${STATEFUL_UNITS_DIR}/portainer" ]]; then
+  docker inspect "$PORTAINER_CONTAINER" >/dev/null 2>&1 \
+    || err "Container '$PORTAINER_CONTAINER' läuft nicht — Stack starten (docker compose --profile portainer-hub up -d)"
 fi
 
 mkdir -p "$BACKUP_DIR"
@@ -331,10 +348,67 @@ archive_one() {
   PRODUCED_FILES+=("$out")
 }
 
+# ---------------------------------------------------------------- Named-Volume → GPG
+# volume_one: sichert ein Docker-Named-Volume (z.B. portainer's BoltDB).
+# Stoppt den nutzenden Container kurz (5-15s) für konsistenten Snapshot —
+# alternative Hot-Copy einer mmap-BoltDB würde halb-committed state einfangen
+# und nach Restore eine korrupte DB liefern. Volume-Name wird LIVE aus dem
+# Container abgelesen (nicht hartkodiert) → robust gegen compose-Projekt-Präfix.
+volume_one() {
+  local folder="$1" stem="$2"
+  local dir="${BACKUP_DIR}/${folder}"
+  mkdir -p "$dir"
+  local base="${stem}_${TS}"
+  [[ -n "$LABEL" ]] && base="${base}_${LABEL}"
+  local out="${dir}/${base}.tar.gpg"
+
+  # Container-Name = stem (Konvention: marker-name == container-name für volume-units).
+  local container="$stem"
+  docker inspect "$container" >/dev/null 2>&1 \
+    || err "volume_one '${folder}': Container '${container}' nicht gefunden"
+
+  # Volume-Name dynamisch lesen: erstes Volume-Mount (Mount-Typ 'volume') des Containers.
+  local vol
+  vol="$(docker inspect "$container" --format \
+    '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\n"}}{{end}}{{end}}' \
+    | head -1)"
+  [[ -n "$vol" ]] \
+    || err "volume_one '${folder}': Kein named volume an Container '${container}' gefunden"
+
+  log "Volume '${folder}' (${vol}) → ${folder}/${out##*/} — Container ${container} kurz stoppen"
+
+  # Stop → Snapshot → Start, mit Fail-Safe: bei Fehler im Snapshot Container TROTZDEM
+  # wieder starten (sonst bleibt Portainer down bis zum nächsten Bootstrap).
+  local snap_failed=0
+  docker stop -t 30 "$container" >/dev/null \
+    || err "volume_one '${folder}': docker stop fehlgeschlagen — kein Backup, kein Snapshot"
+
+  # tar | gpg in einem disposable alpine: kein temp-Klartext-tar auf Platte.
+  # -ro mount: Snapshot read-only, kann eh nicht versehentlich schreiben.
+  if ! docker run --rm -v "${vol}:/source:ro" alpine \
+         tar -cf - -C /source . \
+       | gpg --batch --yes --symmetric --cipher-algo AES256 \
+             --pinentry-mode loopback --passphrase-file "$PASS_TMP" \
+             -o "$out"; then
+    snap_failed=1
+    rm -f "$out"
+  fi
+
+  # Container WIEDER starten — UNBEDINGT, auch wenn Snapshot failed.
+  docker start "$container" >/dev/null \
+    || err "volume_one '${folder}': docker start fehlgeschlagen — Container '${container}' ist down, manuell prüfen!"
+
+  (( snap_failed == 1 )) && err "Volume-Backup '${folder}' fehlgeschlagen (tar | gpg) — unvollständige Datei entfernt"
+  [[ -s "$out" ]] || { rm -f "$out"; err "Volume-Backup '${folder}' ist leer — abgebrochen"; }
+  ok "${folder}: $(basename "$out") ($(du -h "$out" | cut -f1))"
+  PRODUCED_FILES+=("$out")
+}
+
 for i in "${!FOLDERS[@]}"; do
   case "${JOB_TYPES[$i]:-pg}" in
-    tar) archive_one "${FOLDERS[$i]}" "${STEMS[$i]}" ;;
-    *)   dump_one    "${FOLDERS[$i]}" "${STEMS[$i]}" ;;
+    tar)    archive_one "${FOLDERS[$i]}" "${STEMS[$i]}" ;;
+    volume) volume_one  "${FOLDERS[$i]}" "${STEMS[$i]}" ;;
+    *)      dump_one    "${FOLDERS[$i]}" "${STEMS[$i]}" ;;
   esac
 done
 
@@ -348,10 +422,10 @@ rotate_folder() {
   [[ -d "$dir" ]] || return 0
 
   # Datei-Extension und Regex hängen vom Job-Typ ab:
-  #   pg  → .fc.gpg  (pg_dump custom format)
-  #   tar → .tar.gpg (Verzeichnis-Archiv)
+  #   pg            → .fc.gpg  (pg_dump custom format)
+  #   tar | volume  → .tar.gpg (Verzeichnis-Archiv oder Named-Volume-Snapshot)
   local ext regex
-  if [[ "$jtype" == "tar" ]]; then
+  if [[ "$jtype" == "tar" || "$jtype" == "volume" ]]; then
     ext=".tar.gpg"
     regex="^${stem}_[0-9]{8}_[0-9]{6}$"
   else
@@ -446,8 +520,9 @@ prune_r2_folder() {
   local path="${base}/${folder}/"
 
   # Datei-Extension und Regex hängen vom Job-Typ ab.
+  # tar | volume → .tar.gpg ; pg → .fc.gpg.
   local ext rclone_include regex
-  if [[ "$jtype" == "tar" ]]; then
+  if [[ "$jtype" == "tar" || "$jtype" == "volume" ]]; then
     ext=".tar.gpg"
     rclone_include="*.tar.gpg"
     regex="^${stem}_[0-9]{8}_[0-9]{6}\.tar\.gpg$"

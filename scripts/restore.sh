@@ -4,7 +4,12 @@
 #
 #   restore.sh <target> [file|latest] [--yes]
 #
-#   target:  all | db-assistent | db-rapt
+#   target:  all | db-assistent | db-rapt | portainer
+#
+# 'portainer' ist ein Sonder-Target: KEIN psql/pg_restore, sondern tar-Restore
+# des portainer_data-Volumes (Admin-Hash, Settings, Endpoints, JWT-Secret).
+# Container wird kurz gestoppt, Volume geleert, tar-Archiv eingespielt, Container
+# startet wieder → nach Login ist Admin sofort wieder da, kein OTP-Setup nötig.
 #   quelle:  'latest' (default) → jüngste .fc.gpg aus R2 backup/<target>/
 #            <pfad>             → lokale .fc.gpg-Datei einspielen
 #                                 (nur für ein einzelnes Ziel; bei 'all' + Pfad → Fehler)
@@ -65,15 +70,18 @@ err()  { echo -e "\n\033[1;31m✖ $*\033[0m" >&2; exit 1; }
 
 usage() {
   cat >&2 <<EOF
-Usage: $0 <all|db-assistent|db-rapt> [file|latest] [--yes]
+Usage: $0 <all|db-assistent|db-rapt|portainer> [file|latest] [--yes]
 
   all              Beide DBs restoren (jede aus ihrem eigenen R2-Ordner, latest).
                    Nur mit 'latest' kombinierbar — ein Dateipfad kann nicht beide
                    DBs füttern. Für all + Pfad: Fehler.
   db-assistent     Whole-DB-Restore aus backup/db-assistent/ (kein TimescaleDB).
   db-rapt          Whole-DB-Restore aus backup/db-rapt/ (TimescaleDB-Hooks auto).
+  portainer        Volume-Restore aus backup/portainer/ (Admin-Hash, Settings,
+                   Endpoints, JWT). Container kurz down (~5s).
 
-  [file|latest]    'latest' (default) zieht die jüngste .fc.gpg aus dem eigenen R2-Ordner.
+  [file|latest]    'latest' (default) zieht den jüngsten Dump aus dem eigenen
+                   R2-Ordner (.fc.gpg für DBs, .tar.gpg für portainer).
                    Ein Pfad spielt eine lokale Datei ein (nur für ein einzelnes Ziel).
   --yes            Sicherheitsabfrage überspringen (für Automatisierung).
 
@@ -81,6 +89,7 @@ Usage: $0 <all|db-assistent|db-rapt> [file|latest] [--yes]
     $0 all
     $0 all latest
     $0 db-rapt latest
+    $0 portainer latest
     $0 db-assistent backups/db-assistent/db-assistent_20260525_030000.fc.gpg
 EOF
   exit 1
@@ -92,6 +101,7 @@ db_container_for() {
   case "$1" in
     db-assistent) printf 'db-assistent' ;;
     db-rapt)      printf 'db-rapt' ;;
+    portainer)    printf 'portainer' ;;
     *)            err "db_container_for: unbekanntes Ziel '$1'" ;;
   esac
 }
@@ -129,7 +139,19 @@ target_folder() {
   case "$1" in
     db-assistent) printf 'db-assistent' ;;
     db-rapt)      printf 'db-rapt' ;;
+    portainer)    printf 'portainer' ;;
     *)            err "target_folder: unbekanntes Ziel '$1'" ;;
+  esac
+}
+
+# target_kind <target>: 'pg' (Postgres-DB) oder 'volume' (Docker-Volume).
+# Dispatch-Hilfe für restore_one() — der Volume-Pfad hat eine ganz andere
+# Mechanik (kein psql, kein TimescaleDB-Wrap, kein --clean-Heuristik).
+target_kind() {
+  case "$1" in
+    db-assistent|db-rapt) printf 'pg' ;;
+    portainer)            printf 'volume' ;;
+    *)                    err "target_kind: unbekanntes Ziel '$1'" ;;
   esac
 }
 
@@ -155,7 +177,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "$TARGET" ]] || usage
-case "$TARGET" in all|db-assistent|db-rapt) ;; *) err "Ungültiges Ziel '$TARGET' (erwartet: all|db-assistent|db-rapt)"; ;; esac
+case "$TARGET" in all|db-assistent|db-rapt|portainer) ;; *) err "Ungültiges Ziel '$TARGET' (erwartet: all|db-assistent|db-rapt|portainer)"; ;; esac
 [[ -n "$SOURCE" ]] || SOURCE="latest"
 
 # 'all' + expliziter Pfad ist nicht sinnvoll (ein Dump kann nicht beide DBs füttern).
@@ -178,10 +200,12 @@ _check_container() {
 }
 case "$TARGET" in
   all)
+    # 'all' deckt nur die DBs ab — portainer ist explizit aufzurufen, weil
+    # Volume-Restore eine Downtime hat und semantisch nichts mit DB-Restore zu tun.
     _check_container db-assistent
     _check_container db-rapt
     ;;
-  db-assistent|db-rapt)
+  db-assistent|db-rapt|portainer)
     _check_container "$TARGET"
     ;;
 esac
@@ -239,26 +263,94 @@ setup_r2_remote() {
   R2_READY=1
 }
 
-# Holt die jüngste .fc.gpg eines R2-Ordners → lokale Tempdatei, gibt Pfad aus.
+# Holt den jüngsten Dump eines R2-Ordners → lokale Tempdatei, gibt Pfad aus.
 # 'Jüngste' = lexikografisch letzter Name nach sort — entspricht chronologisch
 # letztem nur wenn Dateinamen den Timestamp-Stem <name>_YYYYMMDD_HHMMSS tragen
 # (wie backup.sh ihn erzeugt). Abweichende Namenskonventionen → kein Fallback.
+# $2: glob-Pattern ('*.fc.gpg' für DBs, '*.tar.gpg' für Volume-Units).
 fetch_latest_from_r2() {
-  local folder="$1"
+  local folder="$1" glob="${2:-*.fc.gpg}"
   setup_r2_remote
   local latest
-  latest="$(rclone lsf "R2:${R2_BUCKET}/${folder}/" --include '*.fc.gpg' 2>/dev/null \
+  latest="$(rclone lsf "R2:${R2_BUCKET}/${folder}/" --include "$glob" 2>/dev/null \
             | sort | tail -1)"
-  [[ -n "$latest" ]] || err "Kein *.fc.gpg in R2 ${R2_BUCKET}/${folder}/ gefunden"
+  [[ -n "$latest" ]] || err "Kein ${glob} in R2 ${R2_BUCKET}/${folder}/ gefunden"
   local dest="${WORK_DIR}/${folder}__${latest}"
   rclone copyto "R2:${R2_BUCKET}/${folder}/${latest}" "$dest" \
     || err "rclone-Download fehlgeschlagen: ${folder}/${latest}"
   echo "$dest"
 }
 
+# ---------------------------------------------------------------- Volume-Restore (portainer)
+# Spielt einen .tar.gpg-Snapshot zurück in das Named-Volume des Container-Targets.
+# Mechanik (analog zur Vorlage uglyatbeautymolt/VPS_Bootstrap, kompatibel mit
+# backup.sh:volume_one): container stop → Volume leeren → tar extrahieren →
+# container start. Volume-Name wird LIVE aus dem Container gelesen (robust
+# gegen compose-Projekt-Präfix wie 'alexstuder_portainer_data').
+restore_one_volume() {
+  local target="$1" source="$2"
+  local folder; folder="$(target_folder "$target")"
+  local container; container="$(db_container_for "$target")"
+  local enc_file desc
+
+  if [[ "$source" == "latest" ]]; then
+    log "[$target] Jüngste .tar.gpg aus R2 ${R2_BUCKET:-?}/${folder}/ holen"
+    enc_file="$(fetch_latest_from_r2 "$folder" '*.tar.gpg')"
+    desc="R2:${folder}/$(basename "${enc_file#*__}")"
+    ok "[$target] geholt: $(basename "$enc_file")"
+  else
+    [[ -f "$source" ]] || err "Datei nicht gefunden: $source"
+    enc_file="$source"
+    desc="$source"
+  fi
+
+  local tar_out="${WORK_DIR}/${target}.tar"
+  gpg --batch --yes --decrypt --pinentry-mode loopback \
+      --passphrase-file "$PASS_TMP" -o "$tar_out" "$enc_file" \
+    || err "[$target] Entschlüsselung fehlgeschlagen (falsche Passphrase / korrupte Datei?)"
+  [[ -s "$tar_out" ]] || err "[$target] Entschlüsseltes Archiv ist leer"
+
+  # Volume-Name live ablesen.
+  local vol
+  vol="$(docker inspect "$container" --format \
+    '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\n"}}{{end}}{{end}}' \
+    | head -1)"
+  [[ -n "$vol" ]] || { rm -f "$tar_out"; err "[$target] Kein named volume an '$container' — kann nicht restoren"; }
+
+  log "[$target] Volume-Restore (Quelle: ${desc}, Volume: ${vol})"
+  echo "  Container ${container} kurz stoppen, Volume leeren, tar einspielen"
+
+  docker stop -t 30 "$container" >/dev/null \
+    || { rm -f "$tar_out"; err "[$target] docker stop fehlgeschlagen — kein Restore"; }
+
+  # Volume leeren + tar extrahieren in einem alpine-Lauf. tar liest vom stdin → kein
+  # Klartext-tar im Container bleiben. Bei Fehler: trotzdem Container wieder starten.
+  local restore_failed=0
+  if ! docker run --rm -i -v "${vol}:/target" alpine \
+         sh -c 'rm -rf /target/* /target/.[!.]* /target/..?* 2>/dev/null; tar -xf - -C /target' \
+         < "$tar_out"; then
+    restore_failed=1
+  fi
+
+  docker start "$container" >/dev/null \
+    || err "[$target] docker start fehlgeschlagen — Container '${container}' down, manuell prüfen!"
+
+  rm -f "$tar_out"
+  (( restore_failed == 1 )) && err "[$target] tar-Extract fehlgeschlagen — Volume ggf. halb leer"
+  ok "[$target] Volume-Restore abgeschlossen — Container neu gestartet"
+}
+
 # ---------------------------------------------------------------- Ein Ziel restoren
 restore_one() {
   local target="$1" source="$2"
+
+  # Dispatch nach Target-Art: Volume-Units gehen den tar-Pfad,
+  # DB-Units gehen den pg_restore-Pfad (Rest dieser Funktion).
+  if [[ "$(target_kind "$target")" == "volume" ]]; then
+    restore_one_volume "$target" "$source"
+    return
+  fi
+
   local folder; folder="$(target_folder "$target")"
   local container; container="$(db_container_for "$target")"
   local pgpassword; pgpassword="$(db_password_for "$target")"
@@ -429,6 +521,28 @@ run_verify() {
       verify_count db-rapt rapt telemetry_controllers 2>/dev/null || true
       verify_count db-rapt rapt telemetry_hydrometers 2>/dev/null || true
       ;;
+    portainer)
+      # Volume-Restore hat keine SQL-Verify; statt dessen kurzer Smoke:
+      # BoltDB-Datei existiert + ist > 0 Bytes. portainer/portainer-ce ist ein
+      # distroless Image (kein ls/sh) → nicht via 'docker exec', sondern via
+      # disposable alpine mit read-only Mount des Volumes.
+      local vol db_size
+      vol="$(docker inspect portainer --format \
+        '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\n"}}{{end}}{{end}}' \
+        | head -1)"
+      if [[ -n "$vol" ]]; then
+        db_size="$(docker run --rm -v "${vol}:/d:ro" alpine \
+          stat -c '%s' /d/portainer.db 2>/dev/null || echo 0)"
+        if [[ "$db_size" =~ ^[0-9]+$ && "$db_size" -gt 0 ]]; then
+          printf '  [portainer] %-32s %s bytes (OK)\n' "/data/portainer.db" "$db_size"
+          printf '  [portainer] Login mit dem ALTEN Admin-Passwort wieder möglich.\n'
+        else
+          printf '  [portainer] %-32s FEHLT — Restore prüfen!\n' "/data/portainer.db"
+        fi
+      else
+        printf '  [portainer] Kein named volume an portainer — Restore-Verify nicht möglich.\n'
+      fi
+      ;;
   esac
 }
 
@@ -447,12 +561,17 @@ esac
 log "RESTORE — destruktiv"
 echo "  Ziel:        ${TARGET}"
 echo "  Quelle:      ${SOURCE}"
+_has_db=0; _has_volume=0
 for t in "${PLAN[@]}"; do
   folder="$(target_folder "$t")"
   container="$(db_container_for "$t")"
-  echo "  DB ${t}: Ordner ${folder}/, Container ${container}"
+  kind="$(target_kind "$t")"
+  echo "  ${kind^^} ${t}: Ordner ${folder}/, Container ${container}"
+  [[ "$kind" == "pg"     ]] && _has_db=1
+  [[ "$kind" == "volume" ]] && _has_volume=1
 done
-echo "  Hinweis:     --clean --if-exists droppt vorhandene Objekte vor dem Neuanlegen."
+(( _has_db     == 1 )) && echo "  Hinweis (DB):     --clean nur wenn App-Schema schon existiert (frische DB → kein --clean)."
+(( _has_volume == 1 )) && echo "  Hinweis (Volume): Container wird kurz gestoppt (~5s), Volume geleert + tar eingespielt."
 echo
 if (( ASSUME_YES == 0 )); then
   [[ -t 0 ]] || err "Kein TTY und kein --yes — Restore aus Sicherheitsgründen abgebrochen"
