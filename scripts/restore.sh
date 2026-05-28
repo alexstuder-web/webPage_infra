@@ -223,6 +223,9 @@ setup_r2_remote() {
   export RCLONE_CONFIG_R2_ENDPOINT="$endpoint"
   export RCLONE_CONFIG_R2_REGION="auto"
   export RCLONE_CONFIG_R2_NO_CHECK_BUCKET="true"
+  # Komplett via Env-Vars konfiguriert → /dev/null als Config-Datei unterdrückt
+  # das "Config file not found"-NOTICE pro Aufruf (siehe backup.sh:setup_r2_remote).
+  export RCLONE_CONFIG="/dev/null"
   R2_READY=1
 }
 

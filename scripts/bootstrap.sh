@@ -102,9 +102,33 @@ EOF
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y
     apt-get upgrade -y
-    apt-get install -y curl git gnupg ca-certificates lsb-release ufw jq unzip cron rclone
+    # rclone bewusst NICHT aus apt: Ubuntu liefert v1.60.1 (Feb 2023) — alter
+    # R2-Multipart-Bug wirft "501 NotImplemented" auf jedem Upload, rclone fängt
+    # das mit Attempt 2/3 ab. Funktioniert, macht aber den Backup-Log unleserlich.
+    # Stattdessen offizielles install.sh → aktuelle Stable (≥1.74) mit R2-Fix.
+    apt-get install -y curl git gnupg ca-certificates lsb-release ufw jq unzip cron
     systemctl enable --now cron
-    ok "apt up-to-date (inkl. cron + rclone für Backups)"
+    ok "apt up-to-date (inkl. cron für Backups)"
+
+    if ! command -v rclone >/dev/null 2>&1; then
+      log "rclone aus offiziellem Installer (R2-kompatibel, ≥1.74)"
+      curl -fsSL https://rclone.org/install.sh | bash >/dev/null
+      ok "rclone installiert: $(rclone version 2>/dev/null | head -1)"
+    else
+      # Schon da (idempotent) — aber wenn's die alte apt-Version ist, upgraden.
+      local _rclone_ver
+      _rclone_ver="$(rclone version 2>/dev/null | head -1 | grep -oE 'v[0-9]+\.[0-9]+' || echo v0.0)"
+      if [[ "$_rclone_ver" < "v1.66" ]]; then
+        log "rclone ${_rclone_ver} ist zu alt für R2 (501-Bug) → upgrade via install.sh"
+        # apt-Pakete erstmal weg, sonst gewinnt /usr/bin/rclone gegen /usr/local/bin/rclone.
+        apt-get remove -y rclone 2>/dev/null || true
+        curl -fsSL https://rclone.org/install.sh | bash >/dev/null
+        hash -r
+        ok "rclone aktualisiert: $(rclone version 2>/dev/null | head -1)"
+      else
+        ok "rclone ${_rclone_ver} bereits aktuell"
+      fi
+    fi
   fi
 
   # ---------------------------------------------------------------- Linux-User
@@ -1838,6 +1862,7 @@ export RCLONE_CONFIG_R2_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID:?fehlt in .env auf alt
 export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY:?fehlt in .env auf altem VPS}"
 export RCLONE_CONFIG_R2_REGION=auto
 export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
+export RCLONE_CONFIG=/dev/null  # unterdrückt "Config file not found"-NOTICE; wir nutzen nur Env-Vars
 _ep="${R2_ENDPOINT:-}"
 if [[ -z "$_ep" ]]; then
   _ep="https://${R2_ACCOUNT_ID:?fehlt in .env auf altem VPS}.r2.cloudflarestorage.com"
@@ -2236,6 +2261,7 @@ export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
 export RCLONE_CONFIG_R2_ENDPOINT="$_r2_ep"
 export RCLONE_CONFIG_R2_REGION=auto
 export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
+export RCLONE_CONFIG=/dev/null  # unterdrückt "Config file not found"-NOTICE; wir nutzen nur Env-Vars
 
 LOCAL_DIR="backups/${DB_UNIT}"
 LOCAL_FILE="${LOCAL_DIR}/${DUMP_NAME}"
@@ -2451,6 +2477,7 @@ export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
 export RCLONE_CONFIG_R2_ENDPOINT="$R2_EP"
 export RCLONE_CONFIG_R2_REGION=auto
 export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
+export RCLONE_CONFIG=/dev/null  # unterdrückt "Config file not found"-NOTICE; wir nutzen nur Env-Vars
 
 _rclone_err_tmp="$(mktemp)"
 trap 'rm -f "$_rclone_err_tmp"' EXIT

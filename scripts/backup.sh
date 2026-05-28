@@ -414,6 +414,10 @@ setup_r2_remote() {
   export RCLONE_CONFIG_R2_ENDPOINT="$endpoint"
   export RCLONE_CONFIG_R2_REGION="auto"
   export RCLONE_CONFIG_R2_NO_CHECK_BUCKET="true"
+  # Wir konfigurieren komplett via RCLONE_CONFIG_*-Env-Vars (Creds-Hygiene).
+  # /dev/null als Config-Datei → unterdrückt das "Config file not found - using
+  # defaults"-NOTICE pro Aufruf, ohne dass eine echte Datei rumliegt.
+  export RCLONE_CONFIG="/dev/null"
 }
 
 upload_r2() {
