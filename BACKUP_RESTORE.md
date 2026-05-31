@@ -429,6 +429,27 @@ Der `pg_extension`-Guard in `restore.sh`:
 Läuft **ohne** `-e`/`--exit-on-error`: Supabase emittiert bekannte nicht-fatale Fehler
 (Extensions, Vault, vom Image bereits angelegte Roles). Erfolg wird über Counts bewertet.
 
+**Supabase-Grants-Hook (`restore-supabase-grants.sql`):**
+`pg_restore --no-acl` überspringt alle GRANT-Statements aus dem Dump. Bei Supabase-DBs
+ist das fatal: `supabase_auth_admin` verliert Ownership auf `auth`-Tabellen, `anon` /
+`authenticated` / `service_role` verlieren USAGE auf den App-Schemas. Symptome auf dem
+live-VPS: Login schlägt mit HTTP 500 fehl (`Database error querying schema`), REST antwortet
+mit `permission denied for schema rapt` (oder `aibrewgenius`).
+
+`restore.sh` führt deshalb nach `pg_restore` + TimescaleDB-`post_restore()` automatisch
+`scripts/restore-supabase-grants.sql` aus — via `docker cp` + `docker exec psql -f`.
+Guard: nur wenn das `auth`-Schema in der DB existiert (= Supabase-DB). Die SQL ist
+**idempotent** (GRANT überschreibt; DO-Blöcke prüfen pg_namespace/pg_tables; kein CONFLICT
+möglich) und kann beliebig oft wiederholt werden. Bei Fehler: harter Abbruch — ein Restore
+ohne korrekte Grants ist nicht vertrauenswürdig.
+
+`restore-supabase-grants.sql` setzt `ALTER DEFAULT PRIVILEGES` in **zwei Varianten** pro
+Schema: einmal für Objekte, die als `supabase_admin` angelegt werden (direkte SQL-Ausführung
+via psql), und einmal für Objekte, die als `postgres` angelegt werden (Migrations-Toolchains
+wie `db-migrate`, `flyway` oder `psql -U postgres` laufen typischerweise als `postgres`).
+Fehlt die `postgres`-Variante, bekommen Tabellen aus zukünftigen Migrations kein Auto-GRANT
+zu `authenticated`/`anon` — derselbe Bug, nur eine Migration verzögert.
+
 **Nach dem Restore gibt `restore.sh` Tabellen-Counts aus:**
 - `db-assistent`: `auth.users`, `aibrewgenius.recipes`
 - `db-rapt`: `auth.users`, `rapt.brew_sessions`, `rapt.telemetry_controllers`,

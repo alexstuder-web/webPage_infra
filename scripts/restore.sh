@@ -340,6 +340,65 @@ restore_one_volume() {
   ok "[$target] Volume-Restore abgeschlossen — Container neu gestartet"
 }
 
+# ---------------------------------------------------------------- Supabase-Grants-Hook
+# apply_supabase_grants_if_supabase_db <target> <container> <pgpassword>
+#
+# Führt restore-supabase-grants.sql aus, wenn das 'auth'-Schema in der DB existiert.
+# pg_restore --no-acl überspringt alle GRANT-Statements aus dem Dump; ohne diesen
+# Hook verlieren supabase_auth_admin, anon und authenticated ihre Schema-Rechte →
+# Login-Fehler "500 Database error querying schema", REST "permission denied for schema".
+#
+# Guard: nur ausführen wenn 'auth'-Schema vorhanden (= Supabase-DB).
+# Nicht-Supabase-DBs (falls jemals) werden sauber übersprungen.
+#
+# Idempotenz: GRANT-Statements überschreiben; ALTER … OWNER und DO-Blöcke prüfen per
+# pg_namespace/pg_tables — kein CONFLICT-Risiko. Kann 2× laufen ohne Schaden.
+#
+# Fehler: hartes Abbruch via err() — Restore ohne korrekte Grants ist nutzlos
+# (Auth-Login klappt nicht, App-Schemas nicht sichtbar via REST).
+apply_supabase_grants_if_supabase_db() {
+  local target="$1" container="$2" pgpassword="$3"
+
+  # Guard: prüfe ob 'auth'-Schema existiert (Supabase-DB-Indikator).
+  # Fehler beim psql-Aufruf selbst (DB-Verbindungsproblem) → harter Abbruch.
+  # stderr absichtlich NICHT stummgeschaltet: "role does not exist" / "connection
+  # refused" müssen sichtbar sein, damit err() eine diagnostische Ausgabe hat.
+  local _auth_present _auth_guard_rc=0
+  _auth_present="$(docker exec -e PGPASSWORD="$pgpassword" "$container" \
+    psql -tA -U supabase_admin -d postgres \
+    -c "SELECT count(*) FROM pg_namespace WHERE nspname = 'auth';")" \
+    || _auth_guard_rc=$?
+  if (( _auth_guard_rc != 0 )); then
+    err "[$target] Supabase-Grant-Guard: psql-Fehler (Exit ${_auth_guard_rc}) — DB-Verbindung prüfen"
+  fi
+  _auth_present="${_auth_present//[[:space:]]/}"
+
+  if [[ "$_auth_present" != "1" ]]; then
+    echo "  [$target] 'auth'-Schema nicht gefunden — Supabase-Grants-Hook übersprungen."
+    return 0
+  fi
+
+  log "[$target] Supabase-Grants wiederherstellen (--no-acl-Kompensation)"
+
+  # SQL-Datei in den Container kopieren, ausführen, aufräumen.
+  local sql_src="${REPO_DIR}/scripts/restore-supabase-grants.sql"
+  [[ -f "$sql_src" ]] \
+    || err "[$target] restore-supabase-grants.sql nicht gefunden: ${sql_src}"
+
+  docker cp "$sql_src" "${container}:/tmp/restore-supabase-grants.sql" \
+    || err "[$target] docker cp restore-supabase-grants.sql fehlgeschlagen"
+
+  docker exec -e PGPASSWORD="$pgpassword" "$container" \
+    psql -U supabase_admin -d postgres -f /tmp/restore-supabase-grants.sql \
+    || { docker exec "$container" rm -f /tmp/restore-supabase-grants.sql 2>/dev/null || true
+         err "[$target] restore-supabase-grants.sql fehlgeschlagen — Grants unvollständig, Restore nicht vertrauen"; }
+
+  docker exec "$container" rm -f /tmp/restore-supabase-grants.sql \
+    || true   # Aufräum-Fehler nicht fatal; Container-tmp ist flüchtig
+
+  ok "[$target] Supabase-Grants gesetzt"
+}
+
 # ---------------------------------------------------------------- Ein Ziel restoren
 restore_one() {
   local target="$1" source="$2"
@@ -392,7 +451,7 @@ restore_one() {
   local _schema_exists _schema_rc=0
   _schema_exists="$(docker exec -e PGPASSWORD="$pgpassword" "$container" \
     psql -tA -U supabase_admin -d postgres \
-    -c "SELECT count(*) FROM information_schema.schemata WHERE schema_name = '${app_schema}';" 2>/dev/null)" \
+    -c "SELECT count(*) FROM information_schema.schemata WHERE schema_name = '${app_schema}';")" \
     || _schema_rc=$?
   if (( _schema_rc != 0 )); then
     err "[$target] Schema-Existenz-Probe scheiterte (psql Exit ${_schema_rc}) — DB-Verbindung prüfen"
@@ -432,7 +491,7 @@ restore_one() {
   local _tsdb_present _tsdb_guard_rc=0
   _tsdb_present="$(docker exec -e PGPASSWORD="$pgpassword" "$container" \
     psql -tA -U supabase_admin -d postgres \
-    -c "SELECT count(*) FROM pg_extension WHERE extname = 'timescaledb';" 2>/dev/null)" \
+    -c "SELECT count(*) FROM pg_extension WHERE extname = 'timescaledb';")" \
     || _tsdb_guard_rc=$?
   if (( _tsdb_guard_rc != 0 )); then
     err "[$target] TimescaleDB-Präsenz nicht ermittelbar (psql Exit-Code ${_tsdb_guard_rc}) — DB-Verbindung prüfen, bevor restauriert wird"
@@ -490,6 +549,10 @@ restore_one() {
     fi
   fi
 
+  # ---- Supabase-Grants-Hook — nach TimescaleDB post_restore, vor Verifikation ----
+  # Kompensiert pg_restore --no-acl: stellt auth/app-schema/public-Grants wieder her.
+  apply_supabase_grants_if_supabase_db "$target" "$container" "$pgpassword"
+
   rm -f "$dump"
   ok "[$target] pg_restore durchgelaufen"
 }
@@ -502,7 +565,7 @@ verify_count() {
   local n
   n="$(docker exec -e PGPASSWORD="$pgpassword" "$container" \
         psql -tA -U supabase_admin -d postgres \
-        -c "SELECT count(*) FROM ${schema}.${tbl};" 2>/dev/null || echo "n/a")"
+        -c "SELECT count(*) FROM ${schema}.${tbl};" || echo "n/a")"
   printf '  [%s] %-32s %s\n' "$target" "${schema}.${tbl}" "$n"
 }
 
@@ -511,15 +574,15 @@ run_verify() {
   case "$target" in
     db-assistent)
       verify_count db-assistent auth users
-      verify_count db-assistent aibrewgenius recipes 2>/dev/null || true
+      verify_count db-assistent aibrewgenius recipes || true
       ;;
     db-rapt)
       # Hypertable-Counts (telemetry_*): 0 nach Restore = starker Indikator für
       # kaputte Chunk-Verknüpfung (TimescaleDB post_restore fehlgeschlagen/fehlt).
       verify_count db-rapt auth users
-      verify_count db-rapt rapt brew_sessions 2>/dev/null || true
-      verify_count db-rapt rapt telemetry_controllers 2>/dev/null || true
-      verify_count db-rapt rapt telemetry_hydrometers 2>/dev/null || true
+      verify_count db-rapt rapt brew_sessions || true
+      verify_count db-rapt rapt telemetry_controllers || true
+      verify_count db-rapt rapt telemetry_hydrometers || true
       ;;
     portainer)
       # Volume-Restore hat keine SQL-Verify; statt dessen kurzer Smoke:
