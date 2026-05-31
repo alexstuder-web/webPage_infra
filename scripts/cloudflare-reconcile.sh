@@ -69,6 +69,10 @@ log()  { echo -e "\n\033[1;34m▶ $*\033[0m"; }
 ok()   { echo -e "\033[1;32m  ✓ $*\033[0m"; }
 err()  { echo -e "\033[1;31m✖ $*\033[0m" >&2; exit 1; }
 
+# I-4: Hoisted aus _resolve_mail_vps_ip — einmal definiert, überall verwendbar.
+_ipv4_re='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+_is_valid_ipv4() { [[ "$1" =~ $_ipv4_re ]]; }
+
 # ---------------------------------------------------------------- Pre-flight
 [[ -f "$ROUTES_JSON" ]] || err "Keine Routes-Map: $ROUTES_JSON"
 [[ -f "$ENV_FILE" ]]   || err "Keine .env — erst ./scripts/decrypt-env.sh"
@@ -764,29 +768,147 @@ fi
 
 if (( _MAIL_ACTIVE == 1 )); then
 
-  # ---- VPS-IP ermitteln (auto oder .env-Override) ----
-  if [[ -n "$MAIL_VPS_IP" ]]; then
-    ok "Mail-VPS-IP aus .env (MAIL_VPS_IP): ${MAIL_VPS_IP}"
-  else
-    # Automatische Ermittlung über ifconfig.co (robuster öffentlicher IP-Service).
-    # Timeout 10s; bei Fehler → Abbruch mit klarem Hinweis (kein stilles Weglassen).
-    MAIL_VPS_IP="$(curl -sS --max-time 10 https://ifconfig.co 2>/dev/null || true)"
-    MAIL_VPS_IP="${MAIL_VPS_IP//[[:space:]]/}"  # trailing newline entfernen
-    if [[ -z "$MAIL_VPS_IP" ]]; then
-      printf '  \033[1;33m⚠ VPS-IP konnte nicht automatisch ermittelt werden (ifconfig.co nicht erreichbar).\033[0m\n'
-      printf '  Mail-DNS (A-Record) wird übersprungen. MAIL_VPS_IP in .env setzen, dann erneut laufen.\n'
-      MAIL_VPS_IP=""
-    else
-      # Sanity-Check: IPv4-Format
-      if [[ ! "$MAIL_VPS_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-        printf '  \033[1;33m⚠ Ermittelte IP "%s" sieht nicht nach IPv4 aus — A-Record übersprungen.\033[0m\n' \
-          "$MAIL_VPS_IP"
-        printf '  MAIL_VPS_IP in .env manuell setzen.\n'
-        MAIL_VPS_IP=""
+  # ---- _resolve_mail_vps_ip: Multi-Fallback-Echo + optionaler hcloud-Cross-Check ----
+  # Gibt die ermittelte IPv4 auf stdout aus (leer = nicht ermittelbar).
+  # Alle Log-Ausgaben gehen auf stderr (fd 2), damit stdout als reiner IP-Kanal nutzbar ist.
+  # Override-Pfad (konkrete IP ODER literal "auto" in MAIL_VPS_IP):
+  #   konkrete IPv4 → direkt zurückgeben, kein Echo, kein hcloud
+  #   leer ODER "auto" → Auto-Detect-Pfad (Echo-Fallback-Kette + optionaler hcloud-Cross-Check)
+  _resolve_mail_vps_ip() {
+    local _env_val="${1:-}"
+
+    # ---- Override: konkrete IP in .env ----
+    if [[ -n "$_env_val" && "$_env_val" != "auto" ]]; then
+      if _is_valid_ipv4 "$_env_val"; then
+        printf '  \033[1;32m  ✓ MAIL_VPS_IP aus .env (Override): %s\033[0m\n' "$_env_val" >&2
+        printf '%s' "$_env_val"
+        return 0
       else
-        ok "Mail-VPS-IP auto-ermittelt: ${MAIL_VPS_IP}"
+        printf '  \033[1;33m⚠ MAIL_VPS_IP="%s" ist kein gültiges IPv4-Format — Override ignoriert, Auto-Detect startet.\033[0m\n' \
+          "$_env_val" >&2
+        # Fall through to auto-detect
       fi
     fi
+
+    # ---- Teil A: Externe-Echo-Kette (primär) ----
+    local _echo_ip="" _echo_source=""
+    local _echo_urls=(
+      "https://api.ipify.org"
+      "https://ifconfig.me"
+      "https://icanhazip.com"
+      "https://ifconfig.co"
+    )
+    local _url _raw _candidate
+    for _url in "${_echo_urls[@]}"; do
+      _raw="$(curl -fsS --max-time 5 "$_url")" || continue
+      _candidate="$(printf '%s' "$_raw" | tr -d '[:space:]')"
+      if _is_valid_ipv4 "$_candidate"; then
+        _echo_ip="$_candidate"
+        _echo_source="$_url"
+        printf '  \033[1;32m  ✓ Echo-IP ermittelt via %s: %s\033[0m\n' "$_echo_source" "$_echo_ip" >&2
+        break
+      fi
+    done
+
+    # ---- Teil B: hcloud-Cross-Check (optional, nur wenn Token + CLI vorhanden) ----
+    local _hcloud_ip=""
+    local _hcloud_token
+    _hcloud_token="${HCLOUD_TOKEN:-}"
+
+    if [[ -n "$_hcloud_token" ]] && command -v hcloud >/dev/null 2>&1; then
+      # Server-Name aus MAIL_HOSTNAME ableiten: Hostname-Teil vor erstem '.'
+      # z.B. "mail.alexstuder.cloud" → "mail"
+      local _mail_srv_name="${MAIL_HOSTNAME%%.*}"
+
+      # Server-Liste holen; HCLOUD_TOKEN ausschließlich als Env, NIE als argv
+      # S-1: Namen-Ableitung vorab loggen — Hostname-Mismatch (z.B. "mail.dom" → suche "mail") selbstdokumentiert
+      printf '  hcloud: suche Server mit Name "%s" ...\n' "$_mail_srv_name" >&2
+      local _server_list
+      _server_list="$(HCLOUD_TOKEN="$_hcloud_token" hcloud server list -o columns=name -o noheader)" || {
+        printf '  \033[1;33m⚠ hcloud server list fehlgeschlagen — Cross-Check übersprungen.\033[0m\n' >&2
+        _server_list=""
+      }
+
+      if [[ -n "$_server_list" ]]; then
+        local _server_count
+        _server_count="$(printf '%s\n' "$_server_list" | grep -c '[^[:space:]]' || true)" # || true: grep -c gibt 1 bei 0 Treffern zurück, pipefail würde abort
+        local _match_name=""
+
+        if (( _server_count == 1 )); then
+          # Genau 1 Server → den nehmen (egal ob Name passt oder nicht)
+          _match_name="$(printf '%s\n' "$_server_list" | grep '[^[:space:]]' | head -1)"
+          printf '  Nur 1 hcloud-Server (%s) — Cross-Check mit diesem Server.\n' "$_match_name" >&2
+        else
+          # Mehrere Server → nach Name-Match suchen
+          _match_name="$(printf '%s\n' "$_server_list" | grep -x "$_mail_srv_name" || true)"
+          if [[ -z "$_match_name" ]]; then
+            printf '  \033[1;33m⚠ hcloud: %s Server gefunden, kein Name-Match für "%s" — Cross-Check nicht eindeutig, übersprungen.\033[0m\n' \
+              "$_server_count" "$_mail_srv_name" >&2
+          fi
+        fi
+
+        if [[ -n "$_match_name" ]]; then
+          local _hcloud_raw
+          _hcloud_raw="$(HCLOUD_TOKEN="$_hcloud_token" hcloud server describe "$_match_name" \
+            -o 'format={{.PublicNet.IPv4.IP}}')" || {
+            printf '  \033[1;33m⚠ hcloud server describe "%s" fehlgeschlagen — Cross-Check übersprungen.\033[0m\n' \
+              "$_match_name" >&2
+            _hcloud_raw=""
+          }
+          local _hcloud_candidate
+          _hcloud_candidate="$(printf '%s' "$_hcloud_raw" | tr -d '[:space:]')"
+          if _is_valid_ipv4 "$_hcloud_candidate"; then
+            _hcloud_ip="$_hcloud_candidate"
+            printf '  hcloud-IP für Server "%s": %s\n' "$_match_name" "$_hcloud_ip" >&2
+          else
+            printf '  \033[1;33m⚠ hcloud lieferte keine gültige IPv4 für Server "%s" ("%s") — Cross-Check übersprungen.\033[0m\n' \
+              "$_match_name" "$_hcloud_candidate" >&2
+          fi
+        fi
+      fi
+    fi
+
+    # ---- Vergleichslogik (alle 4 Pfade) ----
+    if [[ -n "$_echo_ip" && -n "$_hcloud_ip" ]]; then
+      if [[ "$_echo_ip" == "$_hcloud_ip" ]]; then
+        printf '  \033[1;32m  ✓ Cross-Check OK: Echo und hcloud stimmen überein (%s).\033[0m\n' \
+          "$_echo_ip" >&2
+      else
+        printf '  \033[1;33m⚠ Cross-Check ABWEICHUNG: Echo=%s (via %s), hcloud=%s — Echo-Wert wird verwendet (externer Sichtwinkel).\033[0m\n' \
+          "$_echo_ip" "$_echo_source" "$_hcloud_ip" >&2
+      fi
+      printf '%s' "$_echo_ip"
+
+    elif [[ -n "$_echo_ip" && -z "$_hcloud_ip" ]]; then
+      printf '  Kein hcloud-Cross-Check (n/v oder nicht eindeutig) — Echo-Wert wird verwendet.\n' >&2
+      printf '%s' "$_echo_ip"
+
+    elif [[ -z "$_echo_ip" && -n "$_hcloud_ip" ]]; then
+      printf '  \033[1;33m⚠ Alle Echo-Quellen nicht erreichbar — hcloud-IP wird verwendet: %s\033[0m\n' \
+        "$_hcloud_ip" >&2
+      printf '%s' "$_hcloud_ip"
+
+    else
+      # Beide leer
+      printf '  \033[1;33m⚠ VPS-IP konnte weder via Echo noch via hcloud ermittelt werden.\033[0m\n' >&2
+      printf '  Optionen:\n' >&2
+      printf '    1) MAIL_VPS_IP=<IPv4> in .env.gpg setzen (manueller Override).\n' >&2
+      printf '    2) Internet-Egress des VPS prüfen (curl https://api.ipify.org).\n' >&2
+      printf '    3) HCLOUD_TOKEN in .env.gpg setzen UND hcloud CLI installieren für Cross-Check.\n' >&2
+      return 0 # leere stdout → Aufrufer erkennt Fehler
+    fi
+  }
+
+  # ---- VPS-IP ermitteln — _resolve_mail_vps_ip besitzt alle Validation-Logik ----
+  # Pfade (alle inside _resolve_mail_vps_ip):
+  #   konkrete gültige IPv4   → Override, kein Echo, kein hcloud
+  #   ungültiger Wert         → Warnung >&2 + Auto-Detect-Fallback
+  #   leer ODER literal "auto"→ Auto-Detect (Echo-Kette + optionaler hcloud-Cross-Check)
+  MAIL_VPS_IP="$(_resolve_mail_vps_ip "${MAIL_VPS_IP:-}")"
+  if [[ -n "$MAIL_VPS_IP" ]]; then
+    ok "Mail-VPS-IP ermittelt: ${MAIL_VPS_IP}"
+  else
+    printf '  Mail-DNS (A-Record) wird übersprungen.\n' >&2
   fi
 
   # ---- Hilfsfunktion: DNS-Record idempotent anlegen/aktualisieren ----
