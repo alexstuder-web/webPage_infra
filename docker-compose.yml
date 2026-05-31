@@ -608,7 +608,10 @@ services:
     tmpfs:
       - /var/lib/rspamd
     volumes:
-      - /etc/localtime:/etc/localtime:ro
+      # /etc/localtime Bind-Mount entfernt (FIX 4, 2026-05-31):
+      # posteio 2.5 versucht intern 'cp /etc/localtime' — schlägt mit :ro-Mount fehl
+      # (Read-only file system). TZ: Europe/Zurich via environment: reicht für
+      # jeden vernünftigen Linux-Container; der Bind-Mount war redundant und cosmetisch störend.
       - ./poste-data:/data
     networks:
       - brewing_net

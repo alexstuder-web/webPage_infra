@@ -534,7 +534,70 @@ EOSU
     echo "  portainer läuft nicht — Backfill übersprungen (Marker wird beim Hub-Start gesetzt)."
   fi
 
+  # ---------------------------------------------------------------- SSH-Pubkeys einrichten (idempotent)
+  _install_ssh_pubkeys
+
 } # end run_base_bootstrap
+
+# ================================================================
+# SSH-PUBKEY INSTALL (idempotent, kein GPG/Secret nötig)
+# Liest authorized_keys.alex aus APP_DIR, filtert Kommentare/Leer-Zeilen,
+# trägt jeden noch fehlenden Key in /home/alex/.ssh/authorized_keys ein.
+# Marker: /etc/brewing/ssh_pubkeys_installed_v1
+# Bei fehlendem authorized_keys.alex: WARN + skip ohne Abort.
+# ================================================================
+_install_ssh_pubkeys() {
+  local pubkeys_file="${APP_DIR}/authorized_keys.alex"
+  local auth_keys_dir="${APP_HOME}/.ssh"
+  local auth_keys_file="${auth_keys_dir}/authorized_keys"
+  local marker="/etc/brewing/ssh_pubkeys_installed_v1"
+
+  if [[ ! -f "$pubkeys_file" ]]; then
+    printf '  \033[1;33m⚠ %s nicht gefunden — SSH-Pubkey-Install übersprungen.\033[0m\n' "$pubkeys_file"
+    printf '  Pubkeys anlegen: %s (eine Key-Zeile pro Zeile, #-Kommentare erlaubt)\033[0m\n' "$pubkeys_file"
+    return 0
+  fi
+
+  # .ssh-Verzeichnis sicherstellen
+  if [[ ! -d "$auth_keys_dir" ]]; then
+    install -d -m 700 -o "$APP_USER" -g "$APP_USER" "$auth_keys_dir"
+  else
+    chmod 700 "$auth_keys_dir"
+    chown "${APP_USER}:${APP_USER}" "$auth_keys_dir"
+  fi
+
+  # authorized_keys sicherstellen
+  if [[ ! -f "$auth_keys_file" ]]; then
+    install -m 600 -o "$APP_USER" -g "$APP_USER" /dev/null "$auth_keys_file"
+  else
+    chmod 600 "$auth_keys_file"
+    chown "${APP_USER}:${APP_USER}" "$auth_keys_file"
+  fi
+
+  local added=0 skipped=0
+  # Zeilen lesen: leere Zeilen und #-Kommentare herausfiltern
+  while IFS= read -r line; do
+    # Leer- oder Kommentarzeilen überspringen
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    # Idempotenz: Key schon vorhanden?
+    if grep -qxF "$line" "$auth_keys_file" 2>/dev/null; then
+      (( skipped++ )) || true
+    else
+      printf '%s\n' "$line" >> "$auth_keys_file"
+      (( added++ )) || true
+    fi
+  done < "$pubkeys_file"
+
+  # Permissions nach dem Schreiben sicherstellen (defensiv)
+  chmod 600 "$auth_keys_file"
+  chown "${APP_USER}:${APP_USER}" "$auth_keys_file"
+
+  ok "SSH-Pubkeys: ${added} neu eingetragen, ${skipped} bereits vorhanden — ${auth_keys_file}"
+
+  # Marker setzen (v1 — bei Key-Rotation auf v2 bumpen um Re-Run zu erzwingen)
+  touch "$marker"
+  chmod 644 "$marker"
+}
 
 # ================================================================
 # CLOUDFLARE TUNNEL-ENSURE HELPER
@@ -922,12 +985,12 @@ EOSU
   # falsche Ownership maskieren und ein folgendes touch bei unbeschreibbarem Pfad
   # bricht unter set -euo pipefail ab).
   [[ -d /etc/brewing ]] || install -d -m 711 -o root -g root /etc/brewing
-  # Mode 600 setzen BEVOR der Token hineingeschrieben wird.
-  touch "$cf_ini"
-  chmod 600 "$cf_ini"
-  chown root:root "$cf_ini"
+  # S-1 FIX: atomar install statt touch+chmod+chown — kein world-readable window.
+  install -m 600 -o root -g root /dev/null "$cf_ini"
   # Token direkt schreiben (kein echo/set -x, kein Log des Inhalts).
   printf 'dns_cloudflare_api_token = %s\n' "$cf_api_token" > "$cf_ini"
+  # S-2 FIX: Token aus dem Prozess-Memory entfernen (konsistent mit cf_ensure_tunnel_if_token).
+  unset cf_api_token
   ok "CF-Credentials: ${cf_ini} (mode 600, owner root)"
 
   # Cert bereits vorhanden und gültig? (idempotent)
@@ -958,48 +1021,67 @@ EOSU
     ok "certbot: Cert für ${mail_hostname} ausgestellt"
   fi
 
-  # Cert in Container deployen (Poste.io 2.x erwartet Cert unter /data/ssl/).
-  # Pfad-Konvention für analogic/poste.io 2.x:
-  #   /data/ssl/server-combined.crt = fullchain (Cert + Chain)
-  #   /data/ssl/server.key          = privater Schlüssel
+  # Cert in Container deployen (Poste.io 2.5 erwartet 3 separate Files unter /data/ssl/).
+  # Pfad-Konvention für analogic/poste.io 2.5 (aus /etc/cont-init.d/21-certificate.sh verifiziert):
+  #   /data/ssl/server.crt = Leaf-Cert  (LE: cert.pem)
+  #   /data/ssl/ca.crt     = Intermediate-Chain (LE: chain.pem)
+  #   /data/ssl/server.key = privater Schlüssel  (LE: privkey.pem)
+  # posteio baut server-combined.crt intern (in /etc/ssl/) aus diesen 3 Files SELBST —
+  # wir dürfen /data/ssl/server-combined.crt NICHT schreiben (posteio überschreibt es).
+  # Triple-Existence-Check in 21-certificate.sh: alle 3 müssen vorhanden sein.
+  # Restart: MUSS docker stop + docker start sein (nicht 'docker restart') —
+  # nur stop+start läuft cont-init.d-Scripts neu, was die 3 Files zu /etc/ssl/ + Haraka verarbeitet.
   log "Cert in posteio-Container deployen (/data/ssl/)"
   if docker inspect --format='{{.State.Running}}' posteio 2>/dev/null | grep -q '^true$'; then
     # -L: Symlinks dereferenzieren — /etc/letsencrypt/live/<domain>/*.pem sind Symlinks
     # auf ../../archive/<domain>/...; ohne -L kopiert docker cp den Symlink selbst,
     # der im Container ins Nichts zeigt → posteio fällt auf Self-Signed-Cert zurück.
-    docker cp -L "${cert_path}/fullchain.pem" "posteio:/data/ssl/server-combined.crt" \
-      || { printf '  \033[1;33m⚠ docker cp -L fullchain fehlgeschlagen\033[0m\n'; }
-    docker cp -L "${cert_path}/privkey.pem"   "posteio:/data/ssl/server.key" \
-      || { printf '  \033[1;33m⚠ docker cp -L privkey fehlgeschlagen\033[0m\n'; }
-    # Verify: Datei muss existieren, nicht-leer sein und mit PEM-Header beginnen.
-    # Nur wenn beide Dateien valide sind → restart + ok. Sonst Fehlermeldung ohne ok.
-    local _cert_ok=0 _key_ok=0
-    docker exec posteio test -s /data/ssl/server-combined.crt \
+    docker cp -L "${cert_path}/cert.pem"    "posteio:/data/ssl/server.crt" \
+      || { printf '  \033[1;33m⚠ docker cp -L cert.pem fehlgeschlagen\033[0m\n'; }
+    docker cp -L "${cert_path}/chain.pem"   "posteio:/data/ssl/ca.crt" \
+      || { printf '  \033[1;33m⚠ docker cp -L chain.pem fehlgeschlagen\033[0m\n'; }
+    docker cp -L "${cert_path}/privkey.pem" "posteio:/data/ssl/server.key" \
+      || { printf '  \033[1;33m⚠ docker cp -L privkey.pem fehlgeschlagen\033[0m\n'; }
+    # Verify: alle 3 Files müssen existieren, nicht-leer sein und mit PEM-Header beginnen.
+    # Nur wenn alle 3 valide → stop+start + ok. Sonst Fehlermeldung ohne ok.
+    local _cert_ok=0 _ca_ok=0 _key_ok=0
+    docker exec posteio test -s /data/ssl/server.crt \
       && docker exec posteio sh -c \
-           'head -c 28 /data/ssl/server-combined.crt | grep -q "^-----BEGIN CERTIFICATE"' \
+           'head -c 28 /data/ssl/server.crt | grep -q "^-----BEGIN CERTIFICATE"' \
       && _cert_ok=1 || _cert_ok=0
+    docker exec posteio test -s /data/ssl/ca.crt \
+      && docker exec posteio sh -c \
+           'head -c 28 /data/ssl/ca.crt | grep -q "^-----BEGIN CERTIFICATE"' \
+      && _ca_ok=1 || _ca_ok=0
     docker exec posteio test -s /data/ssl/server.key \
       && docker exec posteio sh -c \
            'head -c 27 /data/ssl/server.key | grep -q "^-----BEGIN "' \
       && _key_ok=1 || _key_ok=0
-    if (( _cert_ok == 1 && _key_ok == 1 )); then
-      docker restart posteio >/dev/null \
-        || { printf '  \033[1;33m⚠ docker restart posteio fehlgeschlagen\033[0m\n'; }
-      ok "Cert in posteio deployet + Container restartet"
+    if (( _cert_ok == 1 && _ca_ok == 1 && _key_ok == 1 )); then
+      # stop+start (nicht 'docker restart') — nur stop+start führt cont-init.d neu aus,
+      # was 21-certificate.sh die 3 Files zu /etc/ssl/ + Haraka-Symlinks verarbeiten lässt.
+      if docker stop posteio >/dev/null && docker start posteio >/dev/null; then
+        ok "Cert in posteio deployet (3 Files) + Container stop+start"
+      else
+        printf '  \033[1;33m⚠ docker stop/start posteio fehlgeschlagen\033[0m\n'
+      fi
     else
       printf '  \033[1;31m✗ Cert-Verify fehlgeschlagen:\033[0m\n' >&2
-      (( _cert_ok == 0 )) && printf '  \033[1;31m  server-combined.crt ist kein gueltiges PEM-Cert (cert_ok=0)\033[0m\n' >&2
+      (( _cert_ok == 0 )) && printf '  \033[1;31m  server.crt ist kein gueltiges PEM-Cert (cert_ok=0)\033[0m\n' >&2
+      (( _ca_ok  == 0 )) && printf '  \033[1;31m  ca.crt ist kein gueltiges PEM-Cert (ca_ok=0)\033[0m\n' >&2
       (( _key_ok  == 0 )) && printf '  \033[1;31m  server.key ist kein gueltiger PEM-Key (key_ok=0)\033[0m\n' >&2
       printf '  Posteio laeuft mit Default-Cert. docker cp -L manuell pruefen:\033[0m\n' >&2
-      printf '    docker cp -L %s/fullchain.pem posteio:/data/ssl/server-combined.crt\033[0m\n' "$cert_path" >&2
-      printf '    docker cp -L %s/privkey.pem   posteio:/data/ssl/server.key\033[0m\n' "$cert_path" >&2
+      printf '    docker cp -L %s/cert.pem    posteio:/data/ssl/server.crt\033[0m\n' "$cert_path" >&2
+      printf '    docker cp -L %s/chain.pem   posteio:/data/ssl/ca.crt\033[0m\n' "$cert_path" >&2
+      printf '    docker cp -L %s/privkey.pem posteio:/data/ssl/server.key\033[0m\n' "$cert_path" >&2
     fi
   else
     printf '  \033[1;33m⚠ posteio laeuft nicht — Cert-Deploy uebersprungen.\033[0m\n'
     printf '  Cert liegt in %s — nach Start von posteio deployen:\033[0m\n' "$cert_path"
-    printf '    docker cp -L %s/fullchain.pem posteio:/data/ssl/server-combined.crt\033[0m\n' "$cert_path"
-    printf '    docker cp -L %s/privkey.pem   posteio:/data/ssl/server.key\033[0m\n' "$cert_path"
-    printf '    docker restart posteio\033[0m\n'
+    printf '    docker cp -L %s/cert.pem    posteio:/data/ssl/server.crt\033[0m\n' "$cert_path"
+    printf '    docker cp -L %s/chain.pem   posteio:/data/ssl/ca.crt\033[0m\n' "$cert_path"
+    printf '    docker cp -L %s/privkey.pem posteio:/data/ssl/server.key\033[0m\n' "$cert_path"
+    printf '    docker stop posteio && docker start posteio\033[0m\n'
   fi
 
   # Renew-Cron-Drop-in (wöchentlicher Versuch + Deploy-Hook, idempotent)
@@ -1017,20 +1099,24 @@ EOSU
 #!/usr/bin/env bash
 # Mail-Cert-Deploy-Hook: nach certbot-Renew in posteio-Container kopieren.
 # Wird von certbot via --deploy-hook oder aus dem Renew-Cron aufgerufen.
+# Poste.io 2.5 erwartet 3 separate Files: server.crt (cert), ca.crt (chain), server.key.
+# stop+start (nicht restart) damit cont-init.d/21-certificate.sh die Files verarbeitet.
 set -euo pipefail
 MAIL_HOSTNAME="${mail_hostname}"
 CERT_PATH="/etc/letsencrypt/live/\${MAIL_HOSTNAME}"
 if docker inspect --format='{{.State.Running}}' posteio 2>/dev/null | grep -q '^true\$'; then
   # -L: Let's-Encrypt live-Pfade sind Symlinks — ohne -L kopiert docker cp den Symlink.
-  docker cp -L "\${CERT_PATH}/fullchain.pem" "posteio:/data/ssl/server-combined.crt"
-  docker cp -L "\${CERT_PATH}/privkey.pem"   "posteio:/data/ssl/server.key"
-  # Verify vor Restart — sonst potentiell silenter Restart mit falschem Cert.
-  if docker exec posteio sh -c 'head -c 28 /data/ssl/server-combined.crt | grep -q "^-----BEGIN CERTIFICATE"' \
+  docker cp -L "\${CERT_PATH}/cert.pem"    "posteio:/data/ssl/server.crt"
+  docker cp -L "\${CERT_PATH}/chain.pem"   "posteio:/data/ssl/ca.crt"
+  docker cp -L "\${CERT_PATH}/privkey.pem" "posteio:/data/ssl/server.key"
+  # Verify aller 3 Files vor stop+start — sonst potentiell silenter Start mit falschem Cert.
+  if docker exec posteio sh -c 'head -c 28 /data/ssl/server.crt | grep -q "^-----BEGIN CERTIFICATE"' \
+     && docker exec posteio sh -c 'head -c 28 /data/ssl/ca.crt | grep -q "^-----BEGIN CERTIFICATE"' \
      && docker exec posteio sh -c 'head -c 27 /data/ssl/server.key | grep -q "^-----BEGIN "'; then
-    docker restart posteio >/dev/null
-    echo "certbot-deploy-hook: Cert in posteio deployet + restart OK"
+    docker stop posteio >/dev/null && docker start posteio >/dev/null
+    echo "certbot-deploy-hook: Cert in posteio deployet (3 Files) + stop+start OK"
   else
-    echo "certbot-deploy-hook: Cert-Verify fehlgeschlagen — Restart uebersprungen, posteio laeuft mit altem Cert" >&2
+    echo "certbot-deploy-hook: Cert-Verify fehlgeschlagen — Stop+Start uebersprungen, posteio laeuft mit altem Cert" >&2
     exit 1
   fi
 else
@@ -1060,7 +1146,8 @@ SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 CF_INI="${cf_ini}"
 HOOK="${deploy_hook_script}"
-30 2 * * 0 root certbot renew --cert-name ${mail_hostname} --dns-cloudflare --dns-cloudflare-credentials "\$CF_INI" --non-interactive --deploy-hook "\$HOOK" --quiet >> /var/log/certbot-mail.log 2>&1
+CERT_NAME="${mail_hostname}"
+30 2 * * 0 root certbot renew --cert-name "\$CERT_NAME" --dns-cloudflare --dns-cloudflare-credentials "\$CF_INI" --non-interactive --deploy-hook "\$HOOK" --quiet >> /var/log/certbot-mail.log 2>&1
 EOF
   chmod 644 "$renew_cron"
   touch /var/log/certbot-mail.log
@@ -1071,16 +1158,17 @@ EOF
   # Bei Token-Rotation: neues .env → bootstrap erneut → cf_ini wird überschrieben.
 }
 
-# ---------------------------------------------------------------- Postausgang-Relay in Poste.io konfigurieren
-# Schreibt SMTP_RELAY_HOST/PORT/USERNAME/PASSWORD aus .env in Poste.ios Settings-Datei
-# (/data/admin/settings) via docker exec — nicht-interaktiv, reproduzierbar.
-# Secret (SMTP_RELAY_PASSWORD) wird NICHT in argv/log ausgegeben.
-# Fallback: falls Mechanismus nicht verfügbar → UI-Hinweis ausgeben, sauber fortfahren.
+# ---------------------------------------------------------------- Postausgang-Relay Hinweis-Block
+# Poste.io 2.5 verwaltet Smarthost-Settings NUR via Admin-UI (kein dokumentierter
+# File-Patch-Pfad — /data/admin/settings existiert nicht, Settings liegen in SQLite users.db).
+# Ein automatisierter Patch ist daher nicht verlässlich implementierbar.
+# Diese Funktion gibt einen präzisen manuellen Schritt-Hinweis aus.
+# SMTP_RELAY_PASSWORD wird NICHT gelesen — kein Secret fliesst durch diesen Pfad.
 _mail_configure_relay() {
-  log "Postausgang-Relay (Smarthost) in Poste.io konfigurieren"
+  log "Postausgang-Relay (Smarthost) — manueller Schritt erforderlich"
 
-  # Relay-Vars aus .env lesen (nicht-sensitive via Pipe, relay_pass ebenfalls via Pipe weiter unten).
-  local relay_host relay_port relay_user
+  # Nur nicht-sensitive Werte aus .env lesen (für den Hinweis-Block)
+  local relay_host relay_port relay_user mail_domain poste_admin
   relay_host="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
 grep -E '^SMTP_RELAY_HOST=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true
 EOSU
@@ -1093,128 +1181,31 @@ EOSU
 grep -E '^SMTP_RELAY_USERNAME=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true
 EOSU
 )"
-  # SMTP_RELAY_PASSWORD: sensitiv — via in-Memory-Pipe aus sudo-alex-Subshell lesen.
-  # Kein Tempfile-Umweg: root-mktemp + alex-write verstösst gegen fs.protected_regular=2
-  # (Lesson 2026-05-26). Pipe ist in-Memory, taucht nicht in ps/docker inspect/Logs auf.
-  local relay_pass
-  relay_pass="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
-grep -E '^SMTP_RELAY_PASSWORD=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true
+  mail_domain="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+grep -E '^MAIL_DOMAIN=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true
 EOSU
 )"
-
-  # Guard: wenn kein Relay-Host gesetzt → Skip (Relay optional)
-  if [[ -z "$relay_host" ]]; then
-    echo "  SMTP_RELAY_HOST nicht gesetzt — Smarthost-Konfiguration übersprungen."
-    echo "  Ohne Relay kein externer Postausgang (nur Empfang/intern)."
-    return 0
-  fi
-
+  poste_admin="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+grep -E '^POSTE_ADMIN_EMAIL=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true
+EOSU
+)"
+  mail_domain="${mail_domain:-alexstuder.cloud}"
+  relay_host="${relay_host:-smtp-relay.brevo.com}"
   relay_port="${relay_port:-587}"
-  ok "Relay: ${relay_host}:${relay_port} (User: ${relay_user:-<leer>})"
+  relay_user="${relay_user:-<SMTP_RELAY_USERNAME aus .env>}"
+  poste_admin="${poste_admin:-admin@${mail_domain}}"
 
-  # Mechanismus: Poste.io 2.x schreibt Smarthost-Einstellungen in
-  # /data/admin/settings (JSON-Datei unter poste-data).
-  # Wir patchen diese Datei direkt via docker exec (jq im Container oder python3).
-  # Falls der Pfad/das Format sich ändert: Fallback auf UI-Hinweis.
-  local settings_path="/data/admin/settings"
-  local _patch_ok=0
-
-  # Prüfen ob posteio läuft
-  if ! docker inspect --format='{{.State.Running}}' posteio 2>/dev/null | grep -q '^true$'; then
-    printf '  \033[1;33m⚠ posteio läuft nicht — Relay-Konfiguration übersprungen.\033[0m\n'
-    printf '  Nach Start von posteio bootstrap erneut ausführen oder Relay manuell in der UI setzen.\n'
-    return 0
-  fi
-
-  # Prüfen ob Settings-Datei existiert
-  if docker exec posteio test -f "$settings_path" 2>/dev/null; then
-    # Settings-Datei patchen via python3 (im Container verfügbar in poste.io 2.x)
-    #
-    # I-1 FIX: Stop-Wort literal gequotet (<<'PYEOF') → kein Bash-Interpolation im
-    # Heredoc-Body. Alle Werte werden als Umgebungsvariablen via docker exec -e übergeben
-    # und in Python über os.environ[] gelesen. Keine Variable landet im Heredoc-Text.
-    #
-    # S-1 FIX: Container-Temp-Pfad via mktemp (statt $$), Unlink in finally-Block.
-    # Das Passwort wird per Stdin in den Container geschrieben (nicht als -e-Arg),
-    # damit es nicht in 'docker inspect' oder 'ps' sichtbar ist.
-    local relay_pass_container_tmp
-    relay_pass_container_tmp="$(docker exec posteio mktemp /tmp/.relay_pass_XXXXXX)"
-    # chmod 600 VOR dem Schreiben (Lesson 2026-05-24: write-then-chmod ist falsch).
-    docker exec posteio chmod 600 "$relay_pass_container_tmp"
-    # Passwort über printf | docker exec -i einschreiben (Stdin, nicht argv, nicht env).
-    printf '%s' "$relay_pass" \
-      | docker exec -i posteio bash -c "cat > '${relay_pass_container_tmp}'"
-
-    # Alle Werte außer dem Passwort sicher als Env-Vars übergeben.
-    # Das Passwort bleibt im Container-Tempfile — wird von Python via os.environ['RELAY_PASS_FILE']
-    # gelesen und in einem finally:-Block gelöscht.
-    # Heredoc-Stop-Wort gequotet → kein Bash-Interpolation.
-    docker exec \
-      -e RELAY_SETTINGS_PATH="$settings_path" \
-      -e RELAY_PASS_FILE="$relay_pass_container_tmp" \
-      -e RELAY_HOST="$relay_host" \
-      -e RELAY_PORT="$relay_port" \
-      -e RELAY_USER="$relay_user" \
-      posteio python3 - <<'PYEOF' && _patch_ok=1 || _patch_ok=0
-import json, os, sys
-
-settings_path = os.environ['RELAY_SETTINGS_PATH']
-relay_pass_file = os.environ['RELAY_PASS_FILE']
-relay_host = os.environ['RELAY_HOST']
-relay_port = int(os.environ['RELAY_PORT'])
-relay_user = os.environ['RELAY_USER']
-
-relay_pass = ''
-try:
-    with open(relay_pass_file, 'r') as f:
-        relay_pass = f.read().strip()
-finally:
-    try:
-        os.unlink(relay_pass_file)
-    except OSError:
-        pass
-
-try:
-    with open(settings_path, 'r') as f:
-        settings = json.load(f)
-except Exception:
-    settings = {}
-
-# Poste.io 2.x Smarthost-Keys (aus Community-Dokumentation verifiziert)
-settings['smarthost'] = relay_host
-settings['smarthostPort'] = relay_port
-settings['smarthostUsername'] = relay_user
-settings['smarthostPassword'] = relay_pass
-
-with open(settings_path, 'w') as f:
-    json.dump(settings, f, indent=2)
-
-print('Smarthost-Config geschrieben: {}:{} user={}'.format(relay_host, relay_port, relay_user))
-PYEOF
-
-    if (( _patch_ok == 1 )); then
-      # Container restarten damit Poste.io die neue Config lädt
-      docker restart posteio >/dev/null \
-        && ok "Smarthost-Config in Poste.io gesetzt (${relay_host}:${relay_port}) + Container restartet" \
-        || printf '  \033[1;33m⚠ docker restart nach Relay-Konfig fehlgeschlagen — manuell restarten.\033[0m\n'
-    else
-      # Cleanup des temp-Files im Container (falls python3 fehlschlug vor finally:-Block)
-      docker exec posteio rm -f "$relay_pass_container_tmp" 2>/dev/null || true
-    fi
-  fi
-
-  if (( _patch_ok == 0 )); then
-    # Fallback: UI-Hinweis ausgeben
-    printf '\n  \033[1;33m⚠ Automatische Smarthost-Konfiguration nicht möglich\033[0m\n'
-    printf '  (Settings-Datei %s nicht gefunden oder python3-Patch fehlgeschlagen).\033[0m\n' "$settings_path"
-    printf '  \033[1;34mBitte Relay manuell in der Poste.io-UI einrichten:\033[0m\n'
-    printf '    1. https://webmail.%s aufrufen (Admin-Login)\033[0m\n' "${MAIL_DOMAIN:-alexstuder.cloud}"
-    printf '    2. Administration → Smarthost / Relay\033[0m\n'
-    printf '    3. Host: %s\033[0m\n' "$relay_host"
-    printf '    4. Port: %s\033[0m\n' "$relay_port"
-    printf '    5. Username: %s  (Passwort aus .env: SMTP_RELAY_PASSWORD)\033[0m\n' "$relay_user"
-    printf '    6. TLS/STARTTLS aktivieren\033[0m\n'
-  fi
+  printf '\n  \033[1;34m► Postausgang-Relay (Smarthost) — manueller Schritt:\033[0m\n'
+  printf '  Poste.io 2.5 verwaltet Smarthost-Settings nur via Admin-UI\033[0m\n'
+  printf '  (kein automatisierter Datei-Patch verfügbar — Settings liegen in SQLite).\033[0m\n'
+  printf '  Bitte einmalig manuell setzen:\033[0m\n'
+  printf '    1. Webmail öffnen: https://webmail.%s\033[0m\n' "$mail_domain"
+  printf '    2. Login als %s\033[0m\n' "$poste_admin"
+  printf '    3. Administration → Server settings → SMTP-Relay\033[0m\n'
+  printf '    4. Host: %s  Port: %s\033[0m\n' "$relay_host" "$relay_port"
+  printf '       Username: %s  Password: <SMTP_RELAY_PASSWORD aus .env.gpg / Bitwarden>\033[0m\n' "$relay_user"
+  printf '    5. Speichern + Test-Mail senden\033[0m\n'
+  printf '  Wert für SMTP_RELAY_PASSWORD: nie im Klartext loggen oder im UI screenshoten.\033[0m\n\n'
 }
 
 # ================================================================

@@ -1,0 +1,9 @@
+# SSH public keys for user 'alex' on the VPS.
+# Installed by bootstrap.sh _install_ssh_pubkeys (idempotent, marker: /etc/brewing/ssh_pubkeys_installed_v1).
+# Public keys are NOT secrets — this file is committed plaintext.
+# One key per line; lines starting with '#' or empty lines are ignored.
+# To rotate: add/remove keys here, bump marker name in _install_ssh_pubkeys to ssh_pubkeys_installed_v2
+# and run bootstrap.sh again — existing keys are never removed, only new ones appended.
+
+# Claude / alex@alexstuder.ch — Dev-Mac, fuer autonome SSH-Diagnose
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN/2vYYUUeveJAdhNP1cu/70QgyTtCkGJJtFRg++vqqo alex@alexstuder.ch
