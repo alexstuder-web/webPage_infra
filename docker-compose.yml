@@ -589,7 +589,7 @@ services:
 
   posteio:
     container_name: posteio
-    image: analogic/poste.io:2.4
+    image: analogic/poste.io:2.5.12
     # profiles: [mail] — Mail-Server nicht beim dev-up mitgestartet (kein Port 25/465/… lokal).
     # Starten: docker compose --profile mail up -d posteio
     # (Bootstrap: via TUI-Option "Mailserver (Poste.io)")

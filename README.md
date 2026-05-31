@@ -72,7 +72,7 @@ eigene Netze, Volumes, Secrets und Ports.
 | `watchtower` | `containrrr/watchtower:latest` | self-update · `profiles: [vps]` |
 | `portainer` | `portainer/portainer-ce:2.27.3` | manuell · `profiles: [portainer-hub]` |
 | `portainer_edge_agent` | `portainer/agent:2.27.3` | manuell · `profiles: [portainer-agent]` |
-| `posteio` | `analogic/poste.io:2.4` | manuell · `profiles: [mail]` |
+| `posteio` | `analogic/poste.io:2.5.12` | manuell · `profiles: [mail]` |
 
 App-Container haben das Label `com.centurylinklabs.watchtower.enable=true` →
 Watchtower zieht alle 5 Min neue `:latest` Images. Supabase, cloudflared, Portainer
