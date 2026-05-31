@@ -964,18 +964,41 @@ EOSU
   #   /data/ssl/server.key          = privater Schlüssel
   log "Cert in posteio-Container deployen (/data/ssl/)"
   if docker inspect --format='{{.State.Running}}' posteio 2>/dev/null | grep -q '^true$'; then
-    docker cp "${cert_path}/fullchain.pem" "posteio:/data/ssl/server-combined.crt" \
-      || { printf '  \033[1;33m⚠ docker cp fullchain fehlgeschlagen\033[0m\n'; }
-    docker cp "${cert_path}/privkey.pem"   "posteio:/data/ssl/server.key" \
-      || { printf '  \033[1;33m⚠ docker cp privkey fehlgeschlagen\033[0m\n'; }
-    docker restart posteio >/dev/null \
-      || { printf '  \033[1;33m⚠ docker restart posteio fehlgeschlagen\033[0m\n'; }
-    ok "Cert in posteio deployet + Container restartet"
+    # -L: Symlinks dereferenzieren — /etc/letsencrypt/live/<domain>/*.pem sind Symlinks
+    # auf ../../archive/<domain>/...; ohne -L kopiert docker cp den Symlink selbst,
+    # der im Container ins Nichts zeigt → posteio fällt auf Self-Signed-Cert zurück.
+    docker cp -L "${cert_path}/fullchain.pem" "posteio:/data/ssl/server-combined.crt" \
+      || { printf '  \033[1;33m⚠ docker cp -L fullchain fehlgeschlagen\033[0m\n'; }
+    docker cp -L "${cert_path}/privkey.pem"   "posteio:/data/ssl/server.key" \
+      || { printf '  \033[1;33m⚠ docker cp -L privkey fehlgeschlagen\033[0m\n'; }
+    # Verify: Datei muss existieren, nicht-leer sein und mit PEM-Header beginnen.
+    # Nur wenn beide Dateien valide sind → restart + ok. Sonst Fehlermeldung ohne ok.
+    local _cert_ok=0 _key_ok=0
+    docker exec posteio test -s /data/ssl/server-combined.crt \
+      && docker exec posteio sh -c \
+           'head -c 28 /data/ssl/server-combined.crt | grep -q "^-----BEGIN CERTIFICATE"' \
+      && _cert_ok=1 || _cert_ok=0
+    docker exec posteio test -s /data/ssl/server.key \
+      && docker exec posteio sh -c \
+           'head -c 27 /data/ssl/server.key | grep -q "^-----BEGIN "' \
+      && _key_ok=1 || _key_ok=0
+    if (( _cert_ok == 1 && _key_ok == 1 )); then
+      docker restart posteio >/dev/null \
+        || { printf '  \033[1;33m⚠ docker restart posteio fehlgeschlagen\033[0m\n'; }
+      ok "Cert in posteio deployet + Container restartet"
+    else
+      printf '  \033[1;31m✗ Cert-Verify fehlgeschlagen:\033[0m\n' >&2
+      (( _cert_ok == 0 )) && printf '  \033[1;31m  server-combined.crt ist kein gueltiges PEM-Cert (cert_ok=0)\033[0m\n' >&2
+      (( _key_ok  == 0 )) && printf '  \033[1;31m  server.key ist kein gueltiger PEM-Key (key_ok=0)\033[0m\n' >&2
+      printf '  Posteio laeuft mit Default-Cert. docker cp -L manuell pruefen:\033[0m\n' >&2
+      printf '    docker cp -L %s/fullchain.pem posteio:/data/ssl/server-combined.crt\033[0m\n' "$cert_path" >&2
+      printf '    docker cp -L %s/privkey.pem   posteio:/data/ssl/server.key\033[0m\n' "$cert_path" >&2
+    fi
   else
-    printf '  \033[1;33m⚠ posteio läuft nicht — Cert-Deploy übersprungen.\033[0m\n'
+    printf '  \033[1;33m⚠ posteio laeuft nicht — Cert-Deploy uebersprungen.\033[0m\n'
     printf '  Cert liegt in %s — nach Start von posteio deployen:\033[0m\n' "$cert_path"
-    printf '    docker cp %s/fullchain.pem posteio:/data/ssl/server-combined.crt\033[0m\n' "$cert_path"
-    printf '    docker cp %s/privkey.pem   posteio:/data/ssl/server.key\033[0m\n' "$cert_path"
+    printf '    docker cp -L %s/fullchain.pem posteio:/data/ssl/server-combined.crt\033[0m\n' "$cert_path"
+    printf '    docker cp -L %s/privkey.pem   posteio:/data/ssl/server.key\033[0m\n' "$cert_path"
     printf '    docker restart posteio\033[0m\n'
   fi
 
@@ -998,10 +1021,18 @@ set -euo pipefail
 MAIL_HOSTNAME="${mail_hostname}"
 CERT_PATH="/etc/letsencrypt/live/\${MAIL_HOSTNAME}"
 if docker inspect --format='{{.State.Running}}' posteio 2>/dev/null | grep -q '^true\$'; then
-  docker cp "\${CERT_PATH}/fullchain.pem" "posteio:/data/ssl/server-combined.crt"
-  docker cp "\${CERT_PATH}/privkey.pem"   "posteio:/data/ssl/server.key"
-  docker restart posteio >/dev/null
-  echo "certbot-deploy-hook: Cert in posteio deployet + restart OK"
+  # -L: Let's-Encrypt live-Pfade sind Symlinks — ohne -L kopiert docker cp den Symlink.
+  docker cp -L "\${CERT_PATH}/fullchain.pem" "posteio:/data/ssl/server-combined.crt"
+  docker cp -L "\${CERT_PATH}/privkey.pem"   "posteio:/data/ssl/server.key"
+  # Verify vor Restart — sonst potentiell silenter Restart mit falschem Cert.
+  if docker exec posteio sh -c 'head -c 28 /data/ssl/server-combined.crt | grep -q "^-----BEGIN CERTIFICATE"' \
+     && docker exec posteio sh -c 'head -c 27 /data/ssl/server.key | grep -q "^-----BEGIN "'; then
+    docker restart posteio >/dev/null
+    echo "certbot-deploy-hook: Cert in posteio deployet + restart OK"
+  else
+    echo "certbot-deploy-hook: Cert-Verify fehlgeschlagen — Restart uebersprungen, posteio laeuft mit altem Cert" >&2
+    exit 1
+  fi
 else
   echo "certbot-deploy-hook: posteio laeuft nicht — Skip" >&2
 fi
@@ -1020,15 +1051,15 @@ HOOKEOF
 
   # I-2 FIX: Pfade mit Leerzeichen im Cron-Command — als VAR=-Zuweisungen oberhalb
   # der Schedule-Zeile emittieren und im Command als "$CF_INI"/"$HOOK" referenzieren.
-  # Dadurch sind Leerzeichen in Pfaden sicher (cron splittet VAR=... nicht).
+  # Defensiv gequotet: cron-Daemons verhalten sich unterschiedlich bei VAR=... ohne Quotes.
   cat > "$renew_cron" <<EOF
 # Certbot Mail-Renew — wöchentlich Sonntag 02:30. Von bootstrap.sh erzeugt (idempotent).
 # Erneuert das Let's-Encrypt-Cert für ${mail_hostname} (DNS-01 via Cloudflare-API).
 # Deploy-Hook kopiert Cert automatisch in den posteio-Container.
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-CF_INI=${cf_ini}
-HOOK=${deploy_hook_script}
+CF_INI="${cf_ini}"
+HOOK="${deploy_hook_script}"
 30 2 * * 0 root certbot renew --cert-name ${mail_hostname} --dns-cloudflare --dns-cloudflare-credentials "\$CF_INI" --non-interactive --deploy-hook "\$HOOK" --quiet >> /var/log/certbot-mail.log 2>&1
 EOF
   chmod 644 "$renew_cron"
@@ -1048,10 +1079,7 @@ EOF
 _mail_configure_relay() {
   log "Postausgang-Relay (Smarthost) in Poste.io konfigurieren"
 
-  # Relay-Vars aus .env lesen
-  # S-4 FIX: relay_pass wird erst nach dem Passwort-Tempfile-Lesen zugewiesen;
-  # es steht nicht mehr doppelt in dieser Deklarationszeile (latente Verwirrung).
-  # relay_pass wird weiter unten separat via 'relay_pass="$(cat ...)"' deklariert+befüllt.
+  # Relay-Vars aus .env lesen (nicht-sensitive via Pipe, relay_pass ebenfalls via Pipe weiter unten).
   local relay_host relay_port relay_user
   relay_host="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
 grep -E '^SMTP_RELAY_HOST=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true
@@ -1065,19 +1093,14 @@ EOSU
 grep -E '^SMTP_RELAY_USERNAME=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true
 EOSU
 )"
-  # SMTP_RELAY_PASSWORD: sensitiv — nie echoen, nur über Datei transportieren.
-  local relay_pass_file
-  relay_pass_file="$(mktemp)"
-  CLEANUP_FILES+=("$relay_pass_file")
-  chmod 600 "$relay_pass_file"
-  sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" RELAY_PASS_OUT="$relay_pass_file" bash <<'EOSU'
-val="$(grep -E '^SMTP_RELAY_PASSWORD=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true)"
-printf '%s' "$val" > "$RELAY_PASS_OUT"
-EOSU
+  # SMTP_RELAY_PASSWORD: sensitiv — via in-Memory-Pipe aus sudo-alex-Subshell lesen.
+  # Kein Tempfile-Umweg: root-mktemp + alex-write verstösst gegen fs.protected_regular=2
+  # (Lesson 2026-05-26). Pipe ist in-Memory, taucht nicht in ps/docker inspect/Logs auf.
   local relay_pass
-  relay_pass="$(cat "$relay_pass_file")"
-  rm -f "$relay_pass_file"
-  mapfile -t CLEANUP_FILES < <(printf '%s\n' "${CLEANUP_FILES[@]}" | grep -vxF "$relay_pass_file")
+  relay_pass="$(sudo -u "$APP_USER" -H APP_DIR="$APP_DIR" bash <<'EOSU'
+grep -E '^SMTP_RELAY_PASSWORD=[[:print:]]' "$APP_DIR/.env" | head -1 | cut -d= -f2- || true
+EOSU
+)"
 
   # Guard: wenn kein Relay-Host gesetzt → Skip (Relay optional)
   if [[ -z "$relay_host" ]]; then
@@ -1132,7 +1155,7 @@ EOSU
       -e RELAY_HOST="$relay_host" \
       -e RELAY_PORT="$relay_port" \
       -e RELAY_USER="$relay_user" \
-      posteio python3 - <<'PYEOF' 2>/dev/null && _patch_ok=1 || _patch_ok=0
+      posteio python3 - <<'PYEOF' && _patch_ok=1 || _patch_ok=0
 import json, os, sys
 
 settings_path = os.environ['RELAY_SETTINGS_PATH']
